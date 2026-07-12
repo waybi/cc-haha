@@ -27,6 +27,13 @@ export type Model1mSupport = {
 
 export type ModelContextWindows = Record<string, number>
 
+export type ProviderModelInfo = {
+  id: string
+  name: string
+  description: string
+  context: string
+}
+
 export type SavedProvider = {
   id: string
   presetId: string
@@ -37,6 +44,7 @@ export type SavedProvider = {
   apiFormat: ApiFormat
   runtimeKind?: ProviderRuntimeKind
   models: ModelMapping
+  availableModels?: ProviderModelInfo[]
   model1mSupport?: Model1mSupport
   autoCompactWindow?: number
   modelContextWindows?: ModelContextWindows

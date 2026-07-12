@@ -645,6 +645,102 @@ describe('Models API', () => {
     expect(ids.filter((id: string) => id === 'deepseek-v4-pro')).toHaveLength(1)
   })
 
+  it('GET /api/models should merge models advertised by a loopback provider gateway', async () => {
+    const providerSvc = new ProviderService()
+    const provider = await providerSvc.addProvider({
+      presetId: 'custom',
+      name: 'RunAI GPT',
+      baseUrl: 'http://127.0.0.1:7357',
+      apiKey: 'local',
+      apiFormat: 'anthropic',
+      models: {
+        main: 'gpt-5.5',
+        haiku: 'gpt-5.4-mini',
+        sonnet: 'gpt-5.4',
+        opus: 'gpt-5.5',
+      },
+    })
+    await providerSvc.activateProvider(provider.id)
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input) => {
+      expect(String(input)).toBe('http://127.0.0.1:7357/v1/models')
+      return new Response(JSON.stringify({
+        data: [
+          { id: 'gpt-5.4', owned_by: 'runai-openai' },
+          { id: 'gpt-5.4-mini', owned_by: 'runai-openai' },
+          { id: 'gpt-5.5', owned_by: 'runai-openai' },
+          { id: 'gpt-5.6-sol', owned_by: 'runai-openai' },
+          { id: 'gpt-5.6-terra', owned_by: 'runai-openai' },
+          { id: 'gpt-5.6-luna', owned_by: 'runai-openai' },
+        ],
+      }), {
+        headers: { 'content-type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    try {
+      const { req, url, segments } = makeRequest('GET', '/api/models')
+      const res = await handleModelsApi(req, url, segments)
+
+      expect(res.status).toBe(200)
+      const body = await res.json() as {
+        models: Array<{ id: string; name: string; description: string }>
+      }
+      expect(body.models.map((model) => model.id)).toEqual([
+        'gpt-5.5',
+        'gpt-5.4-mini',
+        'gpt-5.4',
+        'gpt-5.6-sol',
+        'gpt-5.6-terra',
+        'gpt-5.6-luna',
+      ])
+      expect(body.models.find((model) => model.id === 'gpt-5.6-sol')).toMatchObject({
+        name: 'gpt-5.6-sol',
+        description: 'runai-openai model',
+      })
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('GET /api/models should not discover models from a remote custom provider', async () => {
+    const providerSvc = new ProviderService()
+    const provider = await providerSvc.addProvider({
+      presetId: 'custom',
+      name: 'Remote provider',
+      baseUrl: 'https://example.com',
+      apiKey: 'test-key',
+      apiFormat: 'anthropic',
+      models: {
+        main: 'remote-main',
+        haiku: '',
+        sonnet: '',
+        opus: '',
+      },
+    })
+    await providerSvc.activateProvider(provider.id)
+
+    const originalFetch = globalThis.fetch
+    let fetchCalled = false
+    globalThis.fetch = (async () => {
+      fetchCalled = true
+      throw new Error('remote discovery must not run')
+    }) as typeof fetch
+
+    try {
+      const { req, url, segments } = makeRequest('GET', '/api/models')
+      const res = await handleModelsApi(req, url, segments)
+
+      expect(res.status).toBe(200)
+      const body = await res.json() as { models: Array<{ id: string }> }
+      expect(body.models.map((model) => model.id)).toEqual(['remote-main'])
+      expect(fetchCalled).toBe(false)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
   it('GET /api/models/current should return default model when not set', async () => {
     const { req, url, segments } = makeRequest('GET', '/api/models/current')
     const res = await handleModelsApi(req, url, segments)

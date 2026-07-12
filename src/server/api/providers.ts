@@ -26,6 +26,7 @@ import {
 } from '../types/provider.js'
 import { ApiError, errorResponse } from '../middleware/errorHandler.js'
 import { diagnosticsService } from '../services/diagnosticsService.js'
+import { discoverLoopbackProviderModels } from './models.js'
 
 const providerService = new ProviderService()
 
@@ -83,7 +84,13 @@ export async function handleProvidersApi(
     if (!id) {
       if (req.method === 'GET') {
         const { providers, activeId } = await providerService.listProviders()
-        return Response.json({ providers, activeId })
+        const providersWithAvailableModels = await Promise.all(providers.map(async (provider) => {
+          const availableModels = await discoverLoopbackProviderModels(provider)
+          return availableModels.length > 0
+            ? { ...provider, availableModels }
+            : provider
+        }))
+        return Response.json({ providers: providersWithAvailableModels, activeId })
       }
       if (req.method === 'POST') {
         return await handleCreate(req)

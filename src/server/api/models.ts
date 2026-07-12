@@ -19,6 +19,7 @@ import {
   OPENAI_OFFICIAL_PROVIDER_NAME,
   isOpenAIOfficialProviderId,
 } from '../services/openaiOfficialProvider.js'
+import type { SavedProvider } from '../types/provider.js'
 
 // ─── Fallback models (used when no provider is configured) ────────────────────
 
@@ -113,6 +114,98 @@ function buildProviderModelList(models: {
     : null)
 
   return modelList
+}
+
+function getLoopbackModelsUrl(baseUrl: string): string | null {
+  try {
+    const url = new URL(baseUrl)
+    const hostname = url.hostname.toLowerCase()
+    const isLoopback = hostname === 'localhost'
+      || hostname === '::1'
+      || /^127(?:\.\d{1,3}){3}$/.test(hostname)
+    if (!isLoopback) {
+      return null
+    }
+
+    url.pathname = `${url.pathname.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/models`
+    url.search = ''
+    url.hash = ''
+    return url.toString()
+  } catch {
+    return null
+  }
+}
+
+function isOpenAIModelId(modelId: string): boolean {
+  const normalized = modelId.trim().toLowerCase()
+  return normalized.startsWith('gpt-') || /^o\d/.test(normalized)
+}
+
+function providerUsesOpenAIModels(provider: SavedProvider): boolean {
+  const configuredModels = Object.values(provider.models).filter(Boolean)
+  return configuredModels.length > 0 && configuredModels.every(isOpenAIModelId)
+}
+
+export async function discoverLoopbackProviderModels(provider: SavedProvider): Promise<ApiModelInfo[]> {
+  const modelsUrl = getLoopbackModelsUrl(provider.baseUrl)
+  if (!modelsUrl || !providerUsesOpenAIModels(provider)) {
+    return []
+  }
+
+  try {
+    const response = await fetch(modelsUrl, {
+      signal: AbortSignal.timeout(1500),
+    })
+    if (!response.ok) {
+      return []
+    }
+
+    const body = await response.json() as {
+      data?: Array<{ id?: unknown; owned_by?: unknown }>
+      models?: Array<{ id?: unknown; slug?: unknown; owned_by?: unknown; provider?: unknown }>
+    }
+    const entries = Array.isArray(body.data)
+      ? body.data
+      : Array.isArray(body.models)
+        ? body.models
+        : []
+
+    return entries.flatMap((entry) => {
+      const id = typeof entry.id === 'string'
+        ? entry.id.trim()
+        : typeof entry.slug === 'string'
+          ? entry.slug.trim()
+          : ''
+      if (!id) {
+        return []
+      }
+      if (!isOpenAIModelId(id)) {
+        return []
+      }
+
+      const owner = typeof entry.owned_by === 'string'
+        ? entry.owned_by.trim()
+        : typeof entry.provider === 'string'
+          ? entry.provider.trim()
+          : ''
+      return [{
+        id,
+        name: id,
+        description: owner ? `${owner} model` : 'Gateway model',
+        context: '',
+      }]
+    })
+  } catch {
+    return []
+  }
+}
+
+async function buildActiveProviderModelList(provider: SavedProvider): Promise<ApiModelInfo[]> {
+  const models = buildProviderModelList(provider.models)
+  for (const model of await discoverLoopbackProviderModels(provider)) {
+    addUniqueModel(models, model)
+  }
+  return models
 }
 
 function buildOpenAIModelList(): ApiModelInfo[] {
@@ -211,7 +304,7 @@ async function handleModelsList(): Promise<Response> {
 
   const activeProvider = activeId ? providers.find((p) => p.id === activeId) : null
   if (activeProvider) {
-    const modelList = buildProviderModelList(activeProvider.models)
+    const modelList = await buildActiveProviderModelList(activeProvider)
     return Response.json({
       models: modelList,
       provider: { id: activeProvider.id, name: activeProvider.name },
@@ -264,7 +357,7 @@ async function handleCurrentModel(req: Request): Promise<Response> {
     const availableModels = isOpenAIProviderActive
       ? buildOpenAIModelList()
       : activeProvider
-        ? buildProviderModelList(activeProvider.models)
+        ? await buildActiveProviderModelList(activeProvider)
         : getStandaloneModelList()
 
     const modelEntry = availableModels.find((m) => m.id === lookupId)

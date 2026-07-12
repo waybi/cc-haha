@@ -89,12 +89,20 @@ function buildProviderModels(
     byId.set(entry.id, { id: entry.id, labels: [entry.label] })
   }
 
-  return [...byId.values()].map((entry) => ({
+  const models = [...byId.values()].map((entry) => ({
     id: entry.id,
     name: entry.id,
     description: entry.labels.join(' · '),
     context: '',
   }))
+
+  for (const model of provider.availableModels ?? []) {
+    if (!model.id.trim() || byId.has(model.id)) continue
+    byId.set(model.id, { id: model.id, labels: [] })
+    models.push(model)
+  }
+
+  return models
 }
 
 function buildProviderChoices(

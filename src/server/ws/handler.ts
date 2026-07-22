@@ -3178,6 +3178,21 @@ async function getSessionPermissionMode(sessionId: string): Promise<string | und
   return launchInfo?.permissionMode
 }
 
+
+function pickEffortLevel(
+  settings: Record<string, unknown> | undefined | null,
+): string | undefined {
+  if (!settings) return undefined
+  for (const key of ['effort', 'effortLevel'] as const) {
+    const value = settings[key]
+    if (typeof value === 'string') {
+      const level = value.trim()
+      if (VALID_EFFORT_LEVELS.has(level)) return level
+    }
+  }
+  return undefined
+}
+
 async function getDefaultRuntimeSettings(): Promise<RuntimeSettings> {
   // Check if a custom provider is active
   const { providers, activeId } = await providerService.listProviders()
@@ -3198,9 +3213,9 @@ async function getDefaultRuntimeSettings(): Promise<RuntimeSettings> {
       ? modelSettings.modelContext
       : undefined
   let effort =
-    typeof userSettings.effort === 'string' && userSettings.effort.trim()
-      ? userSettings.effort
-      : undefined
+    pickEffortLevel(providerSettings) ??
+    pickEffortLevel(userSettings) ??
+    'max'
   const thinking = resolveDesktopThinkingMode(userSettings, resolvedActiveId)
 
   let model: string | undefined

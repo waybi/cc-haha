@@ -449,6 +449,7 @@ describe('Business Flow: Models & Effort', () => {
     const settings = JSON.parse(raw)
     expect(settings.model).toBe('claude-opus-4-7')
     expect(settings.effort).toBe('high')
+    expect(settings.effortLevel).toBe('high')
   })
 })
 

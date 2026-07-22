@@ -204,7 +204,14 @@ describe('EmptySession', () => {
     mocks.webviewDragHandlers.length = 0
     mocks.isMobile = false
     mocks.isTauriRuntime = false
-    useSettingsStore.setState({ locale: 'en', activeProviderName: null, permissionMode: 'default' })
+    useSettingsStore.setState({
+      locale: 'en',
+      activeProviderName: null,
+      permissionMode: 'default',
+      currentModel: { id: 'claude-opus-4-6', name: 'claude-opus-4-6', description: '', context: '' },
+      effortLevel: 'max',
+      availableModels: [{ id: 'claude-opus-4-6', name: 'claude-opus-4-6', description: '', context: '' }],
+    })
     useSessionStore.setState(initialSessionState, true)
     useChatStore.setState(initialChatState, true)
     useTabStore.setState(initialTabState, true)
@@ -502,7 +509,25 @@ describe('EmptySession', () => {
       attachments: [],
     })
     expect(mocks.wsConnect).toHaveBeenCalledWith('draft-session')
-    expect(useSessionRuntimeStore.getState().selections['draft-session']).toBeUndefined()
+    // Visible composer defaults (model + 最大) are now materialized into session runtime
+    // so the first request matches the UI without an extra click.
+    expect(useSessionRuntimeStore.getState().selections['draft-session']).toEqual({
+      providerId: null,
+      modelId: 'claude-opus-4-6',
+      effortLevel: 'max',
+    })
+    expect(mocks.wsSend.mock.calls.slice(0, 2)).toEqual([
+      [
+        'draft-session',
+        {
+          type: 'set_runtime_config',
+          providerId: null,
+          modelId: 'claude-opus-4-6',
+          effortLevel: 'max',
+        },
+      ],
+      ['draft-session', { type: 'prewarm_session' }],
+    ])
   })
 
   it('stores and replays a draft runtime only when the user explicitly selected one', async () => {
@@ -526,6 +551,7 @@ describe('EmptySession', () => {
     expect(useSessionRuntimeStore.getState().selections['draft-session']).toEqual({
       providerId: 'provider-explicit',
       modelId: 'model-explicit',
+      effortLevel: 'max',
     })
     expect(useSessionRuntimeStore.getState().selections['__draft__']).toBeUndefined()
     expect(mocks.wsSend.mock.calls.slice(0, 2)).toEqual([
@@ -535,6 +561,7 @@ describe('EmptySession', () => {
           type: 'set_runtime_config',
           providerId: 'provider-explicit',
           modelId: 'model-explicit',
+          effortLevel: 'max',
         },
       ],
       ['draft-session', { type: 'prewarm_session' }],

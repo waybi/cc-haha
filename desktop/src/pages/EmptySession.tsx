@@ -330,7 +330,21 @@ export function EmptySession() {
           providers,
           currentModel?.id,
         )
-      const runtimeSelection = explicitDraftSelection ?? defaultActiveProviderSelection ?? undefined
+      const settingsState = useSettingsStore.getState()
+      const defaultRuntimeSelection = defaultActiveProviderSelection
+        ? {
+            ...defaultActiveProviderSelection,
+            effortLevel: settingsState.effortLevel ?? 'max',
+          }
+        : {
+            providerId: null,
+            modelId:
+              settingsState.currentModel?.id ??
+              settingsState.availableModels[0]?.id ??
+              'claude-opus-4-6',
+            effortLevel: settingsState.effortLevel ?? 'max',
+          }
+      const runtimeSelection = explicitDraftSelection ?? defaultRuntimeSelection
       const sessionId = await createSession(
         workDir || undefined,
         {
@@ -340,11 +354,9 @@ export function EmptySession() {
           permissionMode: draftPermissionMode,
         },
       )
-      if (runtimeSelection) {
-        runtimeStore.setSelection(sessionId, runtimeSelection)
-        if (explicitDraftSelection) {
-          runtimeStore.clearSelection(DRAFT_RUNTIME_SELECTION_KEY)
-        }
+      runtimeStore.setSelection(sessionId, runtimeSelection)
+      if (explicitDraftSelection) {
+        runtimeStore.clearSelection(DRAFT_RUNTIME_SELECTION_KEY)
       }
       setActiveView('code')
       useTabStore.getState().openTab(sessionId, 'New Session')

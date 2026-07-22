@@ -405,10 +405,16 @@ async function handleCurrentModel(req: Request): Promise<Response> {
   throw methodNotAllowed(req.method)
 }
 
+function resolveStoredEffortLevel(settings: Record<string, unknown>): (typeof EFFORT_LEVELS)[number] {
+  // Desktop historically wrote `effort`; CLI / managed settings use `effortLevel`.
+  // Read both so UI defaults and launched sessions stay aligned.
+  return normalizeEffortLevel(settings.effort ?? settings.effortLevel)
+}
+
 async function handleEffort(req: Request): Promise<Response> {
   if (req.method === 'GET') {
     const settings = await settingsService.getUserSettings()
-    const level = normalizeEffortLevel(settings.effort)
+    const level = resolveStoredEffortLevel(settings)
     return Response.json({ level, available: EFFORT_LEVELS })
   }
 
@@ -423,7 +429,9 @@ async function handleEffort(req: Request): Promise<Response> {
         `Invalid effort level: "${level}". Valid levels: ${EFFORT_LEVELS.join(', ')}`,
       )
     }
-    await settingsService.updateUserSettings({ effort: level })
+    // Keep both keys in sync: desktop launch path reads `effort`, CLI fallback
+    // reads `effortLevel`.
+    await settingsService.updateUserSettings({ effort: level, effortLevel: level })
     return Response.json({ ok: true, level })
   }
 

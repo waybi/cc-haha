@@ -2,7 +2,7 @@
 // dynamically in getAWSClientProxyConfig() to defer ~929KB of AWS SDK.
 // undici is lazy-required inside getProxyAgent/configureGlobalAgents to defer
 // ~1.5MB when no HTTPS_PROXY/mTLS env vars are set (the common case).
-import axios, { type AxiosInstance } from 'axios'
+import axios, { type AxiosInstance, type AxiosRequestConfig } from 'axios'
 import type { LookupOptions } from 'dns'
 import type { Agent } from 'http'
 import { HttpsProxyAgent, type HttpsProxyAgentOptions } from 'https-proxy-agent'
@@ -96,19 +96,36 @@ export function shouldBypassProxy(
 
   try {
     const url = new URL(urlString)
-    const hostname = url.hostname.toLowerCase()
+    const rawHostname = url.hostname.toLowerCase()
+    const hostname = rawHostname.startsWith('[') && rawHostname.endsWith(']')
+      ? rawHostname.slice(1, -1)
+      : rawHostname
     const port = url.port || (url.protocol === 'https:' ? '443' : '80')
     const hostWithPort = `${hostname}:${port}`
+    const bracketedHostWithPort = hostname.includes(':') ? `[${hostname}]:${port}` : hostWithPort
 
     // Split by comma or space and trim each entry
     const noProxyList = noProxy.split(/[,\s]+/).filter(Boolean)
 
     return noProxyList.some(pattern => {
       pattern = pattern.toLowerCase().trim()
+      const normalizedPattern = pattern.startsWith('[') && pattern.endsWith(']')
+        ? pattern.slice(1, -1)
+        : pattern
 
       // Check for port-specific match
       if (pattern.includes(':')) {
-        return hostWithPort === pattern
+        const bracketedPortMatch = pattern.match(/^\[(.+)]:(\d+)$/)
+        if (bracketedPortMatch) {
+          return hostname === bracketedPortMatch[1] && port === bracketedPortMatch[2]
+        }
+
+        const colonCount = (pattern.match(/:/g) ?? []).length
+        if (colonCount === 1) {
+          return hostWithPort === pattern || bracketedHostWithPort === pattern
+        }
+
+        return hostname === normalizedPattern
       }
 
       // Check for domain suffix match (with or without leading dot)
@@ -120,12 +137,17 @@ export function shouldBypassProxy(
       }
 
       // Check for exact hostname match or IP address
-      return hostname === pattern
+      return hostname === normalizedPattern
     })
   } catch {
     // If URL parsing fails, don't bypass proxy
     return false
   }
+}
+
+function shouldBypassProxyForTarget(targetUrl: string | URL | undefined | null, noProxy?: string | null): boolean {
+  if (!targetUrl) return false
+  return shouldBypassProxy(String(targetUrl), noProxy ?? undefined)
 }
 
 /**
@@ -158,6 +180,25 @@ function createHttpsProxyAgent(
   }
 
   return new HttpsProxyAgent(proxyUrl, { ...agentOptions, ...extra })
+}
+
+/**
+ * Build request-local Axios routing without mutating the process-wide Axios
+ * defaults. `undefined` preserves the CLI's existing inherited environment,
+ * while `null` is an explicit direct connection.
+ */
+export function getAxiosProxyOptions(
+  proxyUrl: string | null | undefined,
+): Pick<AxiosRequestConfig, 'proxy' | 'httpAgent' | 'httpsAgent'> {
+  if (proxyUrl === undefined) return {}
+  if (!proxyUrl) return { proxy: false }
+
+  const proxyAgent = createHttpsProxyAgent(proxyUrl)
+  return {
+    proxy: false,
+    httpAgent: proxyAgent,
+    httpsAgent: proxyAgent,
+  }
 }
 
 /**
@@ -285,7 +326,7 @@ export function getWebSocketProxyUrl(url: string): string | undefined {
  *   requests get misrouted to api.anthropic.com. Only the Anthropic SDK client
  *   should pass `true` here.
  */
-export function getProxyFetchOptions(opts?: { forAnthropicAPI?: boolean; proxyUrl?: string | null }): {
+export function getProxyFetchOptions(opts?: { forAnthropicAPI?: boolean; proxyUrl?: string | null; targetUrl?: string | URL | null; noProxy?: string | null }): {
   tls?: TLSConfig
   dispatcher?: undici.Dispatcher
   proxy?: string
@@ -307,6 +348,10 @@ export function getProxyFetchOptions(opts?: { forAnthropicAPI?: boolean; proxyUr
   const proxyUrl = opts?.proxyUrl !== undefined
     ? opts.proxyUrl || undefined
     : getProxyUrl()
+
+  if (proxyUrl && shouldBypassProxyForTarget(opts?.targetUrl, opts?.noProxy)) {
+    return { ...base, ...getTLSFetchOptions() }
+  }
 
   // If we have a proxy, use the proxy agent (which includes mTLS config)
   if (proxyUrl) {

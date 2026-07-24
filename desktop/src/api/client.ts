@@ -11,6 +11,7 @@ let baseUrl = DEFAULT_BASE_URL
 let authToken: string | null = null
 const DIAGNOSTICS_PATH = '/api/diagnostics/events'
 const DEFAULT_REQUEST_TIMEOUT_MS = 120_000
+const DIAGNOSTICS_REQUEST_TIMEOUT_MS = 5_000
 
 function getErrorMessage(status: number, body: unknown) {
   if (body && typeof body === 'object' && 'message' in body && typeof body.message === 'string') {
@@ -68,13 +69,25 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(method: string, path: string, body?: unknown, options?: { timeout?: number }): Promise<T> {
+export type ApiRequestOptions = {
+  timeout?: number
+  signal?: AbortSignal
+}
+
+async function request<T>(method: string, path: string, body?: unknown, options?: ApiRequestOptions): Promise<T> {
   const url = `${baseUrl}${path}`
   const headers = buildHeaders()
 
   const controller = new AbortController()
   const timeoutMs = options?.timeout ?? DEFAULT_REQUEST_TIMEOUT_MS
-  const timeout = setTimeout(() => controller.abort(), timeoutMs)
+  let timedOut = false
+  const timeout = setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, timeoutMs)
+  const abortFromCaller = () => controller.abort(options?.signal?.reason)
+  if (options?.signal?.aborted) abortFromCaller()
+  else options?.signal?.addEventListener('abort', abortFromCaller, { once: true })
   try {
     const res = await fetch(url, {
       method,
@@ -82,8 +95,6 @@ async function request<T>(method: string, path: string, body?: unknown, options?
       body: body !== undefined ? JSON.stringify(body) : undefined,
       signal: controller.signal,
     })
-    clearTimeout(timeout)
-
     if (!res.ok) {
       const errorBody = await res.json().catch(() => res.text())
       throw new ApiError(res.status, errorBody)
@@ -92,14 +103,21 @@ async function request<T>(method: string, path: string, body?: unknown, options?
     if (res.status === 204) return undefined as T
     return res.json() as Promise<T>
   } catch (err) {
-    clearTimeout(timeout)
-    if (controller.signal.aborted) {
+    if (timedOut) {
       const timeoutError = new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s`)
       reportApiFailure(method, path, timeoutError)
       throw timeoutError
     }
+    if (options?.signal?.aborted) {
+      throw options.signal.reason instanceof Error
+        ? options.signal.reason
+        : new DOMException('The operation was aborted', 'AbortError')
+    }
     reportApiFailure(method, path, err)
     throw err
+  } finally {
+    clearTimeout(timeout)
+    options?.signal?.removeEventListener('abort', abortFromCaller)
   }
 }
 
@@ -133,11 +151,16 @@ export function rawRecordDiagnosticEvent(event: {
   sessionId?: string
   details?: unknown
 }) {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), DIAGNOSTICS_REQUEST_TIMEOUT_MS)
   return fetch(`${baseUrl}${DIAGNOSTICS_PATH}`, {
     method: 'POST',
     headers: buildHeaders(),
     body: JSON.stringify(event),
-  }).catch(() => undefined)
+    signal: controller.signal,
+  })
+    .catch(() => undefined)
+    .finally(() => clearTimeout(timeout))
 }
 
 function buildHeaders(): Record<string, string> {
@@ -173,8 +196,8 @@ function sanitizeDiagnosticValue(value: unknown): unknown {
 }
 
 export const api = {
-  get: <T>(path: string, options?: { timeout?: number }) => request<T>('GET', path, undefined, options),
-  post: <T>(path: string, body?: unknown, options?: { timeout?: number }) => request<T>('POST', path, body, options),
+  get: <T>(path: string, options?: ApiRequestOptions) => request<T>('GET', path, undefined, options),
+  post: <T>(path: string, body?: unknown, options?: ApiRequestOptions) => request<T>('POST', path, body, options),
   put: <T>(path: string, body?: unknown) => request<T>('PUT', path, body),
   patch: <T>(path: string, body?: unknown) => request<T>('PATCH', path, body),
   delete: <T>(path: string) => request<T>('DELETE', path),

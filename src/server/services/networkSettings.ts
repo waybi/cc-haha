@@ -1,6 +1,7 @@
 import { SettingsService } from './settingsService.js'
+import { getProxyFetchOptions, getProxyUrl } from '../../utils/proxy.js'
 
-export type NetworkProxyMode = 'system' | 'manual'
+export type NetworkProxyMode = 'direct' | 'system' | 'manual'
 
 export type NetworkSettings = {
   aiRequestTimeoutMs: number
@@ -26,6 +27,8 @@ export type NetworkSettings = {
 export const DEFAULT_AI_REQUEST_TIMEOUT_MS = 600_000
 export const MIN_AI_REQUEST_TIMEOUT_MS = 30_000
 export const MAX_AI_REQUEST_TIMEOUT_MS = 1_800_000
+export const SYSTEM_PROXY_URL_ENV = 'CC_HAHA_SYSTEM_PROXY_URL'
+export const SYSTEM_PROXY_ERROR_ENV = 'CC_HAHA_SYSTEM_PROXY_ERROR'
 
 const DEFAULT_NETWORK_SETTINGS: NetworkSettings = {
   aiRequestTimeoutMs: DEFAULT_AI_REQUEST_TIMEOUT_MS,
@@ -34,9 +37,10 @@ const DEFAULT_NETWORK_SETTINGS: NetworkSettings = {
     url: '',
   },
 }
+const LOOPBACK_NO_PROXY_ENTRIES = ['localhost', '127.0.0.1', '::1'] as const
 
 function isNetworkProxyMode(value: unknown): value is NetworkProxyMode {
-  return value === 'system' || value === 'manual'
+  return value === 'direct' || value === 'system' || value === 'manual'
 }
 
 function clampTimeoutMs(value: number): number {
@@ -56,9 +60,10 @@ function parseProxy(value: unknown): NetworkSettings['proxy'] {
   }
 
   const record = value as Record<string, unknown>
+  const mode = isNetworkProxyMode(record.mode) ? record.mode : DEFAULT_NETWORK_SETTINGS.proxy.mode
   return {
-    mode: isNetworkProxyMode(record.mode) ? record.mode : DEFAULT_NETWORK_SETTINGS.proxy.mode,
-    url: typeof record.url === 'string' ? record.url.trim() : '',
+    mode,
+    url: mode === 'manual' && typeof record.url === 'string' ? record.url.trim() : '',
   }
 }
 
@@ -85,20 +90,97 @@ export function getManualNetworkProxyUrl(settings: NetworkSettings): string | un
   return url || undefined
 }
 
-export function buildNetworkEnvironment(settings: NetworkSettings): Record<string, string> {
+export function getNetworkProxyUrl(
+  settings: NetworkSettings,
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  if (settings.proxy.mode === 'manual') return getManualNetworkProxyUrl(settings) ?? null
+  if (settings.proxy.mode === 'system') {
+    const bridgeUrl = env[SYSTEM_PROXY_URL_ENV]?.trim()
+    if (bridgeUrl) return bridgeUrl
+
+    const bridgeError = env[SYSTEM_PROXY_ERROR_ENV]?.trim()
+    if (bridgeError) {
+      throw new Error(bridgeError)
+    }
+
+    // Non-Electron/headless server launches have no host resolver bridge. In
+    // that environment, "system" retains the conventional process proxy
+    // contract. The Electron host clears inherited proxy variables before
+    // spawning the server, so desktop requests can only use its bridge.
+    return getProxyUrl(env) ?? null
+  }
+  return null
+}
+
+export function mergeLoopbackNoProxy(existing: string | undefined): string {
+  const entries = (existing ?? '')
+    .split(/[,\s]+/)
+    .map(entry => entry.trim())
+    .filter(Boolean)
+  const lowerEntries = new Set(entries.map(entry => entry.toLowerCase()))
+
+  for (const entry of LOOPBACK_NO_PROXY_ENTRIES) {
+    if (!lowerEntries.has(entry.toLowerCase())) entries.push(entry)
+  }
+
+  return entries.join(',')
+}
+
+export function buildNetworkEnvironment(
+  settings: NetworkSettings,
+  baseEnv: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
   const env: Record<string, string> = {
     API_TIMEOUT_MS: String(settings.aiRequestTimeoutMs),
   }
-  const proxyUrl = getManualNetworkProxyUrl(settings)
+
+  if (settings.proxy.mode === 'direct') {
+    env.HTTP_PROXY = ''
+    env.HTTPS_PROXY = ''
+    env.http_proxy = ''
+    env.https_proxy = ''
+    env.ALL_PROXY = ''
+    env.all_proxy = ''
+    return env
+  }
+
+  const proxyUrl = getNetworkProxyUrl(settings, baseEnv)
 
   if (proxyUrl) {
+    const noProxy = mergeLoopbackNoProxy(baseEnv.no_proxy || baseEnv.NO_PROXY)
     env.HTTP_PROXY = proxyUrl
     env.HTTPS_PROXY = proxyUrl
     env.http_proxy = proxyUrl
     env.https_proxy = proxyUrl
+    env.ALL_PROXY = proxyUrl
+    env.all_proxy = proxyUrl
+    env.NO_PROXY = noProxy
+    env.no_proxy = noProxy
+  } else {
+    env.HTTP_PROXY = ''
+    env.HTTPS_PROXY = ''
+    env.http_proxy = ''
+    env.https_proxy = ''
+    env.ALL_PROXY = ''
+    env.all_proxy = ''
   }
 
   return env
+}
+
+export function getNetworkProxyFetchOptions(
+  settings: NetworkSettings,
+  targetUrl: string | URL,
+): ReturnType<typeof getProxyFetchOptions> {
+  const noProxy = mergeLoopbackNoProxy(process.env.no_proxy || process.env.NO_PROXY)
+  const proxyUrl = getNetworkProxyUrl(settings)
+
+  return getProxyFetchOptions({
+    proxyUrl,
+    targetUrl,
+    noProxy,
+  })
 }
 
 export async function loadNetworkSettings(): Promise<NetworkSettings> {

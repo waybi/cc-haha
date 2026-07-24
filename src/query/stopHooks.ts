@@ -78,6 +78,19 @@ export function shouldLetGoalPromptHookContinue(
   )
 }
 
+export function formatGoalContinuationStatusOutput(reason: string): string {
+  const normalizedReason = reason
+    .replace(/^Prompt hook condition was not met:\s*/i, '')
+    .replace(/[<>&]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 240)
+
+  return normalizedReason
+    ? `Goal continuing: ${normalizedReason}`
+    : 'Goal continuing: more work is required'
+}
+
 export async function* handleStopHooks(
   messagesForQuery: Message[],
   assistantMessages: AssistantMessage[],
@@ -221,8 +234,9 @@ export async function* handleStopHooks(
     const hookErrors: string[] = []
     const hookInfos: StopHookInfo[] = []
     let goalCompleted = false
-	
-	// Goal hook's preventContinuation and blockingError arrive as separate
+    let goalContinuationReason: string | null = null
+
+    // Goal hook's preventContinuation and blockingError arrive as separate
     // generator yields — preventContinuation comes first, but blockingError.command
     // (which identifies it as a goal hook) arrives later. Defer the
     // preventContinuation decision until we've seen all results and can
@@ -296,12 +310,15 @@ export async function* handleStopHooks(
         }
       }
       if (result.blockingError) {
-	    const isGoalHook = isGoalPromptHookCommand(result.blockingError?.command)
-		// If this blockingError is from a goal hook AND we have a pending
-        // preventContinuation, the goal hook's intent is block-and-continue
-        // (not prevent-and-stop). Mark it so we can resolve after the loop.
-        if (isGoalHook && pendingPreventContinuation) {
-          goalBlockingErrorSeen = true
+        const isGoalHook = isGoalPromptHookCommand(result.blockingError.command)
+        if (isGoalHook) {
+          goalContinuationReason ??= result.blockingError.blockingError
+          // If this blockingError is from a goal hook AND we have a pending
+          // preventContinuation, the goal hook's intent is block-and-continue
+          // (not prevent-and-stop). Mark it so we can resolve after the loop.
+          if (pendingPreventContinuation) {
+            goalBlockingErrorSeen = true
+          }
         }
         const userMessage = createUserMessage({
           content: getStopHookMessage(result.blockingError),
@@ -332,7 +349,7 @@ export async function* handleStopHooks(
             toolUseID: stopHookToolUseID,
             hookEvent: 'Stop',
           })
-		 } else {
+        } else {
           // No blockingError yet — defer the decision. The goal hook's
           // blockingError.command may arrive in a later yield, and we need
           // it to distinguish goal-hook preventContinuation (block-and-continue)
@@ -381,7 +398,7 @@ export async function* handleStopHooks(
         hookEvent: 'Stop',
       })
       pendingPreventContinuation = null
-    } 
+    }
 
     // Create summary system message if hooks ran
     if (hookCount > 0) {
@@ -414,6 +431,12 @@ export async function* handleStopHooks(
     if (goalCompleted) {
       yield createCommandInputMessage(
         '<local-command-stdout>Goal marked complete.</local-command-stdout>',
+      )
+    }
+
+    if (goalContinuationReason) {
+      yield createCommandInputMessage(
+        `<local-command-stdout>${formatGoalContinuationStatusOutput(goalContinuationReason)}</local-command-stdout>`,
       )
     }
 

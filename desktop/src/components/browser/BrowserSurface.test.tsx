@@ -10,7 +10,15 @@ beforeAll(() => {
 })
 
 const { bridge } = vi.hoisted(() => ({
-  bridge: { open: vi.fn(), navigate: vi.fn(), setBounds: vi.fn(), setVisible: vi.fn(), close: vi.fn(), message: vi.fn() },
+  bridge: {
+    open: vi.fn(),
+    navigate: vi.fn(),
+    setBounds: vi.fn(),
+    setVisible: vi.fn(),
+    setZoom: vi.fn(),
+    close: vi.fn(),
+    message: vi.fn(),
+  },
 }))
 vi.mock('../../lib/previewBridge', () => ({ previewBridge: bridge }))
 vi.mock('@tauri-apps/api/event', () => ({ listen: () => Promise.resolve(() => {}) }))
@@ -20,6 +28,7 @@ import { getDefaultBaseUrl, setBaseUrl } from '../../api/client'
 import { useBrowserPanelStore } from '../../stores/browserPanelStore'
 import { useWorkspacePanelStore } from '../../stores/workspacePanelStore'
 import { useOverlayStore } from '../../stores/overlayStore'
+import { useSettingsStore } from '../../stores/settingsStore'
 
 afterEach(() => {
   cleanup()
@@ -29,6 +38,7 @@ afterEach(() => {
   // browserPanelStore.open() now also opens the unified workbench; keep it isolated.
   useWorkspacePanelStore.setState(useWorkspacePanelStore.getInitialState(), true)
   useOverlayStore.setState(useOverlayStore.getInitialState(), true)
+  useSettingsStore.setState({ uiZoom: 1 })
   setBaseUrl(getDefaultBaseUrl())
 })
 
@@ -36,7 +46,43 @@ describe('BrowserSurface', () => {
   it('opens the preview at the session url on mount when surface is open', () => {
     useBrowserPanelStore.getState().open('s1', 'http://localhost:5173/')
     render(<BrowserSurface sessionId="s1" />)
-    expect(bridge.open).toHaveBeenCalledWith('http://localhost:5173/', expect.objectContaining({ width: expect.any(Number) }))
+    return waitFor(() => {
+      expect(bridge.open).toHaveBeenCalledWith('http://localhost:5173/', expect.objectContaining({ width: expect.any(Number) }))
+    })
+  })
+
+  it('rescales native preview bounds when app zoom changes', async () => {
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({
+      left: 180,
+      top: 150,
+      width: 420,
+      height: 300,
+    } as DOMRect)
+    useSettingsStore.setState({ uiZoom: 1.25 })
+    useBrowserPanelStore.getState().open('s1', 'http://localhost:5173/')
+    render(<BrowserSurface sessionId="s1" />)
+
+    await waitFor(() => {
+      expect(bridge.open).toHaveBeenCalledWith('http://localhost:5173/', {
+        x: 225,
+        y: 187.5,
+        width: 525,
+        height: 375,
+      })
+    })
+
+    act(() => {
+      useSettingsStore.setState({ uiZoom: 1.5 })
+    })
+
+    await waitFor(() => {
+      expect(bridge.setBounds).toHaveBeenLastCalledWith({
+        x: 270,
+        y: 225,
+        width: 630,
+        height: 450,
+      })
+    })
   })
 
   it('waits for local preview URLs before opening the native preview', async () => {
@@ -68,13 +114,15 @@ describe('BrowserSurface', () => {
     expect(bridge.open).not.toHaveBeenCalled()
   })
 
-  it('first navigation from a blank session opens the native preview', () => {
+  it('first navigation from a blank session opens the native preview', async () => {
     useBrowserPanelStore.getState().ensureBlank('s1')
     render(<BrowserSurface sessionId="s1" />)
     const input = screen.getByRole('textbox')
     fireEvent.change(input, { target: { value: 'localhost:3000' } })
     fireEvent.submit(input.closest('form')!)
-    expect(bridge.open).toHaveBeenCalledWith('http://localhost:3000', expect.objectContaining({ width: expect.any(Number) }))
+    await waitFor(() => {
+      expect(bridge.open).toHaveBeenCalledWith('http://localhost:3000', expect.objectContaining({ width: expect.any(Number) }))
+    })
     expect(bridge.navigate).not.toHaveBeenCalled()
   })
 
@@ -99,14 +147,39 @@ describe('BrowserSurface', () => {
     )
   })
 
-  it('navigating via address bar calls store + bridge', () => {
+  it('navigating via address bar calls store + bridge', async () => {
     useBrowserPanelStore.getState().open('s1', 'http://localhost:5173/')
     render(<BrowserSurface sessionId="s1" />)
     const input = screen.getByRole('textbox')
     fireEvent.change(input, { target: { value: 'http://localhost:3000/' } })
     fireEvent.submit(input.closest('form')!)
-    expect(bridge.navigate).toHaveBeenCalledWith('http://localhost:3000/')
+    await waitFor(() => {
+      expect(bridge.navigate).toHaveBeenCalledWith('http://localhost:3000/')
+    })
     expect(useBrowserPanelStore.getState().bySession['s1']!.url).toBe('http://localhost:3000/')
+  })
+
+  it('navigates the mounted native preview when another browser target opens for the same session', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 200 }))
+    useBrowserPanelStore.getState().open('s1', 'http://127.0.0.1:3456/preview-fs/s1/first.md')
+    render(<BrowserSurface sessionId="s1" />)
+    await waitFor(() => {
+      expect(bridge.open).toHaveBeenCalledWith(
+        'http://127.0.0.1:3456/preview-fs/s1/first.md',
+        expect.objectContaining({ width: expect.any(Number) }),
+      )
+    })
+
+    act(() => {
+      useBrowserPanelStore.getState().open('s1', 'http://127.0.0.1:3456/preview-fs/s1/second.md')
+    })
+
+    await waitFor(() => {
+      expect(bridge.navigate).toHaveBeenCalledWith('http://127.0.0.1:3456/preview-fs/s1/second.md')
+    })
+    expect(useBrowserPanelStore.getState().bySession['s1']!.url).toBe(
+      'http://127.0.0.1:3456/preview-fs/s1/second.md',
+    )
   })
 
   it('closes the native webview on unmount', () => {
@@ -145,6 +218,48 @@ describe('BrowserSurface', () => {
     expect(bridge.message).toHaveBeenLastCalledWith({ v: 1, type: 'exit-picker' })
   })
 
+  it('renders floating preview zoom controls that update the native preview zoom', async () => {
+    useBrowserPanelStore.getState().open('s1', 'http://localhost:5173/')
+    useBrowserPanelStore.getState().setReady('s1')
+    render(<BrowserSurface sessionId="s1" />)
+
+    const controls = screen.getByTestId('browser-zoom-controls')
+    const actions = screen.getByTestId('browser-toolbar-actions')
+    const floatingControls = screen.getByTestId('browser-preview-floating-controls')
+    expect(controls).toHaveTextContent('100%')
+    expect(actions).not.toContainElement(controls)
+    expect(floatingControls).toContainElement(controls)
+    expect(screen.getByTestId('browser-preview-stage')).toContainElement(floatingControls)
+    expect(screen.getByTestId('preview-host').compareDocumentPosition(floatingControls) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+
+    fireEvent.click(screen.getByLabelText('缩小预览'))
+    expect(useBrowserPanelStore.getState().bySession['s1']!.zoom).toBe(0.9)
+    await waitFor(() => {
+      expect(bridge.setZoom).toHaveBeenLastCalledWith(0.9)
+    })
+    expect(controls).toHaveTextContent('90%')
+
+    fireEvent.click(screen.getByLabelText('重置预览缩放'))
+    expect(useBrowserPanelStore.getState().bySession['s1']!.zoom).toBe(1)
+    await waitFor(() => {
+      expect(bridge.setZoom).toHaveBeenLastCalledWith(1)
+    })
+  })
+
+  it('applies the session zoom before opening the native preview', async () => {
+    useBrowserPanelStore.getState().open('s1', 'http://localhost:5173/')
+    useBrowserPanelStore.getState().setZoom('s1', 0.8)
+    render(<BrowserSurface sessionId="s1" />)
+
+    await waitFor(() => {
+      expect(bridge.open).toHaveBeenCalled()
+    })
+    expect(bridge.setZoom).toHaveBeenCalledWith(0.8)
+    expect(bridge.setZoom.mock.invocationCallOrder[0]!).toBeLessThan(
+      bridge.open.mock.invocationCallOrder[0]!,
+    )
+  })
+
   it('renders the loading indicator while the session is loading (open starts loading)', () => {
     useBrowserPanelStore.getState().open('s1', 'http://localhost:5173/')
     render(<BrowserSurface sessionId="s1" />)
@@ -160,14 +275,16 @@ describe('BrowserSurface', () => {
     expect(screen.getByLabelText('刷新')).toHaveAttribute('aria-busy', 'false')
   })
 
-  it('reload flips the session back into loading and shows the indicator', () => {
+  it('reload flips the session back into loading and shows the indicator', async () => {
     useBrowserPanelStore.getState().open('s1', 'http://localhost:5173/')
     useBrowserPanelStore.getState().setReady('s1')
     render(<BrowserSurface sessionId="s1" />)
     expect(screen.queryByTestId('browser-loading-bar')).not.toBeInTheDocument()
     fireEvent.click(screen.getByLabelText('刷新'))
     expect(useBrowserPanelStore.getState().bySession['s1']!.loading).toBe(true)
-    expect(bridge.navigate).toHaveBeenCalledWith('http://localhost:5173/')
+    await waitFor(() => {
+      expect(bridge.navigate).toHaveBeenCalledWith('http://localhost:5173/')
+    })
     expect(screen.getByTestId('browser-loading-bar')).toBeInTheDocument()
   })
 

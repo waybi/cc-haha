@@ -1,17 +1,20 @@
-import { useEffect, useState, useCallback, useMemo, useRef } from 'react'
+import { useEffect, useLayoutEffect, useState, useCallback, useMemo, useRef } from 'react'
 import { Check, ChevronDown, Clock, Folder, FolderOpen, FolderPlus, GitBranch, LoaderCircle, MoreHorizontal, Pin, PinOff, RefreshCw, RotateCcw, SquarePen, X } from 'lucide-react'
 import { useSessionStore } from '../../stores/sessionStore'
 import { useUIStore } from '../../stores/uiStore'
 import { useTranslation, type TranslationKey } from '../../i18n'
 import { ConfirmDialog } from '../shared/ConfirmDialog'
 import { GlobalSearchModal } from '../search/GlobalSearchModal'
+import { FindInPageModal } from '../search/FindInPageModal'
 import type { SessionListItem } from '../../types/session'
-import { useTabStore, SETTINGS_TAB_ID, SCHEDULED_TAB_ID } from '../../stores/tabStore'
+import { useTabStore, SETTINGS_TAB_ID, SCHEDULED_TAB_ID, MARKET_TAB_ID } from '../../stores/tabStore'
 import { useChatStore } from '../../stores/chatStore'
 import { useOpenTargetStore } from '../../stores/openTargetStore'
 import { desktopUiPreferencesApi, type SidebarProjectPreferences } from '../../api/desktopUiPreferences'
 import { getDesktopHost } from '../../lib/desktopHost'
 import { publicAssetPath } from '../../lib/publicAsset'
+import { hasRunningBackgroundTasks } from '../../lib/backgroundTasks'
+import { getSessionWorkspaceState } from '../../lib/sessionWorkspace'
 
 const desktopHost = getDesktopHost()
 const isDesktopRuntime = desktopHost.isDesktop
@@ -44,11 +47,17 @@ type SidebarProps = {
   onRequestClose?: () => void
 }
 
+type SessionScrollAnchor = {
+  sessionId: string
+  topOffset: number
+}
+
 export function Sidebar({ isMobile = false, onRequestClose }: SidebarProps) {
   const t = useTranslation()
   const sessions = useSessionStore((s) => s.sessions)
   const isLoading = useSessionStore((s) => s.isLoading)
   const error = useSessionStore((s) => s.error)
+  const indexStatus = useSessionStore((s) => s.indexStatus)
   const fetchSessions = useSessionStore((s) => s.fetchSessions)
   const deleteSession = useSessionStore((s) => s.deleteSession)
   const deleteSessions = useSessionStore((s) => s.deleteSessions)
@@ -92,7 +101,43 @@ export function Sidebar({ isMobile = false, onRequestClose }: SidebarProps) {
   const [projectDropTarget, setProjectDropTarget] = useState<{ key: string; position: 'before' | 'after' } | null>(null)
   const suppressProjectClickRef = useRef<string | null>(null)
   const sidebarPreferenceRevisionRef = useRef(0)
+  const sessionScrollAreaRef = useRef<HTMLDivElement>(null)
+  const pendingSessionScrollAnchorRef = useRef<SessionScrollAnchor | null>(null)
   const refreshSessionsNow = useSessionListAutoRefresh(fetchSessions)
+
+  useEffect(() => useSessionStore.subscribe((nextState, previousState) => {
+    if (nextState.sessions === previousState.sessions) return
+
+    pendingSessionScrollAnchorRef.current = null
+    if (
+      nextState.indexStatus === previousState.indexStatus
+      || nextState.indexStatus?.mode !== 'on'
+      || nextState.indexStatus.state !== 'building'
+    ) {
+      return
+    }
+
+    const scrollArea = sessionScrollAreaRef.current
+    if (!scrollArea || scrollArea.scrollTop <= 0) return
+    pendingSessionScrollAnchorRef.current = readFirstVisibleSessionAnchor(scrollArea)
+  }), [])
+
+  useLayoutEffect(() => {
+    const anchor = pendingSessionScrollAnchorRef.current
+    pendingSessionScrollAnchorRef.current = null
+    if (!anchor) return
+
+    const scrollArea = sessionScrollAreaRef.current
+    if (!scrollArea || scrollArea.scrollTop <= 0) return
+    const row = findSessionRow(scrollArea, anchor.sessionId)
+    if (!row) return
+
+    const topOffset = row.getBoundingClientRect().top - scrollArea.getBoundingClientRect().top
+    const delta = topOffset - anchor.topOffset
+    if (Number.isFinite(delta) && delta !== 0) {
+      scrollArea.scrollTop += delta
+    }
+  }, [sessions])
 
   useEffect(() => {
     if (!contextMenu) return
@@ -127,6 +172,18 @@ export function Sidebar({ isMobile = false, onRequestClose }: SidebarProps) {
     ))
   }, [hiddenProjectKeys, orderedProjectGroups])
   const showInitialLoading = isLoading && sessions.length === 0
+  const showRefreshLoading = showInitialLoading
+  const showIndexBuilding = indexStatus?.state === 'building' && sessions.length > 0
+  const showIndexDegraded = indexStatus?.state === 'degraded'
+  const indexAnnouncement = indexStatus
+    ? t(indexStatus.state === 'building'
+      ? 'sidebar.indexBuilding'
+      : indexStatus.state === 'ready'
+        ? 'sidebar.indexReady'
+        : indexStatus.state === 'degraded'
+          ? 'sidebar.indexDegraded'
+          : 'sidebar.indexOff')
+    : ''
   const filteredSessionIds = useMemo(() => filteredSessions.map((session) => session.id), [filteredSessions])
   const selectedCount = selectedSessionIds.size
   const sessionsById = useMemo(
@@ -139,7 +196,9 @@ export function Sidebar({ isMobile = false, onRequestClose }: SidebarProps) {
       if (tab.type === 'session' && tab.status === 'running') ids.add(tab.sessionId)
     }
     for (const [sessionId, sessionState] of Object.entries(chatSessions)) {
-      if (sessionState.chatState !== 'idle') ids.add(sessionId)
+      if (sessionState.chatState !== 'idle' || hasRunningBackgroundTasks(sessionState.backgroundAgentTasks)) {
+        ids.add(sessionId)
+      }
     }
     return ids
   }, [chatSessions, tabs])
@@ -683,6 +742,21 @@ export function Sidebar({ isMobile = false, onRequestClose }: SidebarProps) {
             {t('sidebar.scheduled')}
           </NavItem>
         )}
+        {!isMobile && (
+          <NavItem
+            active={activeTabId === MARKET_TAB_ID}
+            collapsed={!expanded}
+            label={t('sidebar.market')}
+            touchFriendly={isMobile}
+            onClick={() => {
+              useTabStore.getState().openTab(MARKET_TAB_ID, t('sidebar.market'), 'market')
+              closeMobileDrawer()
+            }}
+            icon={<StorefrontIcon />}
+          >
+            {t('sidebar.market')}
+          </NavItem>
+        )}
       </div>
 
       {expanded ? (
@@ -709,12 +783,11 @@ export function Sidebar({ isMobile = false, onRequestClose }: SidebarProps) {
               <button
                 type="button"
                 onClick={() => void refreshSessionsNow()}
-                disabled={isLoading}
                 className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-[12px] border border-[var(--color-sidebar-search-border)] bg-[var(--color-sidebar-search-bg)] text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-sidebar-item-hover)] hover:text-[var(--color-text-primary)] disabled:cursor-default disabled:opacity-65 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-border-focus)]"
                 aria-label={t('sidebar.refreshSessions')}
                 title={t('sidebar.refreshSessions')}
               >
-                <RefreshCw className={`h-4 w-4 ${isLoading ? 'animate-spin' : ''}`} strokeWidth={1.9} aria-hidden="true" />
+                <RefreshCw className={`h-4 w-4 ${showRefreshLoading ? 'animate-spin' : ''}`} strokeWidth={1.9} aria-hidden="true" />
               </button>
               <button
                 type="button"
@@ -782,7 +855,35 @@ export function Sidebar({ isMobile = false, onRequestClose }: SidebarProps) {
                 </div>
               </div>
             )}
-            <div className="sidebar-scroll-area min-h-0 flex-1 overflow-y-auto px-3 pb-20">
+            <div role="status" aria-live="polite" aria-atomic="true" className="sr-only">
+              {indexAnnouncement}
+            </div>
+            {showIndexBuilding && (
+              <div
+                data-testid="sidebar-index-progress"
+                aria-hidden="true"
+                className="mx-4 mb-1 flex-none text-[11px] leading-5 text-[var(--color-text-tertiary)]"
+              >
+                {t('sidebar.indexBuildingProgress', {
+                  indexed: indexStatus.indexed,
+                  discovered: indexStatus.discovered,
+                })}
+              </div>
+            )}
+            {showIndexDegraded && (
+              <div
+                data-testid="sidebar-index-degraded"
+                aria-hidden="true"
+                className="mx-4 mb-1 flex-none text-[11px] leading-5 text-[var(--color-text-tertiary)]"
+              >
+                {t('sidebar.indexDegraded')}
+              </div>
+            )}
+            <div
+              ref={sessionScrollAreaRef}
+              data-testid="sidebar-session-scroll-area"
+              className="sidebar-scroll-area min-h-0 flex-1 overflow-y-auto px-3 pb-20"
+            >
               {error && (
                 <div className="mx-1 mt-2 rounded-[var(--radius-md)] border border-[var(--color-error)]/20 bg-[var(--color-error)]/5 px-3 py-2">
                   <div className="text-xs font-medium text-[var(--color-error)]">{t('sidebar.sessionListFailed')}</div>
@@ -937,7 +1038,11 @@ export function Sidebar({ isMobile = false, onRequestClose }: SidebarProps) {
                           data-testid={`sidebar-project-session-list-${domSafeProjectKey(project.key)}`}
                         >
                           {visibleItems.map((session) => (
-                            <div key={session.id} className="relative mb-0.5 last:mb-0">
+                            <div
+                              key={session.id}
+                              data-sidebar-session-id={session.id}
+                              className="relative mb-0.5 last:mb-0"
+                            >
                               {renamingId === session.id ? (
                                 <input
                                   autoFocus
@@ -975,13 +1080,14 @@ export function Sidebar({ isMobile = false, onRequestClose }: SidebarProps) {
                                     }
                                   `}
                                   aria-pressed={isBatchMode ? selectedSessionIds.has(session.id) : undefined}
+                                  title={session.title || 'Untitled'}
                                 >
                                   <span className="flex min-w-0 items-center gap-2">
                                     {isBatchMode ? (
                                       <span
                                         className={`flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-[5px] border transition-colors ${
                                           selectedSessionIds.has(session.id)
-                                            ? 'border-[var(--color-brand)] bg-[var(--color-brand)] text-white'
+                                            ? 'border-[var(--color-brand)] bg-[var(--color-brand)] text-[var(--color-on-primary)]'
                                             : 'border-[var(--color-border)] bg-[var(--color-surface)]'
                                         }`}
                                         aria-hidden="true"
@@ -992,7 +1098,7 @@ export function Sidebar({ isMobile = false, onRequestClose }: SidebarProps) {
                                       </span>
                                     ) : null}
                                     <span className="min-w-0 flex-1 truncate font-medium tracking-normal">{session.title || 'Untitled'}</span>
-                                    {!session.workDirExists && (
+                                    {getSessionWorkspaceState(session) === 'missing' && (
                                       <span
                                         className="flex-shrink-0 text-[10px] text-[var(--color-warning)]"
                                         title={session.workDir ?? ''}
@@ -1204,6 +1310,7 @@ export function Sidebar({ isMobile = false, onRequestClose }: SidebarProps) {
       />
 
       <GlobalSearchModal open={activeModal === 'globalSearch'} onClose={closeModal} />
+      <FindInPageModal open={activeModal === 'findInPage'} onClose={closeModal} />
     </aside>
   )
 }
@@ -1213,7 +1320,7 @@ function useSessionListAutoRefresh(fetchSessions: () => Promise<void>): () => Pr
   const lastStartedAtRef = useRef(0)
 
   const refreshSessions = useCallback((force = false) => {
-    if (inFlightRef.current) return inFlightRef.current
+    if (inFlightRef.current && !force) return inFlightRef.current
 
     const now = Date.now()
     if (!force && now - lastStartedAtRef.current < SESSION_LIST_FOCUS_REFRESH_MIN_MS) {
@@ -1245,7 +1352,7 @@ function useSessionListAutoRefresh(fetchSessions: () => Promise<void>): () => Pr
     document.addEventListener('visibilitychange', refreshIfVisible)
     const timer = window.setInterval(() => {
       if (!isDocumentVisible()) return
-      void refreshSessions(true)
+      void refreshSessions()
     }, SESSION_LIST_AUTO_REFRESH_MS)
 
     return () => {
@@ -1260,6 +1367,30 @@ function useSessionListAutoRefresh(fetchSessions: () => Promise<void>): () => Pr
 
 function isDocumentVisible(): boolean {
   return typeof document === 'undefined' || document.visibilityState !== 'hidden'
+}
+
+function readFirstVisibleSessionAnchor(scrollArea: HTMLElement): SessionScrollAnchor | null {
+  const scrollRect = scrollArea.getBoundingClientRect()
+  const rows = scrollArea.querySelectorAll<HTMLElement>('[data-sidebar-session-id]')
+  for (const row of rows) {
+    const rowRect = row.getBoundingClientRect()
+    if (rowRect.bottom <= scrollRect.top || rowRect.top >= scrollRect.bottom) continue
+    const sessionId = row.dataset.sidebarSessionId
+    if (!sessionId) continue
+    return {
+      sessionId,
+      topOffset: rowRect.top - scrollRect.top,
+    }
+  }
+  return null
+}
+
+function findSessionRow(scrollArea: HTMLElement, sessionId: string): HTMLElement | null {
+  const rows = scrollArea.querySelectorAll<HTMLElement>('[data-sidebar-session-id]')
+  for (const row of rows) {
+    if (row.dataset.sidebarSessionId === sessionId) return row
+  }
+  return null
 }
 
 function ProjectHeaderActions({
@@ -1937,6 +2068,17 @@ function ClockIcon() {
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <circle cx="12" cy="12" r="10" />
       <polyline points="12 6 12 12 16 14" />
+    </svg>
+  )
+}
+
+function StorefrontIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M3 9l1.5-5h15L21 9" />
+      <path d="M4 9v11h16V9" />
+      <path d="M4 9c0 1.5 1.3 2.5 2.8 2.5S9.7 10.5 9.7 9c0 1.5 1.3 2.5 2.8 2.5s2.8-1 2.8-2.5c0 1.5 1.3 2.5 2.8 2.5S21 10.5 21 9" />
+      <path d="M9 20v-6h6v6" />
     </svg>
   )
 }

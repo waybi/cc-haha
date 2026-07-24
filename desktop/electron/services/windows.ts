@@ -8,6 +8,7 @@ export const DEFAULT_WINDOW_HEIGHT = 820
 export const MIN_WINDOW_WIDTH = 960
 export const MIN_WINDOW_HEIGHT = 640
 const MIN_VISIBLE_PIXELS = 80
+const failedWindowStateWritePaths = new Set<string>()
 
 export type StoredWindowState = {
   x: number
@@ -27,7 +28,7 @@ export type WindowChromeOptions = Pick<
 >
 
 export function windowStatePath(app: App, env: NodeJS.ProcessEnv = process.env): string {
-  return path.join(env.CLAUDE_CONFIG_DIR || app.getPath('userData'), WINDOW_STATE_FILE)
+  return path.join(env.CLAUDE_CONFIG_DIR || path.join(app.getPath('home'), '.claude'), WINDOW_STATE_FILE)
 }
 
 export function isPersistableWindowState(state: StoredWindowState): boolean {
@@ -92,7 +93,11 @@ export function readWindowState(
   env: NodeJS.ProcessEnv = process.env,
   platform = process.platform,
 ): StoredWindowState | null {
-  const statePath = windowStatePath(app, env)
+  let statePath = windowStatePath(app, env)
+  if (!existsSync(statePath) && !env.CLAUDE_CONFIG_DIR) {
+    const legacyStatePath = path.join(app.getPath('userData'), WINDOW_STATE_FILE)
+    if (existsSync(legacyStatePath)) statePath = legacyStatePath
+  }
   if (!existsSync(statePath)) return null
 
   try {
@@ -115,11 +120,22 @@ export function writeWindowState(
 ) {
   if (!isPersistableWindowState(state)) return
   const statePath = windowStatePath(app, env)
-  mkdirSync(path.dirname(statePath), { recursive: true })
-  writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`)
+  try {
+    mkdirSync(path.dirname(statePath), { recursive: true })
+    writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`)
+    failedWindowStateWritePaths.delete(statePath)
+  } catch (error) {
+    if (!failedWindowStateWritePaths.has(statePath)) {
+      failedWindowStateWritePaths.add(statePath)
+      console.error(`[desktop] failed to write Electron window state ${statePath}:`, error)
+    }
+  }
 }
 
 export function captureWindowState(window: BrowserWindow): StoredWindowState | null {
+  // quitAndInstall/quit can emit late move/resize/close events on an already
+  // torn-down native window; touching it then throws "Object has been destroyed".
+  if (window.isDestroyed()) return null
   if (window.isMinimized()) return null
   const bounds = window.getBounds()
   const state = {
@@ -212,6 +228,31 @@ export function showMainWindow(window: BrowserWindow | null, app?: MacOsWindowVi
   if (!window.isVisible()) window.show()
   if (window.isMinimized()) window.restore()
   window.focus()
+}
+
+export function refreshWindowsDragHitTest(
+  window: BrowserWindow,
+  platform: NodeJS.Platform = process.platform,
+  delayMs = 100,
+): (() => void) | undefined {
+  if (platform !== 'win32') return undefined
+
+  const timer = setTimeout(() => {
+    if (
+      window.isDestroyed()
+      || window.isMinimized()
+      || window.isMaximized()
+      || window.isFullScreen()
+    ) {
+      return
+    }
+
+    const bounds = window.getBounds()
+    window.setBounds({ ...bounds, height: bounds.height + 1 })
+    window.setBounds(bounds)
+  }, delayMs)
+
+  return () => clearTimeout(timer)
 }
 
 export function installWindowLifecycle({

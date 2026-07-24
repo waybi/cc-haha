@@ -1,6 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
-import { MessageList, buildRenderModel, shouldVirtualizeRenderItems } from './MessageList'
+import {
+  MessageList,
+  buildRenderModel,
+  buildVirtualItemOffsets,
+  getActiveConversationNavigationItemId,
+  getConversationNavigationTargetScrollTop,
+  isRenderItemFullyVisibleInChatScroller,
+  resetSessionScrollSnapshotsForTests,
+  shouldVirtualizeRenderItems,
+} from './MessageList'
+import type { ConversationNavigationItem } from './ConversationNavigator'
 import type { VirtualRenderItemMetric } from './virtualHeightCache'
 import { relativizeWorkspacePath } from './CurrentTurnChangeCard'
 import { sessionsApi } from '../../api/sessions'
@@ -11,8 +21,10 @@ import { useSettingsStore } from '../../stores/settingsStore'
 import { useSessionStore } from '../../stores/sessionStore'
 import { useTabStore } from '../../stores/tabStore'
 import { useUIStore } from '../../stores/uiStore'
+import { formatExactMessageTimestamp, formatMessageHoverTime } from '../../lib/formatMessageTimestamp'
 import type { UIMessage } from '../../types/chat'
 import type { PerSessionState } from '../../stores/chatStore'
+import { FindInPageModal } from '../search/FindInPageModal'
 
 const ACTIVE_TAB = 'active-tab'
 
@@ -217,6 +229,7 @@ describe('MessageList nested tool calls', () => {
   beforeEach(() => {
     vi.restoreAllMocks()
     vi.unstubAllGlobals()
+    resetSessionScrollSnapshotsForTests()
     useSettingsStore.setState({ locale: 'en' })
     useUIStore.setState({ pendingSettingsTab: null })
     useTabStore.setState({ activeTabId: ACTIVE_TAB, tabs: [{ sessionId: ACTIVE_TAB, title: 'Test', type: 'session' as const, status: 'idle' }] })
@@ -273,6 +286,198 @@ describe('MessageList nested tool calls', () => {
     for (const item of container.querySelectorAll('[data-virtual-message-item]')) {
       expect((item as HTMLElement).className).not.toContain('chat-render-item--cv')
     }
+  })
+
+  it('finds, mounts, navigates, and highlights matches outside a 120-item virtual window', async () => {
+    const highlights = new Map<string, { ranges: Range[]; priority?: number }>()
+    class TestHighlight {
+      ranges: Range[] = []
+      priority?: number
+
+      add(range: Range) {
+        this.ranges.push(range)
+      }
+    }
+    vi.stubGlobal('CSS', { highlights })
+    vi.stubGlobal('Highlight', TestHighlight)
+
+    const messages = Array.from({ length: 130 }, (_, index) => ({
+      id: `assistant-${index}`,
+      type: 'assistant_text' as const,
+      content: index === 0 || index === 64
+        ? `Virtual history needle ${index}`
+        : `Virtual history filler ${index}`,
+      timestamp: index,
+    }))
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages,
+        }),
+      },
+    })
+
+    const { container } = render(
+      <>
+        <MessageList />
+        <FindInPageModal open onClose={() => {}} />
+      </>,
+    )
+    const scroller = container.querySelector('.chat-scroll-area') as HTMLElement
+    let scrollTop = 15_000
+    Object.defineProperty(scroller, 'clientHeight', { configurable: true, value: 500 })
+    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, value: 16_000 })
+    Object.defineProperty(scroller, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTop,
+      set: (value: number) => { scrollTop = value },
+    })
+
+    expect(screen.queryByText('Virtual history needle 0')).toBeNull()
+    expect(screen.queryByText('Virtual history needle 64')).toBeNull()
+
+    fireEvent.change(screen.getByPlaceholderText('Find'), { target: { value: 'Virtual history needle' } })
+
+    await waitFor(() => expect(screen.getByText('1 / 2')).toBeTruthy())
+    await waitFor(() => expect(screen.getByText('Virtual history needle 0')).toBeTruthy())
+    expect(scrollTop).toBe(0)
+    await waitFor(() => expect(highlights.get('cc-find-active')?.ranges[0]?.startContainer.parentElement?.closest('[data-chat-render-item-key]')?.getAttribute('data-chat-render-item-key')).toBe('assistant-0'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Next match' }))
+
+    await waitFor(() => expect(screen.getByText('2 / 2')).toBeTruthy())
+    await waitFor(() => expect(screen.getByText('Virtual history needle 64')).toBeTruthy())
+    expect(scrollTop).toBeGreaterThan(0)
+    expect(highlights.get('cc-find-active')?.ranges[0]?.startContainer.parentElement?.closest('[data-chat-render-item-key]')?.getAttribute('data-chat-render-item-key')).toBe('assistant-64')
+
+    act(() => {
+      useChatStore.setState({
+        sessions: {
+          [ACTIVE_TAB]: makeSessionState({
+            messages: [...messages, {
+              id: 'assistant-new-tail',
+              type: 'assistant_text',
+              content: 'new Virtual history needle response',
+              timestamp: 131,
+            }],
+          }),
+        },
+      })
+    })
+    await waitFor(() => expect(screen.getByText('2 / 3')).toBeTruthy())
+    expect(highlights.get('cc-find-active')?.ranges[0]?.startContainer.parentElement?.closest('[data-chat-render-item-key]')?.getAttribute('data-chat-render-item-key')).toBe('assistant-64')
+  })
+
+  it('bounds semantic conversation matches and ignores hidden tool payloads', async () => {
+    const highlights = new Map<string, { ranges: Range[] }>()
+    class TestHighlight {
+      ranges: Range[] = []
+
+      add(range: Range) {
+        this.ranges.push(range)
+      }
+    }
+    vi.stubGlobal('CSS', { highlights })
+    vi.stubGlobal('Highlight', TestHighlight)
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [
+            {
+              id: 'assistant-many-matches',
+              type: 'assistant_text',
+              content: 'boundedneedle '.repeat(1_100),
+              timestamp: 1,
+            },
+            {
+              id: 'hidden-tool-payload',
+              type: 'tool_result',
+              toolUseId: 'tool-1',
+              content: 'hiddenpayloadneedle '.repeat(10_000),
+              isError: false,
+              timestamp: 2,
+            },
+          ],
+        }),
+      },
+    })
+
+    render(
+      <>
+        <MessageList />
+        <FindInPageModal open onClose={() => {}} />
+      </>,
+    )
+
+    fireEvent.change(screen.getByPlaceholderText('Find'), { target: { value: 'boundedneedle' } })
+    await waitFor(() => expect(screen.getByText('1 / 1000')).toBeTruthy())
+    await waitFor(() => expect(highlights.get('cc-find-results')?.ranges).toHaveLength(1_000))
+
+    fireEvent.change(screen.getByPlaceholderText('Find'), { target: { value: 'hiddenpayloadneedle' } })
+    await waitFor(() => expect(screen.getByText('0')).toBeTruthy())
+  })
+
+  it('finds the current streaming assistant response', async () => {
+    const highlights = new Map<string, { ranges: Range[] }>()
+    class TestHighlight {
+      ranges: Range[] = []
+
+      add(range: Range) {
+        this.ranges.push(range)
+      }
+    }
+    vi.stubGlobal('CSS', { highlights })
+    vi.stubGlobal('Highlight', TestHighlight)
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          chatState: 'streaming',
+          streamingText: 'Current streaming response without the target',
+        }),
+      },
+    })
+
+    render(
+      <>
+        <MessageList />
+        <FindInPageModal open onClose={() => {}} />
+      </>,
+    )
+
+    fireEvent.change(screen.getByPlaceholderText('Find'), { target: { value: 'late streaming needle' } })
+
+    await waitFor(() => expect(screen.getByText('0')).toBeTruthy())
+    act(() => {
+      useChatStore.setState({
+        sessions: {
+          [ACTIVE_TAB]: makeSessionState({
+            chatState: 'streaming',
+            streamingText: 'Current late streaming needle',
+          }),
+        },
+      })
+    })
+
+    await waitFor(() => expect(screen.getByText('1 / 1')).toBeTruthy())
+    await waitFor(() => expect(highlights.get('cc-find-active')?.ranges[0]?.startContainer.parentElement?.closest('[data-chat-render-item-key]')?.getAttribute('data-chat-render-item-key')).toBe('streaming-assistant-message'))
+
+    act(() => {
+      useChatStore.setState({
+        sessions: {
+          [ACTIVE_TAB]: makeSessionState({
+            messages: [{
+              id: 'assistant-completed-stream',
+              type: 'assistant_text',
+              content: 'Current late streaming needle',
+              timestamp: 2,
+            }],
+            chatState: 'idle',
+            streamingText: '',
+          }),
+        },
+      })
+    })
+    await waitFor(() => expect(highlights.get('cc-find-active')?.ranges[0]?.startContainer.parentElement?.closest('[data-chat-render-item-key]')?.getAttribute('data-chat-render-item-key')).toBe('assistant-completed-stream'))
   })
 
   it('keeps small transcripts fully mounted without deferred browser painting', () => {
@@ -338,6 +543,249 @@ describe('MessageList nested tool calls', () => {
 
     expect(container.querySelector('[data-virtual-message-item]')).not.toBeNull()
     expect(screen.getByText('latest assistant reply')).toBeTruthy()
+  })
+
+  it('keeps the conversation navigator available in compact desktop transcripts', () => {
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [
+            { id: 'user-1', type: 'user_text', content: 'First prompt', timestamp: 1 },
+            { id: 'assistant-1', type: 'assistant_text', content: 'First answer', timestamp: 2 },
+            { id: 'user-2', type: 'user_text', content: 'Second prompt', timestamp: 3 },
+            { id: 'assistant-2', type: 'assistant_text', content: 'Second answer', timestamp: 4 },
+          ],
+        }),
+      },
+    })
+
+    const { rerender } = render(<MessageList />)
+    expect(screen.getByRole('navigation', { name: 'Conversation navigation' })).toBeTruthy()
+
+    rerender(<MessageList compact />)
+    expect(screen.getByRole('navigation', { name: 'Conversation navigation' })).toBeTruthy()
+  })
+
+  it('adapts the conversation navigator when the chat column is resized by adjacent panels', () => {
+    const observers: Array<{
+      callback: ResizeObserverCallback
+      targets: Element[]
+    }> = []
+    class TestResizeObserver {
+      targets: Element[] = []
+      observe = vi.fn((target: Element) => {
+        this.targets.push(target)
+      })
+      unobserve = vi.fn()
+      disconnect = vi.fn()
+
+      constructor(callback: ResizeObserverCallback) {
+        observers.push({ callback, targets: this.targets })
+      }
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver)
+
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [
+            { id: 'user-1', type: 'user_text', content: 'First prompt', timestamp: 1 },
+            { id: 'assistant-1', type: 'assistant_text', content: 'First answer', timestamp: 2 },
+            { id: 'user-2', type: 'user_text', content: 'Second prompt', timestamp: 3 },
+            { id: 'assistant-2', type: 'assistant_text', content: 'Second answer', timestamp: 4 },
+          ],
+        }),
+      },
+    })
+
+    const { rerender } = render(<MessageList />)
+    const messageList = screen.getByTestId('message-list')
+    const scroller = messageList.querySelector('.chat-scroll-area') as HTMLElement
+    const layoutObserver = observers.find(({ targets }) => targets.includes(messageList))
+    expect(layoutObserver).toBeTruthy()
+    expect(screen.getByTestId('conversation-navigator').getAttribute('data-mode')).toBe('full')
+    expect(scroller.className.split(/\s+/)).toContain('px-20')
+
+    const resizeTo = (width: number) => {
+      act(() => {
+        layoutObserver?.callback([{
+          target: messageList,
+          contentRect: { width },
+        } as unknown as ResizeObserverEntry], {} as ResizeObserver)
+      })
+    }
+
+    resizeTo(900)
+    expect(screen.getByTestId('conversation-navigator').getAttribute('data-mode')).toBe('compact')
+    expect(scroller.className.split(/\s+/)).toContain('px-12')
+
+    resizeTo(640)
+    expect(screen.getByTestId('conversation-navigator').getAttribute('data-mode')).toBe('compact')
+
+    resizeTo(520)
+    expect(screen.getByTestId('conversation-navigator').getAttribute('data-mode')).toBe('edge')
+    expect(scroller.className.split(/\s+/)).toContain('px-7')
+
+    resizeTo(1000)
+    expect(screen.getByTestId('conversation-navigator').getAttribute('data-mode')).toBe('full')
+    expect(scroller.className.split(/\s+/)).toContain('px-20')
+    expect(scroller.className.split(/\s+/)).not.toContain('px-12')
+    expect(scroller.className.split(/\s+/)).not.toContain('px-7')
+
+    rerender(<MessageList compact />)
+    expect(scroller.className.split(/\s+/)).toContain('px-20')
+
+    resizeTo(900)
+    expect(scroller.className.split(/\s+/)).toContain('px-12')
+
+    resizeTo(520)
+    expect(scroller.className.split(/\s+/)).toContain('px-7')
+  })
+
+  it('updates the active conversation marker while the transcript scrolls', () => {
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [
+            { id: 'user-1', type: 'user_text', content: 'First prompt', timestamp: 1 },
+            { id: 'assistant-1', type: 'assistant_text', content: 'First answer', timestamp: 2 },
+            { id: 'user-2', type: 'user_text', content: 'Second prompt', timestamp: 3 },
+            { id: 'assistant-2', type: 'assistant_text', content: 'Second answer', timestamp: 4 },
+          ],
+        }),
+      },
+    })
+
+    const { container } = render(<MessageList />)
+    const scroller = container.querySelector('.chat-scroll-area') as HTMLElement
+    let scrollTop = 0
+    Object.defineProperty(scroller, 'clientHeight', { configurable: true, value: 200 })
+    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, value: 450 })
+    Object.defineProperty(scroller, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTop,
+      set: (value: number) => { scrollTop = value },
+    })
+
+    fireEvent.scroll(scroller)
+    expect(screen.getByRole('button', { name: /User message: First prompt/ }).getAttribute('aria-current')).toBe('location')
+
+    scrollTop = 250
+    fireEvent.scroll(scroller)
+    expect(screen.getByRole('button', { name: /User message: Second prompt/ }).getAttribute('aria-current')).toBe('location')
+  })
+
+  it('mounts and highlights a far virtualized message selected from the navigator', async () => {
+    const messages: UIMessage[] = Array.from({ length: 220 }, (_, index) => ({
+      id: `${index % 2 === 0 ? 'user' : 'assistant'}-${index}`,
+      type: index % 2 === 0 ? 'user_text' : 'assistant_text',
+      content: `${index % 2 === 0 ? 'Prompt' : 'Answer'} ${index}`,
+      timestamp: index,
+    })) as UIMessage[]
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({ messages }),
+      },
+    })
+
+    const { container } = render(<MessageList />)
+    const scroller = container.querySelector('.chat-scroll-area') as HTMLElement
+    let scrollTop = 24_000
+    Object.defineProperty(scroller, 'clientHeight', { configurable: true, value: 500 })
+    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, value: 25_000 })
+    Object.defineProperty(scroller, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTop,
+      set: (value: number) => { scrollTop = value },
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /User message: Prompt 0/ }))
+
+    await waitFor(() => expect(screen.getByText('Prompt 0')).toBeTruthy())
+    expect(scrollTop).toBe(0)
+    expect(container.querySelector('[data-chat-render-item-key="user-0"]')?.className).toContain('chat-render-item--navigation-target')
+  })
+
+  it('resumes following new output after navigating to the latest message', async () => {
+    const messages: UIMessage[] = [
+      { id: 'user-1', type: 'user_text', content: 'First prompt', timestamp: 1 },
+      { id: 'assistant-1', type: 'assistant_text', content: 'First answer', timestamp: 2 },
+      { id: 'user-2', type: 'user_text', content: 'Second prompt', timestamp: 3 },
+      { id: 'assistant-2', type: 'assistant_text', content: 'Second answer', timestamp: 4 },
+    ]
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({ messages }),
+      },
+    })
+
+    const { container } = render(<MessageList />)
+    const scroller = container.querySelector('.chat-scroll-area') as HTMLElement
+    let scrollTop = 100
+    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, value: 1000 })
+    Object.defineProperty(scroller, 'clientHeight', { configurable: true, value: 400 })
+    Object.defineProperty(scroller, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTop,
+      set: (value: number) => { scrollTop = value >= 1_000_000_000 ? 600 : value },
+    })
+    Object.defineProperty(scroller, 'scrollTo', {
+      configurable: true,
+      value: (options: ScrollToOptions) => { scroller.scrollTop = options.top ?? 0 },
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /Assistant message: Second answer/ }))
+    act(() => {
+      useChatStore.setState({
+        sessions: {
+          [ACTIVE_TAB]: makeSessionState({
+            messages,
+            chatState: 'streaming',
+            streamingText: 'More output from the latest reply',
+          }),
+        },
+      })
+    })
+
+    await waitFor(() => expect(scrollTop).toBe(600))
+  })
+
+  it('does not treat the last text marker as the transcript tail when tool output follows it', () => {
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [
+            { id: 'user-1', type: 'user_text', content: 'First prompt', timestamp: 1 },
+            { id: 'assistant-1', type: 'assistant_text', content: 'First answer', timestamp: 2 },
+            { id: 'user-2', type: 'user_text', content: 'Second prompt', timestamp: 3 },
+            { id: 'assistant-2', type: 'assistant_text', content: 'Second answer', timestamp: 4 },
+            {
+              id: 'tool-tail',
+              type: 'tool_use',
+              toolName: 'Read',
+              toolUseId: 'tool-tail-use',
+              input: { file_path: '/tmp/example.txt' },
+              timestamp: 5,
+            },
+          ],
+        }),
+      },
+    })
+
+    const { container } = render(<MessageList />)
+    const scroller = container.querySelector('.chat-scroll-area') as HTMLElement
+    let scrollTop = 100
+    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, value: 1000 })
+    Object.defineProperty(scroller, 'clientHeight', { configurable: true, value: 400 })
+    Object.defineProperty(scroller, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTop,
+      set: (value: number) => { scrollTop = value >= 1_000_000_000 ? 600 : value },
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /Assistant message: Second answer/ }))
+
+    expect(scrollTop).not.toBe(600)
   })
 
   it('filters duplicate unresolved AskUserQuestion cards while a matching permission is pending', () => {
@@ -535,6 +983,44 @@ describe('MessageList nested tool calls', () => {
     expect(screen.getByText('Budget: 0 / unlimited tokens')).toBeTruthy()
   })
 
+  it('renders goal continuation status as a divider between assistant turns', () => {
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [
+            {
+              id: 'assistant-1',
+              type: 'assistant_text',
+              content: '上一轮回答到这里。',
+              timestamp: 1,
+            },
+            {
+              id: 'goal-continue',
+              type: 'goal_event',
+              action: 'status',
+              status: 'continuing',
+              message: 'Goal continuing: 还需要补充验证',
+              timestamp: 2,
+            },
+            {
+              id: 'assistant-2',
+              type: 'assistant_text',
+              content: '后续轮次从这里开始。',
+              timestamp: 3,
+            },
+          ],
+        }),
+      },
+    })
+
+    render(<MessageList />)
+
+    expect(screen.getByTestId('goal-continuation-divider')).toBeTruthy()
+    expect(screen.getByText('Goal continuing')).toBeTruthy()
+    expect(screen.getByText('还需要补充验证')).toBeTruthy()
+    expect(screen.queryByText('Goal status')).toBeNull()
+  })
+
   it('renders non-agent background progress inline in the transcript', () => {
     useChatStore.setState({
       sessions: {
@@ -584,6 +1070,41 @@ describe('MessageList nested tool calls', () => {
     expect(card.textContent).toContain('Running Playwright checks')
     expect(card.textContent).toContain('1.2k tokens')
     expect(card.textContent).toContain('45s')
+  })
+
+  it('localizes non-agent background task duration units', () => {
+    useSettingsStore.setState({ locale: 'zh' })
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [
+            {
+              id: 'background-task-shell-1',
+              type: 'background_task',
+              timestamp: 2,
+              task: {
+                taskId: 'shell-task-1',
+                toolUseId: 'shell-tool-1',
+                status: 'completed',
+                taskType: 'local_bash',
+                summary: 'Running Playwright checks',
+                usage: {
+                  totalTokens: 1200,
+                  toolUses: 4,
+                  durationMs: 65000,
+                },
+                startedAt: 2,
+                updatedAt: 2,
+              },
+            },
+          ],
+        }),
+      },
+    })
+
+    render(<MessageList />)
+
+    expect(screen.getByTestId('background-task-event-card').textContent).toContain('1 分 5 秒')
   })
 
   it('renders stopped non-agent background tasks as neutral transcript events', () => {
@@ -685,6 +1206,33 @@ describe('MessageList nested tool calls', () => {
 
     expect(screen.queryByTestId('background-task-event-card')).toBeNull()
     expect(screen.queryByText('local_agent')).toBeNull()
+  })
+
+  it('does not render auto-dream background task events as separate transcript cards', () => {
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [{
+            id: 'background-task-dream-hidden',
+            type: 'background_task',
+            timestamp: 2,
+            task: {
+              taskId: 'dream-task-hidden',
+              status: 'running',
+              taskType: 'dream',
+              description: 'dreaming',
+              startedAt: 1,
+              updatedAt: 2,
+            },
+          }],
+        }),
+      },
+    })
+
+    render(<MessageList />)
+
+    expect(screen.queryByTestId('background-task-event-card')).toBeNull()
+    expect(screen.queryByText('dreaming')).toBeNull()
   })
 
   it('renders the historical window when scrolling away from latest', async () => {
@@ -850,6 +1398,8 @@ describe('MessageList nested tool calls', () => {
     const { container } = render(<MessageList />)
 
     expect(screen.getAllByText('Running').length).toBeGreaterThan(0)
+    expect(screen.queryByText(/Read .*example\.ts.*done/i)).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: /dispatched an agent/i }))
     expect(screen.getByText(/Read .*example\.ts.*done/i)).toBeTruthy()
     expect(container.textContent).toContain('Agent')
   })
@@ -1006,6 +1556,9 @@ describe('MessageList nested tool calls', () => {
     const groupSummary = screen.getByText('TaskUpdate (1), ran a command')
     const groupButton = groupSummary.closest('button')
     expect(groupButton?.textContent).not.toContain('check_circle')
+    expect(screen.queryByText('local_bash')).toBeNull()
+
+    fireEvent.click(groupButton!)
     expect(screen.getByText('local_bash')).toBeTruthy()
   })
 
@@ -1136,6 +1689,11 @@ describe('MessageList nested tool calls', () => {
     render(<MessageList sessionId={ACTIVE_TAB} />)
 
     expect(screen.getByText('Saved 1 memory item(s)')).toBeTruthy()
+    expect(screen.queryByText('preferences.md')).toBeNull()
+    expect(screen.queryByText('Tool details')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: /Saved 1 memory item/i }))
+
     expect(screen.getByText('preferences.md')).toBeTruthy()
     expect(screen.getByText('Tool details')).toBeTruthy()
     const memoryCardClassName = screen.getByTestId('memory-tool-activity-card').className
@@ -1333,6 +1891,218 @@ describe('MessageList nested tool calls', () => {
     ])
   })
 
+  it('honors a manual collapse of an agent group while more SubAgents stream in', async () => {
+    const initialMessages: UIMessage[] = [
+      {
+        id: 'tool-agent-a',
+        type: 'tool_use',
+        toolName: 'Agent',
+        toolUseId: 'agent-a',
+        input: { description: 'Review renderer' },
+        timestamp: 1,
+      },
+      {
+        id: 'result-agent-a',
+        type: 'tool_result',
+        toolUseId: 'agent-a',
+        content: 'Async agent launched successfully.',
+        isError: false,
+        timestamp: 2,
+      },
+      {
+        id: 'tool-agent-b',
+        type: 'tool_use',
+        toolName: 'Agent',
+        toolUseId: 'agent-b',
+        input: { description: 'Review stores' },
+        timestamp: 3,
+      },
+      {
+        id: 'result-agent-b',
+        type: 'tool_result',
+        toolUseId: 'agent-b',
+        content: 'Async agent launched successfully.',
+        isError: false,
+        timestamp: 4,
+      },
+    ]
+
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({ messages: initialMessages }),
+      },
+    })
+
+    render(<MessageList />)
+
+    const agentGroupButton = screen.getByRole('button', { name: /dispatched 2 agents/i })
+    expect(screen.queryByText('Review renderer')).toBeNull()
+    fireEvent.click(agentGroupButton)
+    expect(screen.getByText('Review renderer')).toBeTruthy()
+    fireEvent.click(agentGroupButton)
+    expect(screen.queryByText('Review renderer')).toBeNull()
+
+    act(() => {
+      useChatStore.setState({
+        sessions: {
+          [ACTIVE_TAB]: makeSessionState({
+            chatState: 'tool_executing',
+            messages: [
+              ...initialMessages,
+              {
+                id: 'tool-agent-c',
+                type: 'tool_use',
+                toolName: 'Agent',
+                toolUseId: 'agent-c',
+                input: { description: 'Review coverage' },
+                timestamp: 5,
+              },
+            ],
+          }),
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /dispatched 3 agents/i })).toBeTruthy()
+    })
+    expect(screen.queryByText('Review renderer')).toBeNull()
+    expect(screen.queryByText('Review coverage')).toBeNull()
+  })
+
+  it('honors a manual collapse of mixed tool groups when nested tool calls arrive', async () => {
+    const initialMessages: UIMessage[] = [
+      {
+        id: 'tool-task-update',
+        type: 'tool_use',
+        toolName: 'TaskUpdate',
+        toolUseId: 'task-update-1',
+        input: { id: '1', status: 'in_progress' },
+        timestamp: 1,
+      },
+      {
+        id: 'tool-bash',
+        type: 'tool_use',
+        toolName: 'Bash',
+        toolUseId: 'bash-1',
+        input: { command: 'git status --short' },
+        timestamp: 2,
+      },
+    ]
+
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          chatState: 'tool_executing',
+          messages: initialMessages,
+        }),
+      },
+    })
+
+    render(<MessageList />)
+
+    const mixedGroupButton = screen.getByRole('button', { name: /TaskUpdate \(1\), ran a command/i })
+    expect(screen.queryByText('git status --short')).toBeNull()
+    fireEvent.click(mixedGroupButton)
+    expect(screen.getByText('git status --short')).toBeTruthy()
+    fireEvent.click(mixedGroupButton)
+    expect(screen.queryByText('git status --short')).toBeNull()
+
+    act(() => {
+      useChatStore.setState({
+        sessions: {
+          [ACTIVE_TAB]: makeSessionState({
+            chatState: 'tool_executing',
+            messages: [
+              ...initialMessages,
+              {
+                id: 'tool-child-read',
+                type: 'tool_use',
+                toolName: 'Read',
+                toolUseId: 'read-1',
+                input: { file_path: '/workspace/package.json' },
+                timestamp: 3,
+                parentToolUseId: 'task-update-1',
+              },
+            ],
+          }),
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /TaskUpdate \(1\), ran a command/i })).toBeTruthy()
+    })
+    expect(screen.queryByText('git status --short')).toBeNull()
+    expect(screen.queryByText('package.json')).toBeNull()
+  })
+
+  it('honors a manual collapse of memory activity when regular tools join the group', async () => {
+    const initialMessages: UIMessage[] = [
+      {
+        id: 'tool-memory-write',
+        type: 'tool_use',
+        toolName: 'Write',
+        toolUseId: 'memory-write-1',
+        input: {
+          file_path: '/Users/test/.codex/memory/project-notes.md',
+          content: 'Persisted context',
+        },
+        timestamp: 1,
+      },
+      {
+        id: 'result-memory-write',
+        type: 'tool_result',
+        toolUseId: 'memory-write-1',
+        content: 'Wrote 1 line to /Users/test/.codex/memory/project-notes.md',
+        isError: false,
+        timestamp: 2,
+      },
+    ]
+
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({ messages: initialMessages }),
+      },
+    })
+
+    render(<MessageList />)
+
+    expect(screen.getByText('Saved 1 memory item(s)')).toBeTruthy()
+    const memoryActivityButton = screen.getByRole('button', { name: /Saved 1 memory item/i })
+    expect(screen.queryByText('project-notes.md')).toBeNull()
+    fireEvent.click(memoryActivityButton)
+    expect(screen.getByText('project-notes.md')).toBeTruthy()
+    fireEvent.click(memoryActivityButton)
+    expect(screen.queryByText('project-notes.md')).toBeNull()
+
+    act(() => {
+      useChatStore.setState({
+        sessions: {
+          [ACTIVE_TAB]: makeSessionState({
+            chatState: 'tool_executing',
+            messages: [
+              ...initialMessages,
+              {
+                id: 'tool-bash',
+                type: 'tool_use',
+                toolName: 'Bash',
+                toolUseId: 'bash-1',
+                input: { command: 'bun test memory.test.ts' },
+                timestamp: 3,
+              },
+            ],
+          }),
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText('bun test memory.test.ts')).toBeTruthy()
+    })
+    expect(screen.queryByText('project-notes.md')).toBeNull()
+  })
+
   it('keeps later nested tool calls under their parent after an interleaved user message', () => {
     const messages: UIMessage[] = [
       {
@@ -1440,6 +2210,7 @@ describe('MessageList nested tool calls', () => {
 
     render(<MessageList />)
 
+    fireEvent.click(screen.getByRole('button', { name: /dispatched an agent/i }))
     expect(screen.getByText('Failed')).toBeTruthy()
     expect(screen.getByText('Explore agent unavailable in this session')).toBeTruthy()
   })
@@ -1483,6 +2254,7 @@ describe('MessageList nested tool calls', () => {
 
     render(<MessageList />)
 
+    fireEvent.click(screen.getByRole('button', { name: /dispatched an agent/i }))
     expect(screen.getByText('Done')).toBeTruthy()
     expect(screen.getByRole('button', { name: 'View result' })).toBeTruthy()
 
@@ -1493,6 +2265,39 @@ describe('MessageList nested tool calls', () => {
     expect(within(dialog).queryByText(/agentId:/)).toBeNull()
     expect(within(dialog).queryByText(/total_tokens/)).toBeNull()
     expect(screen.getByRole('button', { name: 'Close dialog' })).toBeTruthy()
+  })
+
+  it('opens the SubAgent run tab from an agent tool card', () => {
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [
+            {
+              id: 'tool-agent',
+              type: 'tool_use',
+              toolName: 'Agent',
+              toolUseId: 'agent-1',
+              input: { description: 'Inspect src/components' },
+              timestamp: 1,
+            },
+          ],
+        }),
+      },
+    })
+
+    render(<MessageList />)
+
+    fireEvent.click(screen.getByRole('button', { name: /dispatched an agent/i }))
+    fireEvent.click(screen.getByRole('button', { name: 'Open run Inspect src/components' }))
+
+    const expectedTabId = '__subagent__active-tab__agent-1'
+    expect(useTabStore.getState().activeTabId).toBe(expectedTabId)
+    expect(useTabStore.getState().tabs.find((tab) => tab.sessionId === expectedTabId)).toMatchObject({
+      title: 'Inspect src/components',
+      type: 'subagent',
+      sourceSessionId: ACTIVE_TAB,
+      subagentToolUseId: 'agent-1',
+    })
   })
 
   it('keeps async launched agents in running state until a terminal notification arrives', () => {
@@ -1569,6 +2374,7 @@ describe('MessageList nested tool calls', () => {
 
     render(<MessageList />)
 
+    fireEvent.click(screen.getByRole('button', { name: /dispatched an agent/i }))
     expect(screen.getByText('Done')).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: 'View result' }))
 
@@ -1623,6 +2429,7 @@ describe('MessageList nested tool calls', () => {
 
     render(<MessageList />)
 
+    fireEvent.click(screen.getByRole('button', { name: /dispatched an agent/i }))
     expect(screen.getByText(/最终报告应该按 Markdown 展示。/)).toBeTruthy()
     expect(screen.queryByText(/raw structured JSON should not be shown/)).toBeNull()
 
@@ -1686,6 +2493,7 @@ describe('MessageList nested tool calls', () => {
 
     render(<MessageList />)
 
+    fireEvent.click(screen.getByRole('button', { name: /dispatched an agent/i }))
     expect(screen.getByText(/git:v0\.2\.6\.\.v0\.2\.7:0/)).toBeTruthy()
     expect(screen.queryByText(/\{"results"/)).toBeNull()
 
@@ -2557,6 +3365,241 @@ describe('MessageList nested tool calls', () => {
     expect(screen.queryByRole('button', { name: 'Latest' })).toBeNull()
   })
 
+  it('keeps a pending file permission pinned when its preview grows after render', async () => {
+    const observers: Array<{
+      callback: ResizeObserverCallback
+      targets: Element[]
+    }> = []
+    class TestResizeObserver {
+      targets: Element[] = []
+      observe = vi.fn((target: Element) => {
+        this.targets.push(target)
+      })
+      unobserve = vi.fn()
+      disconnect = vi.fn()
+
+      constructor(callback: ResizeObserverCallback) {
+        observers.push({ callback, targets: this.targets })
+      }
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver)
+
+    const pendingPermission = {
+      requestId: 'permission-write-memory',
+      toolName: 'Write',
+      input: {
+        file_path: '/tmp/MEMORY.md',
+        content: Array.from({ length: 80 }, (_, index) => `Memory line ${index}`).join('\n'),
+      },
+    }
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          chatState: 'permission_pending',
+          pendingPermission,
+          pendingPermissions: {
+            [pendingPermission.requestId]: pendingPermission,
+          },
+          messages: [
+            ...Array.from({ length: 130 }, (_, index) => ({
+              id: `assistant-history-${index}`,
+              type: 'assistant_text' as const,
+              content: `History line ${index}`,
+              timestamp: index,
+            })),
+            {
+              id: 'permission-write-memory-message',
+              type: 'permission_request',
+              requestId: pendingPermission.requestId,
+              toolName: pendingPermission.toolName,
+              input: pendingPermission.input,
+              timestamp: 131,
+            },
+          ],
+        }),
+      },
+    })
+
+    const { container } = render(<MessageList />)
+    const scroller = container.querySelector('.chat-scroll-area') as HTMLDivElement
+    const scrollContent = scroller.firstElementChild as HTMLElement
+    let scrollTop = 15000
+    let scrollHeight = 15521
+    Object.defineProperty(scroller, 'scrollHeight', {
+      configurable: true,
+      get: () => scrollHeight,
+    })
+    Object.defineProperty(scroller, 'clientHeight', { configurable: true, value: 521 })
+    Object.defineProperty(scroller, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTop,
+      set: (value) => {
+        scrollTop = value
+      },
+    })
+
+    await waitForProgrammaticScrollReset()
+    fireEvent.scroll(scroller)
+    const allowButton = await screen.findByRole('button', { name: 'Allow: /tmp/MEMORY.md' })
+
+    const contentObserver = observers.find(({ targets }) => targets.includes(scrollContent))
+    expect(contentObserver).toBeTruthy()
+    const permissionItem = allowButton.closest('[data-virtual-message-item]') as HTMLElement
+    expect(permissionItem).toBeTruthy()
+    const permissionItemObserver = observers.find(({ targets }) => targets.includes(permissionItem))
+    expect(permissionItemObserver).toBeTruthy()
+
+    scrollHeight = 15717
+    fireEvent.scroll(scroller)
+    act(() => {
+      permissionItemObserver?.callback([{
+        contentRect: { height: 520 },
+        target: permissionItem,
+      } as unknown as ResizeObserverEntry], {} as ResizeObserver)
+    })
+    act(() => {
+      contentObserver?.callback([{
+        contentRect: { height: 15717 },
+        target: scrollContent,
+      } as unknown as ResizeObserverEntry], {} as ResizeObserver)
+    })
+
+    expect(scrollTop).toBe(15196)
+    expect(screen.queryByRole('button', { name: 'Latest' })).toBeNull()
+  })
+
+  it('does not follow resize for stale permission state without a pending file permission', async () => {
+    let resizeCallback: ResizeObserverCallback | null = null
+    class TestResizeObserver {
+      observe = vi.fn()
+      unobserve = vi.fn()
+      disconnect = vi.fn()
+
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallback = callback
+      }
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver)
+
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          chatState: 'permission_pending',
+          messages: [{
+            id: 'assistant-restored',
+            type: 'assistant_text',
+            content: 'Restored completed response',
+            timestamp: 1,
+          }],
+        }),
+      },
+    })
+
+    const { container } = render(<MessageList />)
+    const scroller = container.querySelector('.chat-scroll-area') as HTMLDivElement
+    let scrollTop = 600
+    let scrollHeight = 1000
+    Object.defineProperty(scroller, 'scrollHeight', {
+      configurable: true,
+      get: () => scrollHeight,
+    })
+    Object.defineProperty(scroller, 'clientHeight', { configurable: true, value: 400 })
+    Object.defineProperty(scroller, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTop,
+      set: (value) => {
+        scrollTop = value
+      },
+    })
+
+    await waitForProgrammaticScrollReset()
+    fireEvent.scroll(scroller)
+
+    scrollHeight = 1400
+    act(() => {
+      resizeCallback?.([{
+        contentRect: { height: 1400 },
+      } as ResizeObserverEntry], {} as ResizeObserver)
+    })
+
+    expect(scrollTop).toBe(600)
+  })
+
+  it('preserves upward wheel and keyboard intent while a pending file permission preview resizes', async () => {
+    let resizeCallback: ResizeObserverCallback | null = null
+    class TestResizeObserver {
+      observe = vi.fn()
+      unobserve = vi.fn()
+      disconnect = vi.fn()
+
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallback = callback
+      }
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver)
+
+    const pendingPermission = {
+      requestId: 'permission-write-memory-wheel',
+      toolName: 'Write',
+      input: {
+        file_path: '/tmp/MEMORY.md',
+        content: 'Remember this preference',
+      },
+    }
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          chatState: 'permission_pending',
+          pendingPermission,
+          pendingPermissions: {
+            [pendingPermission.requestId]: pendingPermission,
+          },
+          messages: [{
+            id: 'permission-write-memory-wheel-message',
+            type: 'permission_request',
+            requestId: pendingPermission.requestId,
+            toolName: pendingPermission.toolName,
+            input: pendingPermission.input,
+            timestamp: 1,
+          }],
+        }),
+      },
+    })
+
+    const { container } = render(<MessageList />)
+    const scroller = container.querySelector('.chat-scroll-area') as HTMLDivElement
+    let scrollTop = 600
+    let scrollHeight = 1000
+    Object.defineProperty(scroller, 'scrollHeight', {
+      configurable: true,
+      get: () => scrollHeight,
+    })
+    Object.defineProperty(scroller, 'clientHeight', { configurable: true, value: 400 })
+    Object.defineProperty(scroller, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTop,
+      set: (value) => {
+        scrollTop = value
+      },
+    })
+
+    await waitForProgrammaticScrollReset()
+    fireEvent.scroll(scroller)
+
+    fireEvent.wheel(scroller, { deltaY: -120 })
+    fireEvent.keyDown(scroller, { key: 'PageUp', shiftKey: false })
+    fireEvent.keyDown(scroller, { key: 'ArrowDown', shiftKey: false })
+    scrollTop = 300
+    scrollHeight = 1400
+    act(() => {
+      resizeCallback?.([{
+        contentRect: { height: 1400 },
+      } as ResizeObserverEntry], {} as ResizeObserver)
+    })
+
+    expect(scrollTop).toBe(300)
+  })
+
   it('lets the user drag away from active thinking output before the programmatic scroll settles', async () => {
     let resizeCallback: ResizeObserverCallback | null = null
     class TestResizeObserver {
@@ -2953,6 +3996,55 @@ describe('MessageList nested tool calls', () => {
     expect(screen.getByRole('button', { name: 'Latest' })).toBeTruthy()
   })
 
+  it('restores a session scroll position after the message list remounts between conversations', async () => {
+    const sessionA = 'issue-1057-session-a'
+    const sessionB = 'issue-1057-session-b'
+    useChatStore.setState({
+      sessions: {
+        [sessionA]: makeSessionState({
+          messages: [
+            { id: 'a-user', type: 'user_text', content: 'A prompt', timestamp: 1 },
+            { id: 'a-assistant', type: 'assistant_text', content: 'A response', timestamp: 2 },
+          ],
+        }),
+        [sessionB]: makeSessionState({
+          messages: [
+            { id: 'b-user', type: 'user_text', content: 'B prompt', timestamp: 1 },
+            { id: 'b-assistant', type: 'assistant_text', content: 'B response', timestamp: 2 },
+          ],
+        }),
+      },
+    })
+
+    const firstSession = render(<MessageList sessionId={sessionA} />)
+    const firstScroller = firstSession.container.querySelector('.overflow-y-auto') as HTMLDivElement
+    let firstScrollTop = 180
+    Object.defineProperty(firstScroller, 'scrollHeight', { configurable: true, value: 1200 })
+    Object.defineProperty(firstScroller, 'clientHeight', { configurable: true, value: 400 })
+    Object.defineProperty(firstScroller, 'scrollTop', {
+      configurable: true,
+      get: () => firstScrollTop,
+      set: (value) => {
+        firstScrollTop = value
+      },
+    })
+
+    await waitForProgrammaticScrollReset()
+    fireEvent.scroll(firstScroller)
+    expect(screen.getByRole('button', { name: 'Latest' })).toBeTruthy()
+    firstSession.unmount()
+
+    const secondSession = render(<MessageList sessionId={sessionB} />)
+    expect(screen.getByText('B response')).toBeTruthy()
+    secondSession.unmount()
+
+    const restoredSession = render(<MessageList sessionId={sessionA} />)
+    const restoredScroller = restoredSession.container.querySelector('.overflow-y-auto') as HTMLDivElement
+
+    expect(restoredScroller.scrollTop).toBe(180)
+    expect(screen.getByRole('button', { name: 'Latest' })).toBeTruthy()
+  })
+
   it('scrolls new sessions to the latest message instead of inheriting another tab position', async () => {
     const scrollIntoView = vi.fn()
     Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
@@ -3242,8 +4334,9 @@ describe('MessageList nested tool calls', () => {
   })
 
   it('keeps user actions anchored to the right bubble and assistant actions to the left bubble', () => {
-    const now = new Date('2026-05-29T16:00:00+08:00').getTime()
-    vi.spyOn(Date, 'now').mockReturnValue(now)
+    const now = Date.now()
+    const userTimestamp = now - 5 * 60_000
+    const assistantTimestamp = now - 2 * 60 * 60_000
 
     useChatStore.setState({
       sessions: {
@@ -3253,13 +4346,13 @@ describe('MessageList nested tool calls', () => {
               id: 'user-1',
               type: 'user_text',
               content: '请把这条 prompt 放在右侧',
-              timestamp: now - 5 * 60_000,
+              timestamp: userTimestamp,
             },
             {
               id: 'assistant-1',
               type: 'assistant_text',
               content: '这条回复应该停在左侧。',
-              timestamp: now - 2 * 60 * 60_000,
+              timestamp: assistantTimestamp,
             },
           ],
         }),
@@ -3272,6 +4365,8 @@ describe('MessageList nested tool calls', () => {
     const assistantShell = screen.getByText('这条回复应该停在左侧。').closest('[data-message-shell="assistant"]')
     const userActions = screen.getByRole('button', { name: 'Copy prompt' }).closest('[data-message-actions]')
     const assistantActions = screen.getByRole('button', { name: 'Copy reply' }).closest('[data-message-actions]')
+    const userTime = within(userActions as HTMLElement).getByText(formatMessageHoverTime(userTimestamp, 'en'))
+    const assistantTime = within(assistantActions as HTMLElement).getByText(formatMessageHoverTime(assistantTimestamp, 'en'))
 
     expect(userShell).toBeTruthy()
     expect(userShell?.className).toContain('items-end')
@@ -3289,8 +4384,8 @@ describe('MessageList nested tool calls', () => {
     expect(userActions?.className).not.toContain('h-0')
     expect(userActions?.className).not.toContain('group-hover:h-7')
     expect(userActions?.className).not.toContain('invisible')
-    expect(within(userActions as HTMLElement).getByText('5m ago')).toBeTruthy()
-    expect(within(assistantActions as HTMLElement).getByText('2h ago')).toBeTruthy()
+    expect(userTime.getAttribute('title')).toBe(formatExactMessageTimestamp(userTimestamp, 'en'))
+    expect(assistantTime.getAttribute('title')).toBe(formatExactMessageTimestamp(assistantTimestamp, 'en'))
   })
 
   it('uses the document column for markdown-heavy assistant replies', () => {
@@ -3836,6 +4931,79 @@ describe('MessageList nested tool calls', () => {
     })
   })
 
+  it('rewinds a live turn with the authoritative checkpoint id when the local UI id differs', async () => {
+    vi.spyOn(sessionsApi, 'getTurnCheckpoints').mockResolvedValue({
+      checkpoints: [
+        {
+          target: {
+            targetUserMessageId: 'transcript-user-1',
+            userMessageIndex: 0,
+            userMessageCount: 1,
+          },
+          code: {
+            available: true,
+            filesChanged: ['src/live.ts'],
+            insertions: 1,
+            deletions: 0,
+          },
+        },
+      ],
+    })
+    const rewind = vi.spyOn(sessionsApi, 'rewind').mockResolvedValue({
+      target: {
+        targetUserMessageId: 'transcript-user-1',
+        userMessageIndex: 0,
+        userMessageCount: 1,
+      },
+      conversation: {
+        messagesRemoved: 2,
+      },
+      code: {
+        available: true,
+        filesChanged: ['src/live.ts'],
+        insertions: 1,
+        deletions: 0,
+      },
+    })
+
+    useChatStore.setState({
+      reloadHistory: vi.fn().mockResolvedValue(undefined),
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [
+            {
+              id: 'local-user-temp-id',
+              type: 'user_text',
+              content: '实时这一轮',
+              timestamp: 1,
+            },
+            {
+              id: 'assistant-1',
+              type: 'assistant_text',
+              content: 'done',
+              timestamp: 2,
+            },
+          ],
+        }),
+      },
+    })
+
+    render(<MessageList />)
+
+    await screen.findByText('live.ts')
+    fireEvent.click(screen.getByRole('button', { name: 'Undo current turn changes' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Undo current turn?' })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Undo current turn' }))
+
+    await waitFor(() => {
+      expect(rewind).toHaveBeenCalledWith(ACTIVE_TAB, {
+        targetUserMessageId: 'transcript-user-1',
+        userMessageIndex: 0,
+        expectedContent: '实时这一轮',
+      })
+    })
+  })
+
   it('keeps turn change cards anchored when the only response item is filtered from rendering', async () => {
     vi.spyOn(sessionsApi, 'getTurnCheckpoints').mockResolvedValue({
       checkpoints: [
@@ -3930,7 +5098,42 @@ describe('MessageList nested tool calls', () => {
         sessions: {
           [ACTIVE_TAB]: makeSessionState({
             messages,
+            chatState: 'idle',
+            backgroundAgentTasks: {
+              'agent-task-1': {
+                taskId: 'agent-task-1',
+                status: 'running',
+                taskType: 'local_agent',
+                description: 'Review screenshots',
+                startedAt: 1,
+                updatedAt: 2,
+              },
+            },
+          }),
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.queryByText('first.ts')).toBeNull()
+    })
+
+    act(() => {
+      useChatStore.setState({
+        sessions: {
+          [ACTIVE_TAB]: makeSessionState({
+            messages,
             chatState: 'thinking',
+            backgroundAgentTasks: {
+              'agent-task-1': {
+                taskId: 'agent-task-1',
+                status: 'completed',
+                taskType: 'local_agent',
+                description: 'Review screenshots',
+                startedAt: 1,
+                updatedAt: 3,
+              },
+            },
           }),
         },
       })
@@ -3939,6 +5142,67 @@ describe('MessageList nested tool calls', () => {
     await waitFor(() => {
       expect(screen.getByText('first.ts')).toBeTruthy()
     })
+  })
+
+  it('does not load turn change cards while background tasks are still running', async () => {
+    const getTurnCheckpoints = vi.spyOn(sessionsApi, 'getTurnCheckpoints').mockResolvedValue({
+      checkpoints: [
+        {
+          target: {
+            targetUserMessageId: 'user-1',
+            userMessageIndex: 0,
+            userMessageCount: 1,
+          },
+          code: {
+            available: true,
+            filesChanged: ['src/first.ts'],
+            insertions: 1,
+            deletions: 0,
+          },
+        },
+      ],
+    })
+
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [
+            {
+              id: 'user-1',
+              type: 'user_text',
+              content: '第一轮',
+              timestamp: 1,
+            },
+            {
+              id: 'assistant-1',
+              type: 'assistant_text',
+              content: 'done',
+              timestamp: 2,
+            },
+          ],
+          chatState: 'idle',
+          backgroundAgentTasks: {
+            'agent-task-1': {
+              taskId: 'agent-task-1',
+              status: 'running',
+              taskType: 'local_agent',
+              description: 'Review screenshots',
+              startedAt: 1,
+              updatedAt: 2,
+            },
+          },
+        }),
+      },
+    })
+
+    render(<MessageList />)
+
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(getTurnCheckpoints).not.toHaveBeenCalled()
+    expect(screen.queryByText('first.ts')).toBeNull()
   })
 
   it('confirms before rewinding to an earlier turn from a historical change card', async () => {
@@ -4209,6 +5473,180 @@ describe('MessageList nested tool calls', () => {
     ).toBeTruthy()
     expect(screen.queryByText(/This model does not support images/)).toBeNull()
   })
+
+  it('restores opener focus without scrolling when its render item remains fully visible', async () => {
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [{ id: 'assistant-origin', type: 'assistant_text', content: 'review result', timestamp: 1 }],
+        }),
+      },
+    })
+    const { container } = render(<MessageList />)
+    const opener = screen.getByRole('button', { name: 'Copy reply' })
+    opener.id = 'origin-opener'
+    const renderItem = container.querySelector<HTMLElement>('[data-chat-render-item-key="assistant-origin"]')!
+    const scroller = renderItem.closest<HTMLElement>('.chat-scroll-area')!
+    const scrollIntoView = vi.fn()
+    Object.defineProperty(renderItem, 'scrollIntoView', { configurable: true, value: scrollIntoView })
+    vi.spyOn(scroller, 'getBoundingClientRect').mockReturnValue({ top: 100, bottom: 500, left: 40, right: 640 } as DOMRect)
+    vi.spyOn(renderItem, 'getBoundingClientRect').mockReturnValue({ top: 120, bottom: 480, left: 60, right: 620 } as DOMRect)
+
+    await act(async () => {
+      useWorkspacePanelStore.getState().openPanel(ACTIVE_TAB)
+      useWorkspacePanelStore.setState({
+        originBySession: {
+          [ACTIVE_TAB]: { sourceTurnKey: 'assistant-origin', sourceElementId: 'origin-opener' },
+        },
+      })
+      await Promise.resolve()
+    })
+    await act(async () => {
+      useWorkspacePanelStore.getState().closePanel(ACTIVE_TAB)
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+    })
+
+    await waitFor(() => expect(document.activeElement).toBe(opener))
+    expect(scrollIntoView).not.toHaveBeenCalled()
+  })
+
+  it('scrolls a render item clipped by the chat container before restoring opener focus', async () => {
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [{ id: 'assistant-clipped', type: 'assistant_text', content: 'review result', timestamp: 1 }],
+        }),
+      },
+    })
+    const { container } = render(<MessageList />)
+    const opener = screen.getByRole('button', { name: 'Copy reply' })
+    opener.id = 'clipped-origin-opener'
+    const renderItem = container.querySelector<HTMLElement>('[data-chat-render-item-key="assistant-clipped"]')!
+    const scroller = renderItem.closest<HTMLElement>('.chat-scroll-area')!
+    const scrollIntoView = vi.fn()
+    Object.defineProperty(renderItem, 'scrollIntoView', { configurable: true, value: scrollIntoView })
+    vi.spyOn(scroller, 'getBoundingClientRect').mockReturnValue({ top: 100, bottom: 500, left: 40, right: 640 } as DOMRect)
+    vi.spyOn(renderItem, 'getBoundingClientRect').mockReturnValue({ top: 80, bottom: 460, left: 60, right: 620 } as DOMRect)
+
+    await act(async () => {
+      useWorkspacePanelStore.getState().openPanel(ACTIVE_TAB)
+      useWorkspacePanelStore.setState({
+        originBySession: {
+          [ACTIVE_TAB]: { sourceTurnKey: 'assistant-clipped', sourceElementId: 'clipped-origin-opener' },
+        },
+      })
+      await Promise.resolve()
+    })
+    await act(async () => {
+      useWorkspacePanelStore.getState().closePanel(ACTIVE_TAB)
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+    })
+
+    await waitFor(() => expect(document.activeElement).toBe(opener))
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' })
+  })
+
+  it('uses the semantic render key to remount a virtualized origin before focusing it', async () => {
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: Array.from({ length: 220 }, (_, index) => ({
+            id: `virtual-origin-${index}`,
+            type: 'assistant_text' as const,
+            content: `virtual transcript ${index}`,
+            timestamp: index,
+          })),
+        }),
+      },
+    })
+    const { container } = render(<MessageList />)
+    expect(container.querySelector('[data-chat-render-item-key="virtual-origin-0"]')).toBeNull()
+
+    const frames: FrameRequestCallback[] = []
+    vi.stubGlobal('requestAnimationFrame', vi.fn((callback: FrameRequestCallback) => {
+      frames.push(callback)
+      return frames.length
+    }))
+
+    await act(async () => {
+      useWorkspacePanelStore.getState().openPanel(ACTIVE_TAB)
+      useWorkspacePanelStore.setState({
+        originBySession: {
+          [ACTIVE_TAB]: { sourceTurnKey: 'virtual-origin-0', sourceElementId: 'virtual-origin-opener' },
+        },
+      })
+      await Promise.resolve()
+    })
+    await act(async () => {
+      useWorkspacePanelStore.getState().closePanel(ACTIVE_TAB)
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      frames.shift()?.(0)
+      await Promise.resolve()
+    })
+    const restoredItem = container.querySelector<HTMLElement>('[data-chat-render-item-key="virtual-origin-0"]')
+    expect(restoredItem).not.toBeNull()
+    const opener = restoredItem!.querySelector<HTMLButtonElement>('[aria-label="Copy reply"]')!
+    opener.id = 'virtual-origin-opener'
+
+    await act(async () => {
+      frames.shift()?.(16)
+      await Promise.resolve()
+    })
+
+    expect(document.activeElement).toBe(opener)
+    expect(useWorkspacePanelStore.getState().getOrigin(ACTIVE_TAB)).toBeNull()
+    vi.unstubAllGlobals()
+  })
+
+  it('consumes a closed-panel origin when the source conversation mounts after returning from a workbench tab', async () => {
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [{ id: 'assistant-return', type: 'assistant_text', content: 'returned conversation', timestamp: 1 }],
+        }),
+      },
+    })
+    useWorkspacePanelStore.setState({
+      panelBySession: {
+        [ACTIVE_TAB]: { isOpen: false, activeView: 'changed' },
+      },
+      originBySession: {
+        [ACTIVE_TAB]: { sourceTurnKey: 'assistant-return', sourceElementId: 'return-origin-opener' },
+      },
+    })
+    const frames: FrameRequestCallback[] = []
+    vi.stubGlobal('requestAnimationFrame', vi.fn((callback: FrameRequestCallback) => {
+      frames.push(callback)
+      return frames.length
+    }))
+
+    const { container } = render(<MessageList />)
+    const opener = screen.getByRole('button', { name: 'Copy reply' })
+    opener.id = 'return-origin-opener'
+    const renderItem = container.querySelector<HTMLElement>('[data-chat-render-item-key="assistant-return"]')!
+    const scroller = renderItem.closest<HTMLElement>('.chat-scroll-area')!
+    const scrollIntoView = vi.fn()
+    Object.defineProperty(renderItem, 'scrollIntoView', { configurable: true, value: scrollIntoView })
+    vi.spyOn(scroller, 'getBoundingClientRect').mockReturnValue({ top: 100, bottom: 500, left: 40, right: 640 } as DOMRect)
+    vi.spyOn(renderItem, 'getBoundingClientRect').mockReturnValue({ top: 60, bottom: 460, left: 60, right: 620 } as DOMRect)
+
+    for (let attempt = 0; attempt < 20 && document.activeElement !== opener; attempt += 1) {
+      const frame = frames.shift()
+      if (!frame) break
+      await act(async () => {
+        frame(attempt * 16)
+        await Promise.resolve()
+      })
+    }
+
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' })
+    expect(document.activeElement).toBe(opener)
+    expect(useWorkspacePanelStore.getState().getOrigin(ACTIVE_TAB)).toBeNull()
+    vi.unstubAllGlobals()
+  })
 })
 
 describe('shouldVirtualizeRenderItems', () => {
@@ -4242,5 +5680,89 @@ describe('shouldVirtualizeRenderItems', () => {
     } finally {
       document.documentElement.removeAttribute('data-touch-h5')
     }
+  })
+})
+
+describe('conversation navigation layout', () => {
+  const metrics: VirtualRenderItemMetric[] = [
+    { signature: 'a', contentWeight: 1, estimatedHeight: 100 },
+    { signature: 'b', contentWeight: 1, estimatedHeight: 200 },
+    { signature: 'c', contentWeight: 1, estimatedHeight: 300 },
+  ]
+  const items: ConversationNavigationItem[] = [
+    { id: 'a', renderItemKey: 'a', renderIndex: 0, role: 'user', preview: 'A', attachmentCount: 0 },
+    { id: 'b', renderItemKey: 'b', renderIndex: 1, role: 'assistant', preview: 'B', attachmentCount: 0 },
+    { id: 'c', renderItemKey: 'c', renderIndex: 2, role: 'user', preview: 'C', attachmentCount: 0 },
+  ]
+
+  it('uses measured heights when calculating transcript offsets', () => {
+    const offsets = buildVirtualItemOffsets(
+      ['a', 'b', 'c'],
+      metrics,
+      new Map([['b', 250]]),
+    )
+
+    expect(offsets).toEqual([0, 100, 350, 650])
+  })
+
+  it('selects the last navigation item above the viewport reading anchor', () => {
+    const offsets = [0, 100, 350, 650]
+
+    expect(getActiveConversationNavigationItemId(items, offsets, 0, 300)).toBe('a')
+    expect(getActiveConversationNavigationItemId(items, offsets, 0, 600)).toBe('a')
+    expect(getActiveConversationNavigationItemId(items, offsets, 120, 300)).toBe('b')
+    expect(getActiveConversationNavigationItemId(items, offsets, 330, 300)).toBe('c')
+  })
+
+  it('places navigation targets near the upper reading anchor and clamps the range', () => {
+    const offsets = [0, 100, 350, 650]
+
+    expect(getConversationNavigationTargetScrollTop(items[0]!, offsets, 400, 650)).toBe(0)
+    expect(getConversationNavigationTargetScrollTop(items[2]!, offsets, 400, 650)).toBe(250)
+  })
+
+  it('does not render the desktop conversation rail in the mobile chat layout', () => {
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [
+            { id: 'user-1', type: 'user_text', content: 'First prompt', timestamp: 1 },
+            { id: 'assistant-1', type: 'assistant_text', content: 'First reply', timestamp: 2 },
+            { id: 'user-2', type: 'user_text', content: 'Second prompt', timestamp: 3 },
+            { id: 'assistant-2', type: 'assistant_text', content: 'Second reply', timestamp: 4 },
+          ],
+        }),
+      },
+    })
+
+    const { rerender } = render(<MessageList />)
+    expect(screen.getByRole('navigation', { name: 'Conversation navigation' })).toBeTruthy()
+
+    rerender(<MessageList mobileLayout />)
+    expect(screen.queryByRole('navigation', { name: 'Conversation navigation' })).toBeNull()
+  })
+})
+
+describe('workspace panel origin visibility', () => {
+  it('does not request scrolling when the render item is fully visible in the chat scroller', () => {
+    const scroller = document.createElement('div')
+    scroller.className = 'chat-scroll-area'
+    const item = document.createElement('div')
+    scroller.append(item)
+    vi.spyOn(scroller, 'getBoundingClientRect').mockReturnValue({ top: 100, bottom: 500, left: 40, right: 640 } as DOMRect)
+    vi.spyOn(item, 'getBoundingClientRect').mockReturnValue({ top: 120, bottom: 480, left: 60, right: 620 } as DOMRect)
+
+    expect(isRenderItemFullyVisibleInChatScroller(item)).toBe(true)
+  })
+
+  it('detects an item clipped by its chat scroller even while inside the window viewport', () => {
+    const scroller = document.createElement('div')
+    scroller.className = 'chat-scroll-area'
+    const item = document.createElement('div')
+    scroller.append(item)
+    vi.spyOn(scroller, 'getBoundingClientRect').mockReturnValue({ top: 100, bottom: 500, left: 40, right: 640 } as DOMRect)
+    vi.spyOn(item, 'getBoundingClientRect').mockReturnValue({ top: 80, bottom: 460, left: 60, right: 620 } as DOMRect)
+
+    expect(isRenderItemFullyVisibleInChatScroller(item)).toBe(false)
   })
 })

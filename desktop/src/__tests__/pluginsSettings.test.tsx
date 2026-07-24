@@ -25,9 +25,7 @@ vi.mock('../stores/providerStore', () => ({
     activeId: null,
     presets: [],
     isLoading: false,
-    isPresetsLoading: false,
     fetchProviders: vi.fn(),
-    fetchPresets: vi.fn(),
     deleteProvider: vi.fn(),
     activateProvider: vi.fn(),
     activateOfficial: vi.fn(),
@@ -137,7 +135,7 @@ describe('Settings > Plugins tab', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     useSettingsStore.setState({ locale: 'en' })
-    useUIStore.setState({ pendingSettingsTab: null })
+    useUIStore.setState({ activeSettingsTab: 'providers', pendingSettingsTab: null })
     useSessionStore.setState({
       sessions: [
         {

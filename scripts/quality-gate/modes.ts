@@ -8,6 +8,10 @@ export function currentPackageSmokePlatform(platform: NodeJS.Platform = process.
   return null
 }
 
+export function currentPackageSmokeArch(arch: NodeJS.Architecture = process.arch) {
+  return arch === 'arm64' || arch === 'x64' ? arch : null
+}
+
 export function currentReleaseArtifactsDir(
   platform: NodeJS.Platform = process.platform,
   arch: NodeJS.Architecture = process.arch,
@@ -20,6 +24,7 @@ export function currentReleaseArtifactsDir(
 
 export function lanesForMode(mode: QualityGateMode, baselineTargets: BaselineTarget[] = []): LaneDefinition[] {
   const packageSmokePlatform = currentPackageSmokePlatform()
+  const packageSmokeArch = currentPackageSmokeArch()
   const releaseArtifactsDir = currentReleaseArtifactsDir()
   const lanes: LaneDefinition[] = [
     {
@@ -62,6 +67,26 @@ export function lanesForMode(mode: QualityGateMode, baselineTargets: BaselineTar
       category: 'unit',
     },
     {
+      id: 'provider-contract-checks',
+      title: 'Provider contract checks',
+      description: 'Validate provider persistence, runtime env, proxy request/response transforms, streaming, and network failure semantics without live credentials.',
+      kind: 'command',
+      command: ['bun', 'run', 'check:provider-contract'],
+      impactRequiredCheck: 'bun run check:provider-contract',
+      requiredForModes: ['pr', 'release'],
+      category: 'integration',
+    },
+    {
+      id: 'chat-contract-checks',
+      title: 'Desktop/server chat contract checks',
+      description: 'Exercise WebSocket, first-turn runtime selection, reconnect, and mock CLI integration without a real model.',
+      kind: 'command',
+      command: ['bun', 'run', 'check:chat-contract'],
+      impactRequiredCheck: 'bun run check:chat-contract',
+      requiredForModes: ['pr', 'release'],
+      category: 'integration',
+    },
+    {
       id: 'adapter-checks',
       title: 'Adapter checks',
       description: 'Run adapter tests when IM adapter paths changed.',
@@ -97,6 +122,7 @@ export function lanesForMode(mode: QualityGateMode, baselineTargets: BaselineTar
       description: 'Validate local JSON and desktop localStorage migrations against old-version fixtures.',
       kind: 'command',
       command: ['bun', 'run', 'check:persistence-upgrade'],
+      impactRequiredCheck: 'bun run check:persistence-upgrade',
       requiredForModes: ['pr', 'release'],
       category: 'governance',
     },
@@ -106,7 +132,7 @@ export function lanesForMode(mode: QualityGateMode, baselineTargets: BaselineTar
       description: 'Validate quarantined tests still have owners, exit criteria, and active review windows.',
       kind: 'command',
       command: ['bun', 'run', 'check:quarantine'],
-      requiredForModes: ['pr', 'baseline', 'release'],
+      requiredForModes: ['baseline', 'release'],
       category: 'governance',
     },
     {
@@ -115,6 +141,7 @@ export function lanesForMode(mode: QualityGateMode, baselineTargets: BaselineTar
       description: 'Run unit/component coverage suites and enforce the ratcheted coverage baseline.',
       kind: 'command',
       command: ['bun', 'run', 'check:coverage'],
+      impactRequiredCheck: 'bun run check:coverage',
       requiredForModes: ['pr', 'baseline', 'release'],
       category: 'coverage',
     },
@@ -123,7 +150,7 @@ export function lanesForMode(mode: QualityGateMode, baselineTargets: BaselineTar
       title: 'Baseline case catalog validation',
       description: 'Validate real Coding Agent baseline case definitions and fixture metadata.',
       kind: 'command',
-      command: ['bun', 'test', 'scripts/quality-gate/baseline/cases.test.ts'],
+      command: ['bun', 'test', './scripts/quality-gate/baseline/cases.test.ts'],
       requiredForModes: ['baseline', 'release'],
       category: 'unit',
     },
@@ -131,6 +158,9 @@ export function lanesForMode(mode: QualityGateMode, baselineTargets: BaselineTar
 
   if (packageSmokePlatform && releaseArtifactsDir) {
     const packageSmokeCommand = ['bun', 'run', 'test:package-smoke', '--platform', packageSmokePlatform, '--package-kind', 'release', '--artifacts-dir', releaseArtifactsDir]
+    if (packageSmokeArch) {
+      packageSmokeCommand.push('--arch', packageSmokeArch)
+    }
     if (packageSmokePlatform === 'macos') {
       packageSmokeCommand.push('--require-macos-gatekeeper')
     }

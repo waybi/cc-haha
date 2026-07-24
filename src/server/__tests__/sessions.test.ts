@@ -21,6 +21,19 @@ import { clearInstalledPluginsCache } from '../../utils/plugins/installedPlugins
 import { clearPluginCache } from '../../utils/plugins/pluginLoader.js'
 import { resetSettingsCache } from '../../utils/settings/settingsCache.js'
 import { updateSessionSlashCommands } from '../ws/handler.js'
+import { reduceTranscript } from '../services/localIndex/transcriptReducer.js'
+import { openLocalIndexDatabase } from '../services/localIndex/database.js'
+import { readSessionEntriesByLocator } from '../services/localIndex/sessionEntries.js'
+import {
+  createSessionIndex,
+  type LocalIndexGateway,
+} from '../services/localIndex/sessionIndex.js'
+import { createSessionProjector } from '../services/localIndex/sessionProjector.js'
+import type {
+  SessionListSummary,
+  TranscriptChunk,
+  TranscriptProjection,
+} from '../services/localIndex/types.js'
 
 // ============================================================================
 // Test helpers
@@ -143,14 +156,32 @@ async function createWorkspaceApiGitRepo(baseDir: string): Promise<string> {
     `workspace-api-${Date.now()}-${Math.random().toString(36).slice(2)}`,
   )
 
+  const javaControllerDir = path.join(
+    workDir,
+    'services',
+    'mental-health-service',
+    'src',
+    'main',
+    'java',
+    'com',
+    'example',
+    'campus',
+    'mentalhealth',
+    'controller',
+  )
   await fs.mkdir(path.join(workDir, 'src'), { recursive: true })
+  await fs.mkdir(javaControllerDir, { recursive: true })
   git(workDir, 'init')
   git(workDir, 'config', 'user.email', 'sessions-api@example.com')
   git(workDir, 'config', 'user.name', 'Sessions API')
 
   await fs.writeFile(path.join(workDir, 'tracked.txt'), 'before\n')
   await fs.writeFile(path.join(workDir, 'src', 'app.ts'), 'export const answer = 42\n')
-  git(workDir, 'add', 'tracked.txt', 'src/app.ts')
+  await fs.writeFile(
+    path.join(javaControllerDir, 'MentalHealthTrendController.java'),
+    'package com.example.campus.mentalhealth.controller;\n\npublic final class MentalHealthTrendController {}\n',
+  )
+  git(workDir, 'add', 'tracked.txt', 'src/app.ts', 'services')
   git(workDir, 'commit', '-m', 'initial')
 
   await fs.writeFile(path.join(workDir, 'tracked.txt'), 'before\nafter\n')
@@ -507,6 +538,24 @@ describe('SessionService', () => {
     expect(session.projectRoot).toBe('/tmp/test')
   })
 
+  it('should keep duplicate session ids from different transcript paths distinct', async () => {
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    await writeSessionFile('-tmp-duplicate-one', sessionId, [
+      makeUserEntry('First physical transcript'),
+    ])
+    await writeSessionFile('-tmp-duplicate-two', sessionId, [
+      makeUserEntry('Second physical transcript'),
+    ])
+
+    const result = await service.listSessions({ limit: 10 })
+
+    expect(result.total).toBe(2)
+    expect(result.sessions.map((session) => session.projectPath).sort()).toEqual([
+      '-tmp-duplicate-one',
+      '-tmp-duplicate-two',
+    ])
+  })
+
   it('should expose the source project root for persisted worktree sessions', async () => {
     const sourceWorkDir = path.join(tmpDir, 'source-repo')
     const worktreePath = path.join(sourceWorkDir, '.claude', 'worktrees', 'desktop-main-12345678')
@@ -529,6 +578,56 @@ describe('SessionService', () => {
       projectPath: sanitizePath(worktreePath),
       projectRoot: await fs.realpath(sourceWorkDir),
       workDir: worktreePath,
+      workDirExists: true,
+      workspaceState: 'available',
+    })
+  })
+
+  it('should classify a cleaned worktree separately when its source project still exists', async () => {
+    const sourceWorkDir = path.join(tmpDir, 'cleaned-worktree-source')
+    const worktreePath = path.join(sourceWorkDir, '.claude', 'worktrees', 'desktop-main-87654321')
+    await fs.mkdir(sourceWorkDir, { recursive: true })
+    const sessionId = 'bbbbbbbb-bbbb-cccc-dddd-ffffffffffff'
+    await writeSessionFile(sanitizePath(worktreePath), sessionId, [
+      makeSnapshotEntry(),
+      makeSessionMetaEntry(worktreePath),
+      makeWorktreeStateEntry(sessionId, worktreePath, {
+        originalCwd: sourceWorkDir,
+      }),
+      makeUserEntry('History from a cleaned worktree'),
+    ])
+
+    const listed = await service.listSessions()
+    const detail = await service.getSession(sessionId)
+
+    expect(listed.sessions[0]).toMatchObject({
+      projectRoot: await fs.realpath(sourceWorkDir),
+      workDir: worktreePath,
+      workDirExists: false,
+      workspaceState: 'worktree_removed',
+    })
+    expect(detail).toMatchObject({
+      projectRoot: await fs.realpath(sourceWorkDir),
+      workDirExists: false,
+      workspaceState: 'worktree_removed',
+    })
+  })
+
+  it('should keep a genuinely missing project classified as missing', async () => {
+    const missingWorkDir = path.join(tmpDir, 'deleted-project')
+    const sessionId = 'bbbbbbbb-bbbb-cccc-dddd-111111111111'
+    await writeSessionFile(sanitizePath(missingWorkDir), sessionId, [
+      makeSessionMetaEntry(missingWorkDir),
+      makeUserEntry('History from a deleted project'),
+    ])
+
+    const result = await service.listSessions()
+
+    expect(result.sessions[0]).toMatchObject({
+      projectRoot: missingWorkDir,
+      workDir: missingWorkDir,
+      workDirExists: false,
+      workspaceState: 'missing',
     })
   })
 
@@ -551,7 +650,7 @@ describe('SessionService', () => {
     expect(page2.sessions).toHaveLength(1)
   })
 
-  it('should only scan the requested page when listing many sessions', async () => {
+  it('should scan summaries before pagination so metadata-only writes cannot skew order', async () => {
     for (let i = 0; i < 12; i++) {
       const id = `1000000${i.toString(16)}-bbbb-cccc-dddd-eeeeeeeeeeee`
       const filePath = await writeSessionFile('-tmp-many-sessions', id, [
@@ -576,7 +675,293 @@ describe('SessionService', () => {
 
     expect(result.total).toBe(12)
     expect(result.sessions).toHaveLength(3)
-    expect(scanCount).toBe(3)
+    expect(scanCount).toBe(12)
+  })
+
+  it('should ignore metadata-only writes when sorting and dating the session list', async () => {
+    const activeSessionId = '10000000-aaaa-bbbb-cccc-eeeeeeeeeeee'
+    const viewedHistorySessionId = '10000001-aaaa-bbbb-cccc-eeeeeeeeeeee'
+    const activeFilePath = await writeSessionFile('-tmp-viewed-history-sessions', activeSessionId, [
+      makeSnapshotEntry(),
+      {
+        ...makeUserEntry('Recent real work'),
+        timestamp: '2026-07-02T02:00:00.000Z',
+      },
+      {
+        ...makeAssistantEntry('Recent reply'),
+        timestamp: '2026-07-02T02:05:00.000Z',
+      },
+    ])
+    const historyFilePath = await writeSessionFile('-tmp-viewed-history-sessions', viewedHistorySessionId, [
+      makeSnapshotEntry(),
+      {
+        ...makeUserEntry('Older work'),
+        timestamp: '2026-07-01T02:00:00.000Z',
+      },
+      {
+        ...makeAssistantEntry('Older reply'),
+        timestamp: '2026-07-01T02:05:00.000Z',
+      },
+      {
+        ...makeSessionMetaEntry('/tmp/viewed-history'),
+        timestamp: '2026-07-02T03:00:00.000Z',
+      },
+    ])
+    await fs.utimes(activeFilePath, new Date('2026-07-02T02:05:00.000Z'), new Date('2026-07-02T02:05:00.000Z'))
+    await fs.utimes(historyFilePath, new Date('2026-07-02T03:00:00.000Z'), new Date('2026-07-02T03:00:00.000Z'))
+
+    const result = await service.listSessions({ project: '/tmp/viewed-history-sessions', limit: 2 })
+
+    expect(result.sessions.map((session) => session.id)).toEqual([
+      activeSessionId,
+      viewedHistorySessionId,
+    ])
+    expect(result.sessions.find((session) => session.id === viewedHistorySessionId)?.modifiedAt)
+      .toBe('2026-07-01T02:05:00.000Z')
+  })
+
+  it('should leave an incomplete final JSON line out of the session summary', async () => {
+    const sessionId = '10000002-aaaa-bbbb-cccc-eeeeeeeeeeee'
+    const projectDir = '-tmp-incomplete-summary'
+    const dir = path.join(tmpDir, 'projects', projectDir)
+    const filePath = path.join(dir, `${sessionId}.jsonl`)
+    await fs.mkdir(dir, { recursive: true })
+    await fs.writeFile(
+      filePath,
+      JSON.stringify({
+        ...makeUserEntry('This line is not durable yet'),
+        timestamp: '2026-07-03T02:00:00.000Z',
+      }),
+      'utf-8',
+    )
+    const fallbackTime = new Date('2026-07-03T03:00:00.000Z')
+    await fs.utimes(filePath, fallbackTime, fallbackTime)
+
+    const result = await service.listSessions({ project: '/tmp/incomplete-summary' })
+
+    expect(result.sessions).toHaveLength(1)
+    expect(result.sessions[0]).toMatchObject({
+      title: 'Untitled Session',
+      modifiedAt: fallbackTime.toISOString(),
+      messageCount: 0,
+    })
+  })
+
+  it('should keep the file scanner and canonical reducer summaries identical', async () => {
+    const sessionId = '10000003-aaaa-bbbb-cccc-eeeeeeeeeeee'
+    const projectDir = '-tmp-reducer-parity'
+    const dir = path.join(tmpDir, 'projects', projectDir)
+    const filePath = path.join(dir, `${sessionId}.jsonl`)
+    const repository = {
+      requestedWorkDir: '/repo',
+      repoRoot: '/repo',
+      branch: 'main',
+      worktree: true,
+      baseRef: 'main',
+      worktreePath: '/repo/.claude/worktrees/parity',
+      worktreeBranch: 'worktree-parity',
+      worktreeSlug: 'parity',
+    }
+    const worktreeSession = {
+      originalCwd: '/repo',
+      worktreePath: '/repo/.claude/worktrees/parity',
+      worktreeName: 'parity',
+      sessionId,
+    }
+    const completeLines = [
+      JSON.stringify({
+        type: 'session-meta',
+        isMeta: true,
+        workDir: '/repo/.claude/worktrees/parity',
+        permissionMode: 'acceptEdits',
+        runtimeProviderId: 'provider-a',
+        runtimeModelId: 'model-a',
+        effortLevel: 'high',
+        timestamp: '2026-07-01T01:00:00.000Z',
+      }),
+      JSON.stringify({
+        ...makeUserEntry('First user title'),
+        cwd: '/repo/fallback',
+        repository,
+        timestamp: '2026-07-01T02:00:00.000Z',
+      }),
+      JSON.stringify({
+        ...makeAssistantEntry('Assistant response'),
+        timestamp: '2026-07-01T02:05:00.000Z',
+      }),
+      '{malformed complete line}',
+      JSON.stringify({
+        ...makeMetaUserEntry(),
+        timestamp: '2026-07-02T03:00:00.000Z',
+      }),
+      JSON.stringify({ type: 'ai-title', aiTitle: 'AI title' }),
+      JSON.stringify({
+        type: 'system',
+        subtype: 'local_command',
+        content: '<command-name>/goal</command-name><command-args>Parity goal</command-args>',
+      }),
+      JSON.stringify({ type: 'worktree-state', worktreeSession }),
+      JSON.stringify({
+        type: 'custom-title',
+        customTitle: 'Canonical parity title',
+        timestamp: '2026-07-02T04:00:00.000Z',
+      }),
+      JSON.stringify({
+        type: 'session-meta',
+        isMeta: true,
+        workDir: '/repo/.claude/worktrees/parity-latest',
+        runtimeProviderId: null,
+        runtimeModelId: 'model-b',
+        effortLevel: 'max',
+        timestamp: '2026-07-02T05:00:00.000Z',
+      }),
+    ].map((line) => `${line}\n`)
+    const incompleteTail = JSON.stringify({
+      ...makeAssistantEntry('Pending response'),
+      timestamp: '2026-07-03T00:00:00.000Z',
+    })
+    await fs.mkdir(dir, { recursive: true })
+    await fs.writeFile(filePath, `${completeLines.join('')}${incompleteTail}`, 'utf-8')
+
+    const stat = await fs.stat(filePath)
+    const scanner = service as unknown as {
+      scanSessionListSummary: (
+        targetPath: string,
+        targetProject: string,
+        targetStat: { birthtime: Date; mtime: Date },
+      ) => Promise<SessionListSummary>
+    }
+    const scanned = await scanner.scanSessionListSummary(filePath, projectDir, stat)
+    const chunks: TranscriptChunk[] = []
+    let byteStart = 0
+    for (const text of completeLines) {
+      chunks.push({ text, byteStart, completeLine: true })
+      byteStart += Buffer.byteLength(text)
+    }
+    chunks.push({ text: incompleteTail, byteStart, completeLine: false })
+    const seed: TranscriptProjection = {
+      summary: {
+        title: 'Untitled Session',
+        createdAt: stat.birthtime.toISOString(),
+        modifiedAt: stat.mtime.toISOString(),
+        messageCount: 0,
+        workDir: service.desanitizePath(projectDir),
+      },
+      indexedBytes: 0,
+      pendingTailBytes: 0,
+      malformedLineCount: 0,
+    }
+    const reduced = reduceTranscript(chunks, seed)
+
+    expect(scanned).toEqual(reduced.summary)
+    expect(scanned).toEqual({
+      title: 'Canonical parity title',
+      createdAt: '2026-07-01T01:00:00.000Z',
+      modifiedAt: '2026-07-01T02:05:00.000Z',
+      messageCount: 3,
+      workDir: '/repo/.claude/worktrees/parity-latest',
+      permissionMode: 'acceptEdits',
+      runtimeProviderId: null,
+      runtimeModelId: 'model-b',
+      effortLevel: 'max',
+      repository,
+      worktreeSession,
+    })
+    expect(reduced.malformedLineCount).toBe(1)
+    expect(reduced.pendingTailBytes).toBe(Buffer.byteLength(incompleteTail))
+  })
+
+  it('should scan a multibuffer CRLF line once without splitting UTF-8 metadata', async () => {
+    const sessionId = '10000004-aaaa-bbbb-cccc-eeeeeeeeeeee'
+    const projectDir = '-tmp-multibuffer-reducer'
+    const dir = path.join(tmpDir, 'projects', projectDir)
+    const filePath = path.join(dir, `${sessionId}.jsonl`)
+    const streamBufferBytes = 64 * 1024
+    const targetCharacterByteStart = streamBufferBytes * 3 - 1
+    const buildUserLine = (paddingLength: number) => JSON.stringify({
+      type: 'user',
+      padding: 'x'.repeat(paddingLength),
+      message: { role: 'user', content: '你 boundary title' },
+      timestamp: '2026-07-04T01:00:00.000Z',
+      cwd: '/fallback/from-user',
+    })
+    const emptyPaddingLine = buildUserLine(0)
+    const emptyCharacterIndex = emptyPaddingLine.indexOf('你')
+    const emptyCharacterByteStart = Buffer.byteLength(
+      emptyPaddingLine.slice(0, emptyCharacterIndex),
+    )
+    const userLine = buildUserLine(targetCharacterByteStart - emptyCharacterByteStart)
+    const characterIndex = userLine.indexOf('你')
+    expect(Buffer.byteLength(userLine.slice(0, characterIndex))).toBe(targetCharacterByteStart)
+
+    const sessionMetaLine = JSON.stringify({
+      type: 'session-meta',
+      isMeta: true,
+      workDir: '/metadata/workdir',
+      runtimeProviderId: 'boundary-provider',
+      runtimeModelId: 'boundary-model',
+      effortLevel: 'xhigh',
+      timestamp: '2026-07-04T02:00:00.000Z',
+    })
+    const firstCompleteLine = `${userLine}\r\n`
+    const secondCompleteLine = `${sessionMetaLine}\r\n`
+    const content = `${firstCompleteLine}${secondCompleteLine}`
+    await fs.mkdir(dir, { recursive: true })
+    await fs.writeFile(filePath, content, 'utf-8')
+
+    const stat = await fs.stat(filePath)
+    const scanner = service as unknown as {
+      scanSessionListSummary: (
+        targetPath: string,
+        targetProject: string,
+        targetStat: { birthtime: Date; mtime: Date },
+      ) => Promise<SessionListSummary>
+    }
+    const originalConcat = Buffer.concat
+    let concatCalls = 0
+    Buffer.concat = ((...args: Parameters<typeof Buffer.concat>) => {
+      concatCalls += 1
+      return originalConcat(...args)
+    }) as typeof Buffer.concat
+
+    let scanned: SessionListSummary
+    try {
+      scanned = await scanner.scanSessionListSummary(filePath, projectDir, stat)
+    } finally {
+      Buffer.concat = originalConcat
+    }
+
+    const seed: TranscriptProjection = {
+      summary: {
+        title: 'Untitled Session',
+        createdAt: stat.birthtime.toISOString(),
+        modifiedAt: stat.mtime.toISOString(),
+        messageCount: 0,
+        workDir: service.desanitizePath(projectDir),
+      },
+      indexedBytes: 0,
+      pendingTailBytes: 0,
+      malformedLineCount: 0,
+    }
+    const secondLineByteStart = Buffer.byteLength(firstCompleteLine)
+    const reduced = reduceTranscript([
+      { text: firstCompleteLine, byteStart: 0, completeLine: true },
+      { text: secondCompleteLine, byteStart: secondLineByteStart, completeLine: true },
+    ], seed)
+
+    expect(concatCalls).toBe(1)
+    expect(scanned).toEqual(reduced.summary)
+    expect(scanned).toMatchObject({
+      title: '你 boundary title',
+      modifiedAt: '2026-07-04T01:00:00.000Z',
+      messageCount: 1,
+      workDir: '/metadata/workdir',
+      runtimeProviderId: 'boundary-provider',
+      runtimeModelId: 'boundary-model',
+      effortLevel: 'xhigh',
+    })
+    expect(reduced.indexedBytes).toBe(Buffer.byteLength(content))
+    expect(reduced.pendingTailBytes).toBe(0)
   })
 
   it('should reuse cached list metadata for repeated requests', async () => {
@@ -604,7 +989,397 @@ describe('SessionService', () => {
     const second = await service.listSessions({ limit: 3, offset: 0 })
 
     expect(first.sessions.map((session) => session.id)).toEqual(second.sessions.map((session) => session.id))
+    expect(scanCount).toBe(5)
+  })
+
+  it('should coalesce concurrent session list scans for the same query', async () => {
+    for (let i = 0; i < 3; i++) {
+      const id = `2400000${i.toString(16)}-bbbb-cccc-dddd-eeeeeeeeeeee`
+      await writeSessionFile('-tmp-concurrent-session-list', id, [
+        makeSnapshotEntry(),
+        makeUserEntry(`Concurrent message ${i}`),
+      ])
+    }
+
+    const serviceWithSpy = service as unknown as {
+      scanSessionListSummary: (...args: unknown[]) => Promise<unknown>
+    }
+    const originalScanSessionListSummary = serviceWithSpy.scanSessionListSummary.bind(service)
+    let scanCount = 0
+    let releaseFirstScan: () => void = () => {}
+    let markFirstScanStarted: () => void = () => {}
+    const firstScanStarted = new Promise<void>((resolve) => {
+      markFirstScanStarted = resolve
+    })
+    const firstScanGate = new Promise<void>((resolve) => {
+      releaseFirstScan = resolve
+    })
+
+    serviceWithSpy.scanSessionListSummary = async (...args) => {
+      scanCount += 1
+      if (scanCount === 1) {
+        markFirstScanStarted()
+        await firstScanGate
+      }
+      return originalScanSessionListSummary(...args)
+    }
+
+    const first = service.listSessions({ limit: 3, offset: 0 })
+    await firstScanStarted
+    const second = service.listSessions({ limit: 3, offset: 0 })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    releaseFirstScan()
+
+    const [firstResult, secondResult] = await Promise.all([first, second])
+
+    expect(firstResult).toEqual(secondResult)
     expect(scanCount).toBe(3)
+  })
+
+  it('should isolate warm session list caches by the active config scope', async () => {
+    const scopeRoot = path.join(tmpDir, 'session-list-cache-scopes')
+    const firstConfigDir = path.join(scopeRoot, 'first')
+    const secondConfigDir = path.join(scopeRoot, 'second')
+    const seedScope = async (configDir: string, sessionId: string, title: string) => {
+      const projectDir = path.join(configDir, 'projects', '-tmp-cache-scope')
+      await fs.mkdir(projectDir, { recursive: true })
+      await fs.writeFile(
+        path.join(projectDir, `${sessionId}.jsonl`),
+        `${JSON.stringify(makeUserEntry(title))}\n`,
+        'utf8',
+      )
+    }
+    await seedScope(
+      firstConfigDir,
+      '24100000-bbbb-cccc-dddd-eeeeeeeeeeee',
+      'First scope title',
+    )
+    await seedScope(
+      secondConfigDir,
+      '24100001-bbbb-cccc-dddd-eeeeeeeeeeee',
+      'Second scope title',
+    )
+
+    process.env.CLAUDE_CONFIG_DIR = firstConfigDir
+    const first = await service.listSessions({ limit: 10, offset: 0 })
+    process.env.CLAUDE_CONFIG_DIR = secondConfigDir
+    const second = await service.listSessions({ limit: 10, offset: 0 })
+
+    expect(first.sessions.map(session => session.id)).toEqual([
+      '24100000-bbbb-cccc-dddd-eeeeeeeeeeee',
+    ])
+    expect(second.sessions.map(session => session.id)).toEqual([
+      '24100001-bbbb-cccc-dddd-eeeeeeeeeeee',
+    ])
+  })
+
+  it('should bound session page and summary caches with LRU retention', async () => {
+    let now = 1_000
+    const projects = ['-tmp-bounded-cache-a', '-tmp-bounded-cache-b', '-tmp-bounded-cache-c']
+    for (let index = 0; index < projects.length; index += 1) {
+      await writeSessionFile(
+        projects[index]!,
+        `2420000${index}-bbbb-cccc-dddd-eeeeeeeeeeee`,
+        [makeUserEntry(`Bounded cache ${index}`)],
+      )
+    }
+    const boundedService = new SessionService(undefined, {
+      now: () => now,
+      sessionListCacheMaxEntries: 2,
+      sessionListSummaryCacheMaxEntries: 2,
+    })
+    const internals = boundedService as unknown as {
+      sessionListCache: Map<string, unknown>
+      sessionListSummaryCache: Map<string, unknown>
+    }
+
+    await boundedService.listSessions({ project: '/tmp/bounded/cache/a', limit: 1 })
+    await boundedService.listSessions({ project: '/tmp/bounded/cache/b', limit: 1 })
+    now += 6_000
+    await boundedService.listSessions({ project: '/tmp/bounded/cache/a', limit: 1 })
+    await boundedService.listSessions({ project: '/tmp/bounded/cache/c', limit: 1 })
+
+    expect(internals.sessionListCache.size).toBe(2)
+    expect([...internals.sessionListCache.keys()].some(key => (
+      JSON.parse(key) as { project: string }
+    ).project === '/tmp/bounded/cache/a')).toBe(true)
+    expect([...internals.sessionListCache.keys()].some(key => (
+      JSON.parse(key) as { project: string }
+    ).project === '/tmp/bounded/cache/b')).toBe(false)
+    expect(internals.sessionListSummaryCache.size).toBe(2)
+    expect([...internals.sessionListSummaryCache.keys()].some(filePath => (
+      filePath.includes('-tmp-bounded-cache-a')
+    ))).toBe(true)
+    expect([...internals.sessionListSummaryCache.keys()].some(filePath => (
+      filePath.includes('-tmp-bounded-cache-b')
+    ))).toBe(false)
+  })
+
+  it('should remove a deleted transcript from the session summary cache', async () => {
+    const sessionId = '24205000-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const filePath = await writeSessionFile(
+      '-tmp-deleted-summary-cache',
+      sessionId,
+      [makeUserEntry('Delete cached summary')],
+    )
+    const internals = service as unknown as {
+      sessionListSummaryCache: Map<string, unknown>
+    }
+
+    await service.listSessions({ limit: 10 })
+    expect(internals.sessionListSummaryCache.has(filePath)).toBe(true)
+    await service.deleteSession(sessionId)
+
+    expect(internals.sessionListSummaryCache.has(filePath)).toBe(false)
+  })
+
+  it('should remove expired session pages and caches from inactive config scopes', async () => {
+    let now = 1_000
+    const boundedService = new SessionService(undefined, { now: () => now })
+    const internals = boundedService as unknown as {
+      sessionListCache: Map<string, unknown>
+      sessionListSummaryCache: Map<string, unknown>
+    }
+    const scopeRoot = path.join(tmpDir, 'bounded-cache-scopes')
+    const firstConfigDir = path.join(scopeRoot, 'first')
+    const secondConfigDir = path.join(scopeRoot, 'second')
+    const seedScope = async (configDir: string, sessionId: string) => {
+      const projectDir = path.join(configDir, 'projects', '-tmp-bounded-scope')
+      await fs.mkdir(projectDir, { recursive: true })
+      await fs.writeFile(
+        path.join(projectDir, `${sessionId}.jsonl`),
+        `${JSON.stringify(makeUserEntry(sessionId))}\n`,
+        'utf8',
+      )
+    }
+    await seedScope(firstConfigDir, '24210000-bbbb-cccc-dddd-eeeeeeeeeeee')
+    await seedScope(secondConfigDir, '24210001-bbbb-cccc-dddd-eeeeeeeeeeee')
+
+    process.env.CLAUDE_CONFIG_DIR = firstConfigDir
+    await boundedService.listSessions({ limit: 1, offset: 0 })
+    now += 6_000
+    await boundedService.listSessions({ limit: 1, offset: 1 })
+    expect(internals.sessionListCache.size).toBe(1)
+
+    process.env.CLAUDE_CONFIG_DIR = secondConfigDir
+    await boundedService.listSessions({ limit: 1, offset: 0 })
+
+    expect([...internals.sessionListCache.keys()].every(key => (
+      JSON.parse(key) as { scope: string }
+    ).scope === path.resolve(secondConfigDir))).toBe(true)
+    expect([...internals.sessionListSummaryCache.keys()].every(filePath => (
+      filePath.startsWith(`${path.resolve(secondConfigDir)}${path.sep}`)
+    ))).toBe(true)
+  })
+
+  it('should not coalesce in-flight session list scans across config scopes', async () => {
+    const scopeRoot = path.join(tmpDir, 'session-list-request-scopes')
+    const firstConfigDir = path.join(scopeRoot, 'first')
+    const secondConfigDir = path.join(scopeRoot, 'second')
+    const seedScope = async (configDir: string, sessionId: string, title: string) => {
+      const projectDir = path.join(configDir, 'projects', '-tmp-request-scope')
+      await fs.mkdir(projectDir, { recursive: true })
+      await fs.writeFile(
+        path.join(projectDir, `${sessionId}.jsonl`),
+        `${JSON.stringify(makeUserEntry(title))}\n`,
+        'utf8',
+      )
+    }
+    await seedScope(
+      firstConfigDir,
+      '24300000-bbbb-cccc-dddd-eeeeeeeeeeee',
+      'First in-flight scope',
+    )
+    await seedScope(
+      secondConfigDir,
+      '24300001-bbbb-cccc-dddd-eeeeeeeeeeee',
+      'Second in-flight scope',
+    )
+
+    const serviceWithSpy = service as unknown as {
+      scanSessionListSummary: (...args: unknown[]) => Promise<unknown>
+    }
+    const originalScanSessionListSummary = serviceWithSpy.scanSessionListSummary.bind(service)
+    let releaseFirstScan: () => void = () => {}
+    let markFirstScanStarted: () => void = () => {}
+    const firstScanStarted = new Promise<void>((resolve) => {
+      markFirstScanStarted = resolve
+    })
+    const firstScanGate = new Promise<void>((resolve) => {
+      releaseFirstScan = resolve
+    })
+    serviceWithSpy.scanSessionListSummary = async (...args) => {
+      if (String(args[0]).startsWith(firstConfigDir)) {
+        markFirstScanStarted()
+        await firstScanGate
+      }
+      return originalScanSessionListSummary(...args)
+    }
+
+    process.env.CLAUDE_CONFIG_DIR = firstConfigDir
+    const firstScopeRequest = service.listSessions({ limit: 10, offset: 0 })
+    await firstScanStarted
+    process.env.CLAUDE_CONFIG_DIR = secondConfigDir
+    const secondScopeRequest = service.listSessions({ limit: 10, offset: 0 })
+    await new Promise(resolve => setTimeout(resolve, 10))
+    releaseFirstScan()
+
+    const [first, second] = await Promise.all([firstScopeRequest, secondScopeRequest])
+    expect(first.sessions.map(session => session.id)).toEqual([
+      '24300000-bbbb-cccc-dddd-eeeeeeeeeeee',
+    ])
+    expect(second.sessions.map(session => session.id)).toEqual([
+      '24300001-bbbb-cccc-dddd-eeeeeeeeeeee',
+    ])
+  })
+
+  it('should coalesce file summary scans across concurrent pagination queries', async () => {
+    for (let i = 0; i < 3; i++) {
+      const id = `2420000${i.toString(16)}-bbbb-cccc-dddd-eeeeeeeeeeee`
+      await writeSessionFile('-tmp-concurrent-session-pages', id, [
+        makeSnapshotEntry(),
+        makeUserEntry(`Concurrent page message ${i}`),
+      ])
+    }
+
+    const serviceWithSpy = service as unknown as {
+      scanSessionListSummary: (...args: unknown[]) => Promise<unknown>
+    }
+    const originalScanSessionListSummary = serviceWithSpy.scanSessionListSummary.bind(service)
+    let scanCount = 0
+    let releaseFirstScan: () => void = () => {}
+    let markFirstScanStarted: () => void = () => {}
+    const firstScanStarted = new Promise<void>((resolve) => {
+      markFirstScanStarted = resolve
+    })
+    const firstScanGate = new Promise<void>((resolve) => {
+      releaseFirstScan = resolve
+    })
+
+    serviceWithSpy.scanSessionListSummary = async (...args) => {
+      scanCount += 1
+      if (scanCount === 1) {
+        markFirstScanStarted()
+        await firstScanGate
+      }
+      return originalScanSessionListSummary(...args)
+    }
+
+    const sidebarRequest = service.listSessions({ limit: 400, offset: 0 })
+    await firstScanStarted
+    const tabRestoreRequest = service.listSessions({ limit: 200, offset: 0 })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    releaseFirstScan()
+
+    const [sidebarResult, tabRestoreResult] = await Promise.all([
+      sidebarRequest,
+      tabRestoreRequest,
+    ])
+
+    expect(sidebarResult.sessions).toHaveLength(3)
+    expect(tabRestoreResult.sessions).toHaveLength(3)
+    expect(scanCount).toBe(3)
+  })
+
+  it('should not reuse or cache a list scan started before session metadata changes', async () => {
+    const sessionId = '24500000-bbbb-cccc-dddd-eeeeeeeeeeee'
+    await writeSessionFile('-tmp-invalidated-session-list', sessionId, [
+      makeSnapshotEntry(),
+      makeUserEntry('Original title'),
+    ])
+
+    const serviceWithSpy = service as unknown as {
+      scanSessionListSummary: (...args: unknown[]) => Promise<unknown>
+    }
+    const originalScanSessionListSummary = serviceWithSpy.scanSessionListSummary.bind(service)
+    let scanCount = 0
+    let releaseFirstScan: () => void = () => {}
+    let markFirstScanStarted: () => void = () => {}
+    const firstScanStarted = new Promise<void>((resolve) => {
+      markFirstScanStarted = resolve
+    })
+    const firstScanGate = new Promise<void>((resolve) => {
+      releaseFirstScan = resolve
+    })
+
+    serviceWithSpy.scanSessionListSummary = async (...args) => {
+      scanCount += 1
+      const summary = await originalScanSessionListSummary(...args)
+      if (scanCount === 1) {
+        markFirstScanStarted()
+        await firstScanGate
+      }
+      return summary
+    }
+
+    const staleRequest = service.listSessions({ limit: 10, offset: 0 })
+    await firstScanStarted
+    await service.renameSession(sessionId, 'Renamed while scanning')
+
+    const freshRequest = service.listSessions({ limit: 10, offset: 0 })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(scanCount).toBe(2)
+
+    const freshResult = await freshRequest
+    expect(freshResult.sessions[0]?.title).toBe('Renamed while scanning')
+
+    releaseFirstScan()
+    const staleResult = await staleRequest
+    expect(staleResult.sessions[0]?.title).toBe('Original title')
+
+    const cachedResult = await service.listSessions({ limit: 10, offset: 0 })
+    expect(cachedResult.sessions[0]?.title).toBe('Renamed while scanning')
+  })
+
+  it('should reuse unchanged file summaries after the list response cache is cleared', async () => {
+    const sessionFiles: Array<{ id: string; filePath: string }> = []
+    for (let i = 0; i < 3; i++) {
+      const id = `2500000${i.toString(16)}-bbbb-cccc-dddd-eeeeeeeeeeee`
+      const filePath = await writeSessionFile('-tmp-file-summary-cache', id, [
+        makeSnapshotEntry(),
+        makeUserEntry(`Cached file summary ${i}`),
+      ])
+      const mtime = new Date(Date.now() - i * 1000)
+      await fs.utimes(filePath, mtime, mtime)
+      sessionFiles.push({ id, filePath })
+    }
+
+    const serviceWithSpy = service as unknown as {
+      scanSessionListSummary: (...args: unknown[]) => Promise<unknown>
+    }
+    const serviceInternals = service as unknown as {
+      sessionListCache: Map<string, unknown>
+    }
+    const originalScanSessionListSummary = serviceWithSpy.scanSessionListSummary.bind(service)
+    let scanCount = 0
+    serviceWithSpy.scanSessionListSummary = async (...args) => {
+      scanCount += 1
+      return originalScanSessionListSummary(...args)
+    }
+
+    await service.listSessions({ limit: 3, offset: 0 })
+    expect(scanCount).toBe(3)
+
+    serviceInternals.sessionListCache.clear()
+    const second = await service.listSessions({ limit: 3, offset: 0 })
+    expect(second.sessions).toHaveLength(3)
+    expect(scanCount).toBe(3)
+
+    await fs.appendFile(
+      sessionFiles[1]!.filePath,
+      `${JSON.stringify({
+        type: 'custom-title',
+        customTitle: 'Changed cached file summary',
+        timestamp: new Date().toISOString(),
+      })}\n`,
+      'utf-8',
+    )
+    serviceInternals.sessionListCache.clear()
+
+    const third = await service.listSessions({ limit: 3, offset: 0 })
+    expect(third.sessions.find((session) => session.id === sessionFiles[1]!.id)?.title)
+      .toBe('Changed cached file summary')
+    expect(scanCount).toBe(4)
   })
 
   it('should invalidate cached list metadata after writes', async () => {
@@ -660,6 +1435,35 @@ describe('SessionService', () => {
     expect(detail!.messages).toHaveLength(2)
     expect(detail!.messages[0]!.type).toBe('user')
     expect(detail!.messages[1]!.type).toBe('assistant')
+  })
+
+  it('should derive session detail modifiedAt from transcript messages', async () => {
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const filePath = await writeSessionFile('-tmp-project', sessionId, [
+      {
+        ...makeSessionMetaEntry('/tmp/project'),
+        timestamp: '2026-01-03T00:00:00.000Z',
+      },
+      {
+        ...makeUserEntry('Earlier user work'),
+        timestamp: '2026-01-01T00:01:00.000Z',
+      },
+      {
+        ...makeAssistantEntry('Earlier assistant reply'),
+        timestamp: '2026-01-01T00:02:00.000Z',
+      },
+      {
+        type: 'custom-title',
+        customTitle: 'Later title metadata',
+        timestamp: '2026-01-04T00:00:00.000Z',
+      },
+    ])
+    const mtime = new Date('2026-01-05T00:00:00.000Z')
+    await fs.utimes(filePath, mtime, mtime)
+
+    const detail = await service.getSession(sessionId)
+
+    expect(detail?.modifiedAt).toBe('2026-01-01T00:02:00.000Z')
   })
 
   it('should skip meta entries in messages', async () => {
@@ -837,7 +1641,93 @@ describe('SessionService', () => {
     ])
   })
 
-  it('should hide synthetic interruption, no-response, and command breadcrumb transcript entries', async () => {
+  it('should include linked subagent transcript changes in the message signature', async () => {
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const projectDir = '-tmp-project'
+    const agentId = 'abc123'
+
+    await writeSessionFile(projectDir, sessionId, [
+      makeSnapshotEntry(),
+      {
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'Agent:0',
+              name: 'Agent',
+              input: { description: 'Inspect alpha' },
+            },
+          ],
+        },
+        uuid: crypto.randomUUID(),
+        timestamp: '2026-01-01T00:00:02.000Z',
+      },
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'Agent:0',
+              content: [
+                {
+                  type: 'text',
+                  text: `alpha summary\nagentId: ${agentId}`,
+                },
+              ],
+            },
+          ],
+        },
+        uuid: crypto.randomUUID(),
+        timestamp: '2026-01-01T00:00:03.000Z',
+      },
+    ])
+    const subagentFile = await writeSubagentTranscriptFile(projectDir, sessionId, agentId, [
+      {
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'Read:0',
+              name: 'Read',
+              input: { file_path: '/tmp/alpha.txt' },
+            },
+          ],
+        },
+        uuid: crypto.randomUUID(),
+        timestamp: '2026-01-01T00:00:04.000Z',
+      },
+    ])
+
+    const before = await service.getSessionMessagesSignature(sessionId)
+
+    await fs.appendFile(subagentFile, `${JSON.stringify({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'Read:0',
+            content: 'updated alpha body',
+          },
+        ],
+      },
+      uuid: crypto.randomUUID(),
+      timestamp: '2026-01-01T00:00:05.000Z',
+    })}\n`)
+
+    const after = await service.getSessionMessagesSignature(sessionId)
+
+    expect(before).not.toBe(after)
+  })
+
+  it('should hide synthetic interruption, no-response, and malformed command breadcrumb transcript entries', async () => {
     const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
     await writeSessionFile('-tmp-project', sessionId, [
       makeSnapshotEntry(),
@@ -884,17 +1774,62 @@ describe('SessionService', () => {
         uuid: crypto.randomUUID(),
         timestamp: '2026-01-01T00:00:05.000Z',
       },
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: '<command-name>/agent</command-name> malformed breadcrumb',
+        },
+        uuid: crypto.randomUUID(),
+        timestamp: '2026-01-01T00:00:06.000Z',
+      },
       makeAssistantEntry('正常助手消息', crypto.randomUUID()),
     ])
 
     const messages = await service.getSessionMessages(sessionId)
 
-    expect(messages).toHaveLength(2)
+    expect(messages).toHaveLength(4)
     expect(messages[0]).toMatchObject({ type: 'user', content: '正常用户消息' })
     expect(messages[1]).toMatchObject({
+      type: 'user',
+      content: '<command-name>/exit</command-name>\n<command-message>exit</command-message>\n<command-args></command-args>',
+    })
+    expect(messages[2]).toMatchObject({
+      type: 'user',
+      content: [{
+        type: 'text',
+        text: '<command-name>/agent</command-name>\n<command-message>agent</command-message>\n<command-args>Plan 222</command-args>',
+      }],
+    })
+    expect(messages[3]).toMatchObject({
       type: 'assistant',
       content: [{ type: 'text', text: '正常助手消息' }],
     })
+  })
+
+  it('should keep user-invoked skill command metadata for desktop history restore', async () => {
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    await writeSessionFile('-tmp-project', sessionId, [
+      makeSnapshotEntry(),
+      makeUserEntry([
+        '<command-message>frontend-design</command-message>',
+        '<command-name>/frontend-design</command-name>',
+        '<command-args>redesign the settings page</command-args>',
+      ].join('\n'), 'skill-command-user'),
+      makeAssistantEntry('正常助手消息', 'skill-command-user'),
+    ])
+
+    const messages = await service.getSessionMessages(sessionId)
+
+    expect(messages).toHaveLength(2)
+    const skillCommandContent = String(messages[0]!.content)
+    expect(messages[0]).toMatchObject({
+      id: 'skill-command-user',
+      type: 'user',
+      content: expect.stringContaining('<command-name>/frontend-design</command-name>'),
+    })
+    expect(skillCommandContent).toContain('<command-args>redesign the settings page</command-args>')
+    expect(messages[1]).toMatchObject({ type: 'assistant' })
   })
 
   it('should keep /goal local command transcript entries for desktop history restore', async () => {
@@ -921,6 +1856,16 @@ describe('SessionService', () => {
         timestamp: '2026-01-01T00:00:02.000Z',
         uuid: 'goal-output',
       },
+      {
+        parentUuid: 'goal-output',
+        isSidechain: false,
+        type: 'system',
+        subtype: 'local_command',
+        content: '<local-command-stdout>Goal continuing: verify persisted follow-up</local-command-stdout>',
+        level: 'info',
+        timestamp: '2026-01-01T00:00:03.000Z',
+        uuid: 'goal-continuing',
+      },
       makeAssistantEntry('正常助手消息', crypto.randomUUID()),
     ])
 
@@ -936,6 +1881,11 @@ describe('SessionService', () => {
         id: 'goal-output',
         type: 'system',
         content: expect.stringContaining('Goal set: ship persisted goal'),
+      },
+      {
+        id: 'goal-continuing',
+        type: 'system',
+        content: expect.stringContaining('Goal continuing: verify persisted follow-up'),
       },
       {
         type: 'assistant',
@@ -1034,6 +1984,127 @@ describe('SessionService', () => {
         timestamp: '2026-01-01T00:01:00.000Z',
       },
     ])
+  })
+
+  it('uses bounded locators for snapshots and task notifications with safe fallback', async () => {
+    const sessionId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+    const projectDir = '-tmp-locator-consumers'
+    const snapshotMessageId = crypto.randomUUID()
+    const taskNotification = [
+      '<task-notification>',
+      '<task-id>locator-task</task-id>',
+      '<tool-use-id>toolu_locator</tool-use-id>',
+      '<status>completed</status>',
+      '<summary>Locator completed</summary>',
+      '</task-notification>',
+    ].join('\n')
+    const filePath = await writeSessionFile(projectDir, sessionId, [
+      makeFileHistorySnapshotEntry(snapshotMessageId, {}),
+      makeUserEntry(taskNotification, 'task-notification-locator'),
+      makeAssistantEntry('x'.repeat(256 * 1024), 'task-notification-locator'),
+    ])
+    const snapshot = await fs.stat(filePath)
+    const database = openLocalIndexDatabase({ path: path.join(tmpDir, 'index-v1.sqlite') })
+    const index = createSessionIndex(database)
+    const projector = createSessionProjector({ database, index, scope: tmpDir })
+    await projector.projectSource({
+      path: filePath,
+      sessionId,
+      projectPath: projectDir,
+      fallbackCreatedAt: snapshot.birthtime.toISOString(),
+      fallbackModifiedAt: snapshot.mtime.toISOString(),
+      fallbackWorkDir: '/tmp/locator-consumers',
+      modifiedAtMs: snapshot.mtimeMs,
+    })
+
+    let mode: 'off' | 'shadow' | 'on' = 'on'
+    let locatorCalls = 0
+    let serveWrongEmptyFingerprint = false
+    const gateway: LocalIndexGateway = {
+      async start() {},
+      async stop() {},
+      getMode: () => mode,
+      getPublicStatus: () => ({
+        mode,
+        state: mode === 'off' ? 'off' : 'ready',
+        discovered: 1,
+        indexed: 1,
+        degradedSources: 0,
+        databaseBytes: 0,
+        walBytes: 0,
+        lastUpdatedAt: '2026-07-15T00:00:00.000Z',
+        lastErrorCode: null,
+      }),
+      isSessionScopeReady: () => mode !== 'off',
+      rebuild: async () => gateway.getPublicStatus(),
+      listSessions: options => index.listSessions(options),
+      findSessionFiles: id => index.findSessionFiles(id),
+      getSessionEntryLocators: (transcriptPath, entryTypes) => {
+        locatorCalls += 1
+        const page = index.getSessionEntryLocators(transcriptPath, entryTypes)
+        if (!page || !serveWrongEmptyFingerprint) return page
+        return {
+          source: {
+            ...page.source,
+            fileIdentity: null,
+            fingerprint: 'wrong-fingerprint',
+          },
+          entries: [],
+        }
+      },
+    }
+    const targetedReads: Array<{ bytesRead: number; rangesRead: number }> = []
+    const indexedService = new SessionService(gateway, {
+      targetedEntryReader: async options => {
+        const result = await readSessionEntriesByLocator(options)
+        if (result) targetedReads.push(result)
+        return result
+      },
+    })
+
+    try {
+      expect(await indexedService.getSessionFileHistorySnapshots(sessionId)).toEqual([
+        expect.objectContaining({ messageId: snapshotMessageId }),
+      ])
+      expect(await indexedService.getSessionTaskNotifications(sessionId)).toEqual([{
+        taskId: 'locator-task',
+        toolUseId: 'toolu_locator',
+        status: 'completed',
+        summary: 'Locator completed',
+        timestamp: '2026-01-01T00:01:00.000Z',
+      }])
+      const fileSize = (await fs.stat(filePath)).size
+      expect(targetedReads).toHaveLength(2)
+      expect(targetedReads.every(read => read.rangesRead === 1)).toBeTrue()
+      expect(targetedReads.every(read => read.bytesRead < fileSize)).toBeTrue()
+
+      serveWrongEmptyFingerprint = true
+      expect(await indexedService.getSessionFileHistorySnapshots(sessionId)).toEqual([
+        expect.objectContaining({ messageId: snapshotMessageId }),
+      ])
+      serveWrongEmptyFingerprint = false
+
+      const callsBeforeFullHistory = locatorCalls
+      expect(await indexedService.getSessionMessages(sessionId)).toHaveLength(0)
+      expect(locatorCalls).toBe(callsBeforeFullHistory)
+
+      mode = 'shadow'
+      const callsBeforeShadow = locatorCalls
+      expect(await indexedService.getSessionTaskNotifications(sessionId)).toHaveLength(1)
+      expect(locatorCalls).toBe(callsBeforeShadow)
+
+      mode = 'on'
+      const fallbackService = new SessionService(gateway, {
+        targetedEntryReader: async () => {
+          throw new Error('injected range read failure')
+        },
+      })
+      expect(await fallbackService.getSessionFileHistorySnapshots(sessionId)).toEqual([
+        expect.objectContaining({ messageId: snapshotMessageId }),
+      ])
+    } finally {
+      database.close()
+    }
   })
 
   it('should reconstruct parent agent tool linkage from parentUuid chains', async () => {
@@ -1210,6 +2281,22 @@ describe('SessionService', () => {
     })
   })
 
+  it('should preserve permission metadata when clearing placeholder transcripts', async () => {
+    const workDir = path.join(tmpDir, 'clear-permission-workdir')
+    await fs.mkdir(workDir, { recursive: true })
+    const { sessionId } = await (service.createSession as unknown as (
+      workDir?: string,
+      repositoryOptions?: unknown,
+      permissionMode?: string,
+    ) => Promise<{ sessionId: string; workDir: string }>)(workDir, undefined, 'acceptEdits')
+
+    await service.clearSessionTranscript(sessionId, workDir)
+    const launchInfo = await service.getSessionLaunchInfo(sessionId)
+
+    expect(launchInfo?.workDir).toBe(await fs.realpath(workDir))
+    expect(launchInfo?.permissionMode).toBe('acceptEdits')
+  })
+
   it('should persist session permission mode in launch metadata', async () => {
     const workDir = path.join(tmpDir, 'permission-workdir')
     await fs.mkdir(workDir, { recursive: true })
@@ -1232,6 +2319,91 @@ describe('SessionService', () => {
 
     launchInfo = await service.getSessionLaunchInfo(sessionId)
     expect(launchInfo?.permissionMode).toBe('plan')
+  })
+
+  it('should round-trip auto through creation, list, metadata update, restore, and clear', async () => {
+    const workDir = path.join(tmpDir, 'auto-permission-workdir')
+    await fs.mkdir(workDir, { recursive: true })
+
+    const { sessionId } = await service.createSession(workDir, undefined, 'auto')
+
+    expect((await service.getSessionLaunchInfo(sessionId))?.permissionMode).toBe('auto')
+    expect(
+      (await service.listSessions()).sessions.find((session) => session.id === sessionId)
+        ?.permissionMode,
+    ).toBe('auto')
+
+    await service.appendSessionMetadata(sessionId, {
+      workDir,
+      permissionMode: 'default',
+    })
+    await service.appendSessionMetadata(sessionId, {
+      workDir,
+      permissionMode: 'auto',
+    })
+    expect((await service.getSessionLaunchInfo(sessionId))?.permissionMode).toBe('auto')
+
+    await service.clearSessionTranscript(sessionId, workDir, 'auto')
+    expect((await service.getSessionLaunchInfo(sessionId))?.permissionMode).toBe('auto')
+  })
+
+  it('should expose the latest runtime selection in the session list', async () => {
+    const workDir = '/tmp/runtime-list-metadata'
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    await writeSessionFile(sanitizePath(workDir), sessionId, [
+      makeSnapshotEntry(),
+      {
+        ...makeSessionMetaEntry(workDir),
+        runtimeProviderId: 'provider-latest',
+        runtimeModelId: 'anthropic/claude-opus-4.7',
+        effortLevel: 'max',
+      },
+      makeUserEntry('Use the latest runtime metadata'),
+    ])
+
+    const listed = (await service.listSessions()).sessions.find((session) => session.id === sessionId)
+
+    expect(listed).toMatchObject({
+      runtimeProviderId: 'provider-latest',
+      runtimeModelId: 'anthropic/claude-opus-4.7',
+      effortLevel: 'max',
+    })
+  })
+
+  it('should not append duplicate runtime metadata when it already matches', async () => {
+    const workDir = '/tmp/runtime-idempotent'
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const filePath = await writeSessionFile(sanitizePath(workDir), sessionId, [
+      makeSnapshotEntry(),
+      {
+        ...makeSessionMetaEntry(workDir),
+        runtimeProviderId: 'provider-a',
+        runtimeModelId: 'model-a',
+        effortLevel: 'max',
+      },
+      makeUserEntry('Runtime metadata should stay stable'),
+    ])
+    const before = await fs.readFile(filePath, 'utf-8')
+
+    await service.appendSessionMetadata(sessionId, {
+      workDir,
+      runtimeProviderId: 'provider-a',
+      runtimeModelId: 'model-a',
+      effortLevel: 'max',
+    })
+
+    expect(await fs.readFile(filePath, 'utf-8')).toBe(before)
+
+    await service.appendSessionMetadata(sessionId, {
+      workDir,
+      runtimeProviderId: 'provider-a',
+      runtimeModelId: 'model-b',
+      effortLevel: 'max',
+    })
+
+    const afterChange = await fs.readFile(filePath, 'utf-8')
+    expect(afterChange).not.toBe(before)
+    expect(afterChange).toContain('"runtimeModelId":"model-b"')
   })
 
   it('should remove stale placeholder files after native CLI worktree startup', async () => {
@@ -1518,11 +2690,12 @@ describe('SessionService', () => {
   })
 
   it('should default to the user home directory when workDir is missing', async () => {
-    const { sessionId } = await service.createSession('')
+    const { sessionId, workDir } = await service.createSession('')
+    expect(workDir).toBe(await fs.realpath(os.homedir()))
     const filePath = path.join(
       tmpDir,
       'projects',
-      sanitizePath(os.homedir()),
+      sanitizePath(workDir),
       `${sessionId}.jsonl`,
     )
 
@@ -1935,9 +3108,18 @@ describe('Sessions API', () => {
     const res = await fetch(`${baseUrl}/api/sessions`)
     expect(res.status).toBe(200)
 
-    const body = (await res.json()) as { sessions: unknown[]; total: number }
+    const body = (await res.json()) as {
+      sessions: unknown[]
+      total: number
+      index?: { mode: string; state: string; lastErrorCode: string | null }
+    }
     expect(body.sessions).toEqual([])
     expect(body.total).toBe(0)
+    expect(body.index).toMatchObject({
+      mode: expect.any(String),
+      state: expect.any(String),
+    })
+    expect(body.index?.lastErrorCode === null || typeof body.index?.lastErrorCode === 'string').toBe(true)
   })
 
   it('POST /api/sessions should create a session', async () => {
@@ -1967,6 +3149,16 @@ describe('Sessions API', () => {
     expect(body.sessionId).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
     )
+  })
+
+  it('POST /api/sessions should reject an unknown permission mode', async () => {
+    const res = await fetch(`${baseUrl}/api/sessions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ permissionMode: 'unknown' }),
+    })
+
+    expect(res.status).toBe(400)
   })
 
   it('GET /api/sessions/:id/inspection should report persisted permission mode for inactive sessions', async () => {
@@ -2039,6 +3231,86 @@ describe('Sessions API', () => {
     expect(project?.realPath).toBe(await fs.realpath(workDir))
   })
 
+  it('GET /api/sessions/recent-projects should retain source projects for cleaned worktrees', async () => {
+    const sourceWorkDir = await createCleanGitRepo(tmpDir)
+    const worktreePath = path.join(sourceWorkDir, '.claude', 'worktrees', 'desktop-main-87654321')
+    const sessionId = 'c1000000-bbbb-cccc-dddd-eeeeeeeeeeee'
+    await writeSessionFile(sanitizePath(worktreePath), sessionId, [
+      makeSessionMetaEntry(worktreePath),
+      makeWorktreeStateEntry(sessionId, worktreePath, {
+        originalCwd: sourceWorkDir,
+      }),
+      makeUserEntry('Cleaned worktree history'),
+    ])
+
+    const recentRes = await fetch(`${baseUrl}/api/sessions/recent-projects?limit=20`)
+    expect(recentRes.status).toBe(200)
+
+    const body = (await recentRes.json()) as {
+      projects: Array<{ realPath: string; sessionCount: number }>
+    }
+    expect(body.projects).toContainEqual(expect.objectContaining({
+      realPath: await fs.realpath(sourceWorkDir),
+      sessionCount: 1,
+    }))
+  })
+
+  it('GET /api/sessions/recent-projects should isolate cached projects by config scope', async () => {
+    const firstConfigDir = path.join(tmpDir, 'recent-project-scopes', 'first')
+    const secondConfigDir = path.join(tmpDir, 'recent-project-scopes', 'second')
+    const firstWorkDir = path.join(tmpDir, 'recent-project-workspaces', 'first')
+    const secondWorkDir = path.join(tmpDir, 'recent-project-workspaces', 'second')
+    const firstSessionId = 'a1000000-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const secondSessionId = 'a1000001-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const seedScope = async (
+      configDir: string,
+      sessionId: string,
+      workDir: string,
+      title: string,
+    ) => {
+      const projectDir = path.join(configDir, 'projects', '-tmp-recent-scope')
+      await fs.mkdir(projectDir, { recursive: true })
+      await fs.mkdir(workDir, { recursive: true })
+      await fs.writeFile(
+        path.join(projectDir, `${sessionId}.jsonl`),
+        `${JSON.stringify({
+          ...makeUserEntry(title),
+          cwd: workDir,
+          sessionId,
+        })}\n`,
+        'utf8',
+      )
+    }
+    await seedScope(firstConfigDir, firstSessionId, firstWorkDir, 'First recent scope')
+    await seedScope(secondConfigDir, secondSessionId, secondWorkDir, 'Second recent scope')
+    const firstRealWorkDir = await fs.realpath(firstWorkDir)
+    const secondRealWorkDir = await fs.realpath(secondWorkDir)
+
+    process.env.CLAUDE_CONFIG_DIR = firstConfigDir
+    const createRes = await fetch(`${baseUrl}/api/sessions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ workDir: firstWorkDir }),
+    })
+    expect(createRes.status).toBe(201)
+    const firstRecentRes = await fetch(`${baseUrl}/api/sessions/recent-projects?limit=20`)
+    expect(firstRecentRes.status).toBe(200)
+    const firstRecent = await firstRecentRes.json() as {
+      projects: Array<{ realPath: string }>
+    }
+
+    process.env.CLAUDE_CONFIG_DIR = secondConfigDir
+    const secondRecentRes = await fetch(`${baseUrl}/api/sessions/recent-projects?limit=20`)
+    expect(secondRecentRes.status).toBe(200)
+    const secondRecent = await secondRecentRes.json() as {
+      projects: Array<{ realPath: string }>
+    }
+
+    expect(firstRecent.projects.some(project => project.realPath === firstRealWorkDir)).toBe(true)
+    expect(secondRecent.projects.some(project => project.realPath === secondRealWorkDir)).toBe(true)
+    expect(secondRecent.projects.some(project => project.realPath === firstRealWorkDir)).toBe(false)
+  })
+
   it('GET /api/sessions/:id should return session detail', async () => {
     // Create a session file
     const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
@@ -2099,6 +3371,153 @@ describe('Sessions API', () => {
         timestamp: expect.any(String),
       },
     ])
+  })
+
+  it('GET /api/sessions/:id/subagents/by-tool/:toolUseId should return a resolved run', async () => {
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const projectDir = '-tmp-api-subagent-run'
+    const agentId = 'abc123'
+    await writeSessionFile(projectDir, sessionId, [
+      makeSnapshotEntry(),
+      makeAssistantToolUseEntry([
+        {
+          id: 'tool-1',
+          name: 'Agent',
+          input: { description: 'Inspect server seam', prompt: 'Read session routes' },
+        },
+      ]),
+      makeToolResultUserEntry('tool-1', `server summary\nagentId: ${agentId}`),
+    ])
+    await writeSubagentTranscriptFile(projectDir, sessionId, agentId, [
+      {
+        type: 'user',
+        message: { role: 'user', content: 'Read session routes' },
+        uuid: crypto.randomUUID(),
+        timestamp: '2026-01-01T00:00:04.000Z',
+      },
+      {
+        type: 'assistant',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'Found sessions.ts' }] },
+        uuid: crypto.randomUUID(),
+        timestamp: '2026-01-01T00:00:05.000Z',
+      },
+    ])
+
+    const res = await fetch(`${baseUrl}/api/sessions/${sessionId}/subagents/by-tool/tool-1`)
+    expect(res.status).toBe(200)
+
+    const body = (await res.json()) as {
+      sessionId: string
+      toolUseId: string
+      agentId: string | null
+      description?: string
+      prompt?: string
+      messages: unknown[]
+      source: string
+    }
+    expect(body).toMatchObject({
+      sessionId,
+      toolUseId: 'tool-1',
+      agentId,
+      description: 'Inspect server seam',
+      prompt: 'Read session routes',
+      source: 'subagent-jsonl',
+    })
+    expect(body.messages).toHaveLength(2)
+  })
+
+  it('GET /api/sessions/:id/subagents/by-tool/:toolUseId should use a live task id while running', async () => {
+    const sessionId = 'edededed-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const projectDir = '-tmp-api-live-subagent-run'
+    const agentId = 'abc123'
+    await writeSessionFile(projectDir, sessionId, [
+      makeSnapshotEntry(),
+      makeAssistantToolUseEntry([{
+        id: 'tool-1',
+        name: 'Agent',
+        input: { description: 'Inspect live seam', prompt: 'Read the route' },
+      }]),
+    ])
+    await writeSubagentTranscriptFile(projectDir, sessionId, agentId, [
+      {
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: 'child-tool-1', name: 'Read', input: {} }],
+        },
+        uuid: crypto.randomUUID(),
+        timestamp: '2026-01-01T00:00:04.000Z',
+      },
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'child-tool-1', content: 'route source' }],
+        },
+        uuid: crypto.randomUUID(),
+        timestamp: '2026-01-01T00:00:05.000Z',
+      },
+    ])
+
+    const res = await fetch(
+      `${baseUrl}/api/sessions/${sessionId}/subagents/by-tool/tool-1?taskId=${agentId}`,
+    )
+    expect(res.status).toBe(200)
+
+    const body = (await res.json()) as {
+      agentId: string | null
+      taskId?: string
+      status: string
+      messages: unknown[]
+      source: string
+    }
+    expect(body).toMatchObject({
+      agentId,
+      taskId: agentId,
+      status: 'running',
+      source: 'subagent-jsonl',
+    })
+    expect(body.messages).toHaveLength(2)
+  })
+
+  it('POST /api/sessions/:id/subagents/by-tool/:toolUseId should return 405', async () => {
+    const res = await fetch(
+      `${baseUrl}/api/sessions/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/subagents/by-tool/tool-1`,
+      { method: 'POST' },
+    )
+
+    expect(res.status).toBe(405)
+  })
+
+  it('GET /api/sessions/:id/subagents/by-tool/:toolUseId/extra should return 404', async () => {
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const agentId = 'abc123'
+    await writeSessionFile('-tmp-api-subagent-run-extra', sessionId, [
+      makeSnapshotEntry(),
+      makeAssistantToolUseEntry([
+        {
+          id: 'tool-1',
+          name: 'Agent',
+          input: { description: 'Inspect server seam', prompt: 'Read session routes' },
+        },
+      ]),
+      makeToolResultUserEntry('tool-1', `server summary\nagentId: ${agentId}`),
+    ])
+
+    const res = await fetch(`${baseUrl}/api/sessions/${sessionId}/subagents/by-tool/tool-1/extra`)
+
+    expect(res.status).toBe(404)
+  })
+
+  it('GET /api/sessions/:id/subagents/by-tool/:toolUseId should return 404 for malformed encoding', async () => {
+    const { handleSessionsApi } = await import('../api/sessions.js')
+    const res = await handleSessionsApi(
+      new Request(`${baseUrl}/api/sessions/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/subagents/by-tool/%25E0%25A4%25A`),
+      new URL(`${baseUrl}/api/sessions/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/subagents/by-tool/%25E0%25A4%25A`),
+      ['api', 'sessions', 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', 'subagents', 'by-tool', '%E0%A4%A'],
+    )
+
+    expect(res.status).toBe(404)
   })
 
   it('GET /api/sessions/:id/git-info should prefer the active CLI workDir', async () => {
@@ -2284,6 +3703,56 @@ describe('Sessions API', () => {
     })
   })
 
+  it('GET /api/sessions/:id/git-info should not hang when git blocks in a UTF-8 workDir', async () => {
+    if (process.platform === 'win32') return
+
+    const parentDir = path.join(tmpDir, '数据包看板')
+    const workDir = path.join(parentDir, 'datavizprocessingplatform')
+    await fs.mkdir(workDir, { recursive: true })
+    git(workDir, 'init', '--initial-branch', 'main')
+    git(workDir, 'config', 'user.email', 'sessions-api@example.com')
+    git(workDir, 'config', 'user.name', 'Sessions API')
+    await fs.writeFile(path.join(workDir, 'README.md'), 'main\n')
+    git(workDir, 'add', 'README.md')
+    git(workDir, 'commit', '-m', 'initial')
+
+    const fsmonitorPath = path.join(tmpDir, 'slow-fsmonitor.sh')
+    await fs.writeFile(fsmonitorPath, '#!/bin/sh\nsleep 2\nexit 0\n', 'utf-8')
+    await fs.chmod(fsmonitorPath, 0o755)
+    git(workDir, 'config', 'core.fsmonitor', fsmonitorPath)
+
+    const { sessionId } = await sessionService.createSession(workDir)
+    const oldTimeout = process.env.CC_HAHA_GIT_INFO_TIMEOUT_MS
+    process.env.CC_HAHA_GIT_INFO_TIMEOUT_MS = '80'
+
+    try {
+      const startedAt = Date.now()
+      const res = await fetch(`${baseUrl}/api/sessions/${sessionId}/git-info`, {
+        signal: AbortSignal.timeout(1_000),
+      })
+      expect(Date.now() - startedAt).toBeLessThan(1_000)
+      expect(res.status).toBe(200)
+
+      const body = (await res.json()) as {
+        branch: string | null
+        repoName: string | null
+        workDir: string
+        changedFiles: number
+      }
+      expect(body.workDir).toBe(await fs.realpath(workDir))
+      expect(body.workDir).toContain('数据包看板')
+      expect(body.branch).toBe('main')
+      expect(body.repoName).toBe('datavizprocessingplatform')
+      expect(body.changedFiles).toBe(0)
+    } finally {
+      if (oldTimeout === undefined) {
+        delete process.env.CC_HAHA_GIT_INFO_TIMEOUT_MS
+      } else {
+        process.env.CC_HAHA_GIT_INFO_TIMEOUT_MS = oldTimeout
+      }
+    }
+  })
+
   it('DELETE /api/sessions/:id should delete the session', async () => {
     const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
     await writeSessionFile('-tmp-api-test', sessionId, [makeSnapshotEntry()])
@@ -2294,6 +3763,35 @@ describe('Sessions API', () => {
     // Verify it's gone
     const res2 = await fetch(`${baseUrl}/api/sessions/${sessionId}`)
     expect(res2.status).toBe(404)
+  })
+
+  it('DELETE /api/sessions/:id should invalidate recent projects cache', async () => {
+    const workDir = await fs.mkdtemp(path.join(tmpDir, 'recent-cache-delete-'))
+    const createRes = await fetch(`${baseUrl}/api/sessions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ workDir }),
+    })
+    expect(createRes.status).toBe(201)
+    const { sessionId } = await createRes.json() as { sessionId: string }
+    const realWorkDir = await fs.realpath(workDir)
+
+    const firstRecentRes = await fetch(`${baseUrl}/api/sessions/recent-projects?limit=20`)
+    expect(firstRecentRes.status).toBe(200)
+    const firstRecent = await firstRecentRes.json() as {
+      projects: Array<{ realPath: string }>
+    }
+    expect(firstRecent.projects.some((project) => project.realPath === realWorkDir)).toBe(true)
+
+    const deleteRes = await fetch(`${baseUrl}/api/sessions/${sessionId}`, { method: 'DELETE' })
+    expect(deleteRes.status).toBe(200)
+
+    const secondRecentRes = await fetch(`${baseUrl}/api/sessions/recent-projects?limit=20`)
+    expect(secondRecentRes.status).toBe(200)
+    const secondRecent = await secondRecentRes.json() as {
+      projects: Array<{ realPath: string }>
+    }
+    expect(secondRecent.projects.some((project) => project.realPath === realWorkDir)).toBe(false)
   })
 
   it('DELETE /api/sessions/:id should remove matching IM adapter session mappings', async () => {
@@ -2676,7 +4174,7 @@ describe('Sessions API', () => {
     )
   })
 
-  it('GET /api/sessions/:id/workspace/status|tree|file|diff should return workspace data', async () => {
+  it('GET /api/sessions/:id/workspace/status|tree|search|file|diff should return workspace data', async () => {
     const workDir = await createWorkspaceApiGitRepo(tmpDir)
     const { sessionId } = await service.createSession(workDir)
 
@@ -2709,9 +4207,25 @@ describe('Sessions API', () => {
       path: '',
     })
     expect(treeBody.entries).toEqual([
+      { name: 'services', path: 'services', isDirectory: true },
       { name: 'src', path: 'src', isDirectory: true },
       { name: 'tracked.txt', path: 'tracked.txt', isDirectory: false },
     ])
+
+    const searchRes = await fetch(
+      `${baseUrl}/api/sessions/${sessionId}/workspace/search?query=${encodeURIComponent('MentalHealthTrendController')}`,
+    )
+    expect(searchRes.status).toBe(200)
+    expect(await searchRes.json()).toMatchObject({
+      state: 'ok',
+      query: 'MentalHealthTrendController',
+      truncated: false,
+      entries: [{
+        name: 'MentalHealthTrendController.java',
+        path: 'services/mental-health-service/src/main/java/com/example/campus/mentalhealth/controller/MentalHealthTrendController.java',
+        isDirectory: false,
+      }],
+    })
 
     const fileRes = await fetch(
       `${baseUrl}/api/sessions/${sessionId}/workspace/file?path=${encodeURIComponent('src/app.ts')}`,
@@ -3017,6 +4531,17 @@ describe('Sessions API', () => {
       expect(await res.json()).toMatchObject({
         error: 'BAD_REQUEST',
       })
+    }
+  })
+
+  it('GET /api/sessions/:id/workspace/search should require a non-empty query', async () => {
+    const workDir = await createWorkspaceApiGitRepo(tmpDir)
+    const { sessionId } = await service.createSession(workDir)
+
+    for (const suffix of ['', '?query=%20%20']) {
+      const res = await fetch(`${baseUrl}/api/sessions/${sessionId}/workspace/search${suffix}`)
+      expect(res.status).toBe(400)
+      expect(await res.json()).toMatchObject({ error: 'BAD_REQUEST' })
     }
   })
 
@@ -4052,6 +5577,59 @@ describe('Sessions API', () => {
     expect(body.checkpoints[0]!.code.deletions).toBe(0)
   })
 
+  it('GET /api/sessions/:id/turn-checkpoints should ignore rejected transcript tool changes', async () => {
+    const sessionId = '99999999-bbbb-cccc-dddd-000000000004'
+    const workDir = path.join(tmpDir, 'transcript-rejected-session')
+    const userId = crypto.randomUUID()
+    const toolUseId = 'Write:rejected'
+    await fs.mkdir(workDir, { recursive: true })
+
+    await writeSessionFile('-tmp-transcript-rejected-session', sessionId, [
+      makeSessionMetaEntry(workDir),
+      {
+        ...makeUserEntry('write a denied file', userId),
+        cwd: workDir,
+        sessionId,
+      },
+      makeAssistantToolUseEntry([{
+        id: toolUseId,
+        name: 'Write',
+        input: {
+          file_path: path.join(workDir, 'permission-denial-test.txt'),
+          content: 'must not be written\n',
+        },
+      }], userId),
+      {
+        ...makeToolResultUserEntry(
+          toolUseId,
+          'The user rejected this tool use.',
+          undefined,
+          undefined,
+          sessionId,
+        ),
+        message: {
+          role: 'user',
+          content: [{
+            type: 'tool_result',
+            tool_use_id: toolUseId,
+            content: 'The user rejected this tool use.',
+            is_error: true,
+          }],
+        },
+        cwd: workDir,
+      },
+      makeAssistantEntry('The requested write was not completed.', userId),
+    ])
+
+    const res = await fetch(`${baseUrl}/api/sessions/${sessionId}/turn-checkpoints`)
+    expect(res.status).toBe(200)
+    const body = await res.json() as { checkpoints: unknown[] }
+
+    expect(body.checkpoints).toEqual([])
+    await expect(fs.stat(path.join(workDir, 'permission-denial-test.txt')))
+      .rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
   it('GET /api/sessions/:id/turn-checkpoints/diff should return transcript tool diffs when file snapshots are missing', async () => {
     const sessionId = '99999999-bbbb-cccc-dddd-000000000002'
     const workDir = path.join(tmpDir, 'transcript-only-diff-session')
@@ -4228,8 +5806,9 @@ describe('Sessions API', () => {
     const res = await fetch(`${baseUrl}/api/sessions/${sessionId}/chat/status`)
     expect(res.status).toBe(200)
 
-    const body = (await res.json()) as { state: string }
+    const body = (await res.json()) as { state: string; activityState: string }
     expect(body.state).toBe('idle')
+    expect(body.activityState).toBe('idle')
   })
 
   it('POST /api/sessions/:id/chat should queue a message', async () => {
@@ -4249,6 +5828,13 @@ describe('Sessions API', () => {
     const body = (await res.json()) as { messageId: string; status: string }
     expect(body.status).toBe('queued')
     expect(body.messageId).toBeTruthy()
+
+    const statusRes = await fetch(`${baseUrl}/api/sessions/${sessionId}/chat/status`)
+    const status = (await statusRes.json()) as { state: string; activityState: string }
+    expect(status.state).toBe('thinking')
+    expect(status.activityState).toBe('running')
+
+    await fetch(`${baseUrl}/api/sessions/${sessionId}/chat/stop`, { method: 'POST' })
   })
 
   it('POST /api/sessions/:id/chat/stop should reset state to idle', async () => {
@@ -4260,7 +5846,8 @@ describe('Sessions API', () => {
 
     // Verify state is idle
     const statusRes = await fetch(`${baseUrl}/api/sessions/${sessionId}/chat/status`)
-    const status = (await statusRes.json()) as { state: string }
+    const status = (await statusRes.json()) as { state: string; activityState: string }
     expect(status.state).toBe('idle')
+    expect(status.activityState).toBe('idle')
   })
 })

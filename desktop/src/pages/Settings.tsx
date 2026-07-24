@@ -26,14 +26,13 @@ import { ConfirmDialog } from '../components/shared/ConfirmDialog'
 import { Input } from '../components/shared/Input'
 import { Button } from '../components/shared/Button'
 import { Dropdown } from '../components/shared/Dropdown'
+import { PermissionModeSelector } from '../components/controls/PermissionModeSelector'
 import type { ThemeMode, UpdateProxyMode, NetworkProxyMode, WebSearchMode, AppMode, ChatSendBehavior, OutputStyleSource } from '../types/settings'
 import type { Locale } from '../i18n'
 import type { SavedProvider, UpdateProviderInput, ProviderTestResult, ModelMapping, Model1mSupport, ApiFormat, ProviderAuthStrategy } from '../types/provider'
 import type { ProviderPreset } from '../types/providerPreset'
 import { AdapterSettings } from './AdapterSettings'
-import { useAgentStore } from '../stores/agentStore'
 import { useSessionStore } from '../stores/sessionStore'
-import type { AgentDefinition, AgentSource } from '../api/agents'
 import { MarkdownRenderer } from '../components/markdown/MarkdownRenderer'
 import { useSkillStore } from '../stores/skillStore'
 import { SkillList } from '../components/skills/SkillList'
@@ -48,20 +47,25 @@ import { DiagnosticsSettings } from './DiagnosticsSettings'
 import { TraceList } from './TraceList'
 import { ActivitySettings } from './ActivitySettings'
 import { MemorySettings } from './MemorySettings'
-import { useUIStore, type SettingsTab } from '../stores/uiStore'
+import { PetSettings } from '../features/pets/PetSettings'
+import { useUIStore } from '../stores/uiStore'
 import { ClaudeOfficialLogin } from '../components/settings/ClaudeOfficialLogin'
 import { ChatGPTOfficialLogin } from '../components/settings/ChatGPTOfficialLogin'
+import { GrokOfficialLogin } from '../components/settings/GrokOfficialLogin'
+import { AgentManager } from '../components/settings/AgentManager'
 import {
   BUILT_IN_PROVIDER_IDS,
   CLAUDE_OFFICIAL_PROVIDER_ID,
   OPENAI_OFFICIAL_PROVIDER_ID,
 } from '../constants/openaiOfficialProvider'
+import { GROK_OFFICIAL_PROVIDER_ID } from '../constants/grokOfficialProvider'
 import { useUpdateStore } from '../stores/updateStore'
 import { getBaseUrl } from '../api/client'
 import { formatBytes } from '../lib/formatBytes'
 import { isDesktopRuntime } from '../lib/desktopRuntime'
 import { getDesktopHost } from '../lib/desktopHost'
 import { publicAssetPath } from '../lib/publicAsset'
+import { isBrowserSafePort } from '../lib/browserSafePort'
 import {
   getDesktopNotificationPermission,
   notifyDesktop,
@@ -82,6 +86,20 @@ const NETWORK_TIMEOUT_MIN_SECONDS = 30
 const NETWORK_TIMEOUT_MAX_SECONDS = 1800
 const NETWORK_TIMEOUT_STEP_SECONDS = 30
 const SETTINGS_CHECKBOX_INPUT_CLASS = 'settings-checkbox-input peer'
+const BUILT_IN_OUTPUT_STYLE_TRANSLATION_KEYS = {
+  default: {
+    label: 'settings.general.outputStyleBuiltin.default.label',
+    description: 'settings.general.outputStyleBuiltin.default.description',
+  },
+  Explanatory: {
+    label: 'settings.general.outputStyleBuiltin.explanatory.label',
+    description: 'settings.general.outputStyleBuiltin.explanatory.description',
+  },
+  Learning: {
+    label: 'settings.general.outputStyleBuiltin.learning.label',
+    description: 'settings.general.outputStyleBuiltin.learning.description',
+  },
+} satisfies Record<string, { label: TranslationKey; description: TranslationKey }>
 
 function buildH5LaunchUrl(baseUrl: string | null, token: string | null): string | null {
   if (!baseUrl) return null
@@ -150,7 +168,7 @@ function parseH5FixedPortDraft(draft: string): number | null | 'invalid' {
   if (!trimmed) return null
   if (!/^\d{1,5}$/.test(trimmed)) return 'invalid'
   const port = Number(trimmed)
-  return port >= 1024 && port <= 65535 ? port : 'invalid'
+  return port >= 1024 && port <= 65535 && isBrowserSafePort(port) ? port : 'invalid'
 }
 
 // Mirrors the server-side disconnect grace range (h5AccessService
@@ -181,7 +199,8 @@ function buildH5PublicBaseUrlFromHostDraft(draft: string, currentBaseUrl: string
 }
 
 export function Settings() {
-  const [activeTab, setActiveTab] = useState<SettingsTab>('providers')
+  const activeTab = useUIStore((s) => s.activeSettingsTab)
+  const setActiveTab = useUIStore((s) => s.setActiveSettingsTab)
   const pendingSettingsTab = useUIStore((s) => s.pendingSettingsTab)
   const t = useTranslation()
 
@@ -189,7 +208,7 @@ export function Settings() {
     if (!pendingSettingsTab) return
     setActiveTab(pendingSettingsTab)
     useUIStore.getState().setPendingSettingsTab(null)
-  }, [pendingSettingsTab])
+  }, [pendingSettingsTab, setActiveTab])
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-[var(--color-surface)]">
@@ -207,6 +226,7 @@ export function Settings() {
             <TabButton icon="auto_awesome" label={t('settings.tab.skills')} active={activeTab === 'skills'} onClick={() => setActiveTab('skills')} />
             <TabButton icon="history_edu" label={t('settings.tab.memory')} active={activeTab === 'memory'} onClick={() => setActiveTab('memory')} />
             <TabButton icon="extension" label={t('settings.tab.plugins')} active={activeTab === 'plugins'} onClick={() => setActiveTab('plugins')} />
+            <TabButton icon="pets" label={t('settings.tab.pets')} active={activeTab === 'pets'} onClick={() => setActiveTab('pets')} />
             <TabButton icon="mouse" label={t('settings.tab.computerUse')} active={activeTab === 'computerUse'} onClick={() => setActiveTab('computerUse')} />
             <TabButton icon="monitoring" label={t('settings.tab.activity')} active={activeTab === 'activity'} onClick={() => setActiveTab('activity')} />
             <TabButton icon="account_tree" label={t('settings.tab.trace')} active={activeTab === 'trace'} onClick={() => setActiveTab('trace')} />
@@ -226,10 +246,11 @@ export function Settings() {
           {activeTab === 'adapters' && <AdapterSettings />}
           {activeTab === 'terminal' && <TerminalSettings showPreferences />}
           {activeTab === 'mcp' && <McpSettings />}
-          {activeTab === 'agents' && <AgentsSettings />}
+          {activeTab === 'agents' && <AgentManager />}
           {activeTab === 'skills' && <SkillSettings />}
           {activeTab === 'memory' && <MemorySettings />}
           {activeTab === 'plugins' && <PluginSettings />}
+          {activeTab === 'pets' && <PetSettings />}
           {activeTab === 'computerUse' && <ComputerUseSettings />}
           {activeTab === 'trace' && <TraceList />}
           {activeTab === 'diagnostics' && <DiagnosticsSettings />}
@@ -244,13 +265,14 @@ function TabButton({ icon, label, active, onClick }: { icon: string; label: stri
   return (
     <button
       onClick={onClick}
+      aria-current={active ? 'page' : undefined}
       className={`w-full flex items-center gap-2.5 px-4 py-2.5 text-sm text-left transition-colors ${
         active
           ? 'bg-[var(--color-surface-selected)] text-[var(--color-text-primary)] font-medium'
           : 'text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)]'
       }`}
     >
-      <span className="material-symbols-outlined text-[18px]">{icon}</span>
+      <span className="material-symbols-outlined text-[18px]" aria-hidden="true">{icon}</span>
       {label}
     </button>
   )
@@ -261,6 +283,7 @@ function TabButton({ icon, label, active, onClick }: { icon: string; label: stri
 type ProviderListItem =
   | { id: typeof CLAUDE_OFFICIAL_PROVIDER_ID; kind: 'claude-official' }
   | { id: typeof OPENAI_OFFICIAL_PROVIDER_ID; kind: 'openai-official' }
+  | { id: typeof GROK_OFFICIAL_PROVIDER_ID; kind: 'grok-official' }
   | { id: string; kind: 'saved'; provider: SavedProvider }
 
 function defaultProviderOrder(providers: SavedProvider[]): string[] {
@@ -307,6 +330,7 @@ function buildProviderListItems(
   const items = new Map<string, ProviderListItem>([
     [CLAUDE_OFFICIAL_PROVIDER_ID, { id: CLAUDE_OFFICIAL_PROVIDER_ID, kind: 'claude-official' }],
     [OPENAI_OFFICIAL_PROVIDER_ID, { id: OPENAI_OFFICIAL_PROVIDER_ID, kind: 'openai-official' }],
+    [GROK_OFFICIAL_PROVIDER_ID, { id: GROK_OFFICIAL_PROVIDER_ID, kind: 'grok-official' }],
     ...savedItems,
   ])
 
@@ -321,6 +345,8 @@ function providerItemTestId(item: ProviderListItem): string {
       return 'claude-official-provider'
     case 'openai-official':
       return 'openai-official-provider'
+    case 'grok-official':
+      return 'grok-official-provider'
     case 'saved':
       return `provider-${item.provider.id}`
   }
@@ -334,9 +360,7 @@ function ProviderSettings() {
     hasLoadedProviders,
     presets,
     isLoading,
-    isPresetsLoading,
     fetchProviders,
-    fetchPresets,
     deleteProvider,
     reorderProviders,
     activateProvider,
@@ -361,8 +385,7 @@ function ProviderSettings() {
 
   useEffect(() => {
     void fetchProviders()
-    void fetchPresets()
-  }, [fetchPresets, fetchProviders])
+  }, [fetchProviders])
 
   const presetMap = useMemo(
     () => new Map(presets.map((preset) => [preset.id, preset])),
@@ -426,6 +449,7 @@ function ProviderSettings() {
 
   const isClaudeOfficialActive = hasLoadedProviders && activeId === null
   const isOpenAIOfficialActive = hasLoadedProviders && activeId === OPENAI_OFFICIAL_PROVIDER_ID
+  const isGrokOfficialActive = hasLoadedProviders && activeId === GROK_OFFICIAL_PROVIDER_ID
 
   return (
     <div className="max-w-2xl">
@@ -434,7 +458,7 @@ function ProviderSettings() {
           <h2 className="text-base font-semibold text-[var(--color-text-primary)]">{t('settings.providers.title')}</h2>
           <p className="text-sm text-[var(--color-text-tertiary)] mt-0.5">{t('settings.providers.description')}</p>
         </div>
-        <Button size="sm" onClick={() => setShowCreateModal(true)} disabled={isPresetsLoading || presets.length === 0}>
+        <Button size="sm" onClick={() => setShowCreateModal(true)}>
           <span className="material-symbols-outlined text-[16px]">add</span>
           {t('settings.providers.addProvider')}
         </Button>
@@ -489,6 +513,28 @@ function ProviderSettings() {
                     details={isOpenAIOfficialActive ? (
                       <div className="border-t border-[var(--color-border-separator)] px-4 pb-4 pt-3">
                         <ChatGPTOfficialLogin />
+                      </div>
+                    ) : null}
+                  />
+                )
+              }
+
+              if (item.kind === 'grok-official') {
+                return (
+                  <SortableProviderCard
+                    key={item.id}
+                    item={item}
+                    isActive={isGrokOfficialActive}
+                    dragLabel={t('settings.providers.dragToReorder')}
+                    onActivate={!isGrokOfficialActive ? () => handleActivate(GROK_OFFICIAL_PROVIDER_ID) : undefined}
+                    title={t('settings.providers.grokOfficialName')}
+                    subtitle={t('settings.providers.grokOfficialDesc')}
+                    badges={isGrokOfficialActive ? (
+                      <span className="rounded border border-[var(--color-brand)]/18 bg-[var(--color-brand)]/12 px-1.5 py-0.5 text-[10px] font-bold leading-none text-[var(--color-brand)]">{t('settings.providers.default')}</span>
+                    ) : null}
+                    details={isGrokOfficialActive ? (
+                      <div className="border-t border-[var(--color-border-separator)] px-4 pb-4 pt-3">
+                        <GrokOfficialLogin />
                       </div>
                     ) : null}
                   />
@@ -703,6 +749,7 @@ function requirePreset(preset: ProviderPreset | undefined): ProviderPreset {
 
 const AUTO_COMPACT_WINDOW_ENV_KEY = 'CLAUDE_CODE_AUTO_COMPACT_WINDOW'
 const MODEL_CONTEXT_WINDOWS_ENV_KEY = 'CLAUDE_CODE_MODEL_CONTEXT_WINDOWS'
+const DISABLE_EXPERIMENTAL_BETAS_ENV_KEY = 'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS'
 const MODEL_CONTEXT_WINDOW_MIN = 16000
 const MODEL_CONTEXT_WINDOW_MAX = 10000000
 const MODEL_1M_CONTEXT_WINDOW = 1000000
@@ -927,6 +974,27 @@ function normalizeModelMapping(models: ModelMapping): ModelMapping {
   }
 }
 
+function readSettingsEnvString(env: Record<string, unknown>, key: string): string | undefined {
+  const value = env[key]
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  return trimmed || undefined
+}
+
+function readModelMappingFromSettingsEnv(env: Record<string, unknown>): Partial<ModelMapping> {
+  const haiku = readSettingsEnvString(env, 'ANTHROPIC_DEFAULT_HAIKU_MODEL')
+  const sonnet = readSettingsEnvString(env, 'ANTHROPIC_DEFAULT_SONNET_MODEL')
+  const opus = readSettingsEnvString(env, 'ANTHROPIC_DEFAULT_OPUS_MODEL')
+  const main = readSettingsEnvString(env, 'ANTHROPIC_MODEL') ?? sonnet ?? haiku ?? opus
+
+  return {
+    ...(main ? { main } : {}),
+    ...(haiku ? { haiku } : {}),
+    ...(sonnet ? { sonnet } : {}),
+    ...(opus ? { opus } : {}),
+  }
+}
+
 function applyToolSearchEnv(
   env: Record<string, unknown>,
   apiFormat: ApiFormat,
@@ -935,6 +1003,17 @@ function applyToolSearchEnv(
   delete env.ENABLE_TOOL_SEARCH
   if (apiFormat === 'anthropic') {
     env.ENABLE_TOOL_SEARCH = toolSearchEnabled ? 'true' : 'false'
+  }
+}
+
+function applyDisableExperimentalBetasEnv(
+  env: Record<string, unknown>,
+  disableExperimentalBetas: boolean,
+): void {
+  if (disableExperimentalBetas) {
+    env[DISABLE_EXPERIMENTAL_BETAS_ENV_KEY] = '1'
+  } else {
+    delete env[DISABLE_EXPERIMENTAL_BETAS_ENV_KEY]
   }
 }
 
@@ -957,6 +1036,24 @@ function updateSettingsJsonToolSearch(
   }
 }
 
+function updateSettingsJsonDisableExperimentalBetas(
+  raw: string,
+  disableExperimentalBetas: boolean,
+): string {
+  try {
+    const parsed = JSON.parse(raw || '{}') as { env?: Record<string, unknown> }
+    const existingEnv = parsed.env && typeof parsed.env === 'object' && !Array.isArray(parsed.env)
+      ? parsed.env
+      : {}
+    const env = { ...existingEnv }
+    applyDisableExperimentalBetasEnv(env, disableExperimentalBetas)
+    parsed.env = env
+    return JSON.stringify(parsed, null, 2)
+  } catch {
+    return raw
+  }
+}
+
 function readToolSearchEnabledFromEnv(env: Record<string, unknown>): boolean {
   const value = env.ENABLE_TOOL_SEARCH
   if (typeof value === 'boolean') return value
@@ -969,6 +1066,18 @@ function readToolSearchEnabledFromEnv(env: Record<string, unknown>): boolean {
     }
   }
   return true
+}
+
+function readDisableExperimentalBetasFromEnv(env: Record<string, unknown>): boolean {
+  const value = env[DISABLE_EXPERIMENTAL_BETAS_ENV_KEY]
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'number') return value !== 0
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase()
+    if (['0', 'false', 'off', 'no'].includes(normalized)) return false
+    if (['1', 'true', 'on', 'yes'].includes(normalized)) return true
+  }
+  return false
 }
 
 function updateSettingsJsonAutoCompactWindow(raw: string, value: string): string {
@@ -1046,6 +1155,7 @@ function updateSettingsJsonProviderConnection(
   baseUrl: string,
   proxyBaseUrl: string,
   toolSearchEnabled = true,
+  disableExperimentalBetas = false,
 ): string {
   try {
     const parsed = JSON.parse(raw || '{}') as { env?: Record<string, unknown> }
@@ -1056,6 +1166,7 @@ function updateSettingsJsonProviderConnection(
     delete env.ANTHROPIC_API_KEY
     delete env.ANTHROPIC_AUTH_TOKEN
     applyToolSearchEnv(env, apiFormat, toolSearchEnabled)
+    applyDisableExperimentalBetasEnv(env, disableExperimentalBetas)
     env.ANTHROPIC_BASE_URL = apiFormat !== 'anthropic' ? proxyBaseUrl : baseUrl
     Object.assign(env, buildSettingsJsonAuthEnv(apiFormat, authStrategy, apiKey, preset))
     parsed.env = env
@@ -1096,21 +1207,18 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
   const fetchSettings = useSettingsStore((s) => s.fetchAll)
   const t = useTranslation()
 
-  const availablePresets = presets.filter((p) => p.id !== 'official')
+  const fallbackPreset = buildFallbackPreset(provider)
+  const loadedPresets = presets.filter((p) => p.id !== 'official')
+  const availablePresets = loadedPresets.length > 0 ? loadedPresets : [fallbackPreset]
   const regularPresets = availablePresets.filter((p) => !p.featured)
   const featuredPresets = availablePresets.filter((p) => p.featured)
   const presetDefaultEnvKeys = useMemo(
     () => presets.flatMap((preset) => Object.keys(preset.defaultEnv ?? {})),
     [presets],
   )
-  const fallbackPreset = provider
-    ? buildFallbackPreset(provider)
-    : requirePreset(availablePresets[availablePresets.length - 1])
-  const initialPreset = requirePreset(
-    provider
-      ? availablePresets.find((p) => p.id === provider.presetId) ?? fallbackPreset
-      : availablePresets[0] ?? fallbackPreset,
-  )
+  const initialPreset = provider
+    ? availablePresets.find((p) => p.id === provider.presetId) ?? fallbackPreset
+    : availablePresets[0] ?? fallbackPreset
   const initialModels = stripModel1mMarkers(provider?.models ?? initialPreset.defaultModels)
   const initialModel1mSupport = getInitialModel1mSupport(
     provider?.models ?? initialPreset.defaultModels,
@@ -1138,6 +1246,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
       : getPresetAutoCompactWindow(initialPreset),
   )
   const [toolSearchEnabled, setToolSearchEnabled] = useState(provider?.toolSearchEnabled ?? true)
+  const [disableExperimentalBetas, setDisableExperimentalBetas] = useState(provider?.disableExperimentalBetas ?? false)
   const [showContextSettings, setShowContextSettings] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [testResult, setTestResult] = useState<ProviderTestResult | null>(null)
@@ -1178,6 +1287,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
           ANTHROPIC_DEFAULT_OPUS_MODEL: runtimeModels.opus,
         }
         applyToolSearchEnv(mergedEnv, apiFormat, toolSearchEnabled)
+        applyDisableExperimentalBetasEnv(mergedEnv, disableExperimentalBetas)
         const merged = {
           ...settings,
           skipWebFetchPreflight: settings.skipWebFetchPreflight ?? true,
@@ -1208,6 +1318,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
     setModelContextInputs(nextModelContextInputs)
     setAutoCompactWindow(getPresetAutoCompactWindow(preset))
     setToolSearchEnabled(true)
+    setDisableExperimentalBetas(false)
     setShowContextSettings(false)
     setTestResult(null)
   }
@@ -1297,24 +1408,28 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
   }
   const handleBaseUrlChange = (value: string) => {
     setBaseUrl(value)
-    setSettingsJson((current) => updateSettingsJsonProviderConnection(current, apiFormat, authStrategy, apiKey, selectedPreset, value, providerProxyBaseUrl, toolSearchEnabled))
+    setSettingsJson((current) => updateSettingsJsonProviderConnection(current, apiFormat, authStrategy, apiKey, selectedPreset, value, providerProxyBaseUrl, toolSearchEnabled, disableExperimentalBetas))
   }
   const handleApiKeyChange = (value: string) => {
     setApiKey(value)
-    setSettingsJson((current) => updateSettingsJsonProviderConnection(current, apiFormat, authStrategy, value, selectedPreset, baseUrl, providerProxyBaseUrl, toolSearchEnabled))
+    setSettingsJson((current) => updateSettingsJsonProviderConnection(current, apiFormat, authStrategy, value, selectedPreset, baseUrl, providerProxyBaseUrl, toolSearchEnabled, disableExperimentalBetas))
   }
   const handleApiFormatChange = (value: ApiFormat) => {
     setApiFormat(value)
-    setSettingsJson((current) => updateSettingsJsonProviderConnection(current, value, authStrategy, apiKey, selectedPreset, baseUrl, providerProxyBaseUrl, toolSearchEnabled))
+    setSettingsJson((current) => updateSettingsJsonProviderConnection(current, value, authStrategy, apiKey, selectedPreset, baseUrl, providerProxyBaseUrl, toolSearchEnabled, disableExperimentalBetas))
   }
   const handleAuthStrategyChange = (value: ProviderAuthStrategy) => {
     setAuthStrategy(value)
-    setSettingsJson((current) => updateSettingsJsonProviderConnection(current, apiFormat, value, apiKey, selectedPreset, baseUrl, providerProxyBaseUrl, toolSearchEnabled))
+    setSettingsJson((current) => updateSettingsJsonProviderConnection(current, apiFormat, value, apiKey, selectedPreset, baseUrl, providerProxyBaseUrl, toolSearchEnabled, disableExperimentalBetas))
   }
   const handleToolSearchToggle = (enabled: boolean) => {
     if (toolSearchUnsupported) return
     setToolSearchEnabled(enabled)
     setSettingsJson((current) => updateSettingsJsonToolSearch(current, apiFormat, enabled))
+  }
+  const handleDisableExperimentalBetasToggle = (disabled: boolean) => {
+    setDisableExperimentalBetas(disabled)
+    setSettingsJson((current) => updateSettingsJsonDisableExperimentalBetas(current, disabled))
   }
   const handleModelChange = (slot: ModelSlot, value: string) => {
     const hasMarker = hasModel1mMarker(value)
@@ -1372,7 +1487,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
   )
 
   const handleSubmit = async () => {
-    if (!canSubmit) return
+    if (!canSubmit || isSubmitting) return
     const normalizedModels = normalizeModelMapping(models)
     const parsedAutoCompactWindow = parseAutoCompactWindowInput(autoCompactWindow)
     const parsedModelContextWindows = buildModelContextWindows(models, modelContextInputs)
@@ -1406,6 +1521,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
           ...(parsedAutoCompactWindow !== undefined && { autoCompactWindow: parsedAutoCompactWindow }),
           ...(Object.keys(parsedModelContextWindows).length > 0 && { modelContextWindows: parsedModelContextWindows }),
           toolSearchEnabled,
+          ...(disableExperimentalBetas && { disableExperimentalBetas }),
           notes: notes.trim() || undefined,
         })
       } else if (provider) {
@@ -1421,6 +1537,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
             ? parsedModelContextWindows
             : null,
           toolSearchEnabled,
+          disableExperimentalBetas,
           notes: notes.trim() || undefined,
         }
         if (apiKey.trim()) input.apiKey = apiKey.trim()
@@ -1433,6 +1550,11 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
     } finally {
       setIsSubmitting(false)
     }
+  }
+
+  const handleClose = () => {
+    if (isSubmitting) return
+    onClose()
   }
 
   const handleTest = async () => {
@@ -1469,13 +1591,13 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
   return (
     <Modal
       open={open}
-      onClose={onClose}
+      onClose={handleClose}
       title={mode === 'create' ? t('settings.providers.addTitle') : t('settings.providers.editTitle')}
       width={720}
       footer={
         <>
-          <Button variant="secondary" onClick={onClose}>{t('common.cancel')}</Button>
-          <Button onClick={handleSubmit} disabled={!canSubmit} loading={isSubmitting}>
+          <Button variant="secondary" onClick={handleClose} disabled={isSubmitting}>{t('common.cancel')}</Button>
+          <Button onClick={handleSubmit} disabled={!canSubmit || isSubmitting} loading={isSubmitting}>
             {mode === 'create' ? t('common.add') : t('common.save')}
           </Button>
         </>
@@ -1586,6 +1708,25 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
           </div>
         </label>
 
+        <label className="relative flex cursor-pointer items-start gap-3 rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-3 py-3 transition-colors hover:border-[var(--color-border-focus)] hover:bg-[var(--color-surface-hover)]">
+          <input
+            type="checkbox"
+            aria-label={t('settings.providers.disableExperimentalBetas')}
+            checked={disableExperimentalBetas}
+            onChange={(e) => handleDisableExperimentalBetasToggle(e.target.checked)}
+            className={SETTINGS_CHECKBOX_INPUT_CLASS}
+          />
+          <SettingsCheckboxMark checked={disableExperimentalBetas} />
+          <div className="min-w-0">
+            <div className="text-sm font-medium text-[var(--color-text-primary)]">
+              {t('settings.providers.disableExperimentalBetas')}
+            </div>
+            <div className="mt-1 text-xs leading-5 text-[var(--color-text-tertiary)]">
+              {t('settings.providers.disableExperimentalBetasDesc')}
+            </div>
+          </div>
+        </label>
+
         <div className="flex flex-col gap-1">
           <label htmlFor="provider-api-key" className="text-sm font-medium text-[var(--color-text-primary)]">
             {t('settings.providers.apiKey')}
@@ -1663,7 +1804,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
                     required={slot === 'main'}
                     value={models[slot]}
                     onChange={(e) => handleModelChange(slot, e.target.value)}
-                    placeholder={slot === 'main' ? 'Model ID' : t('settings.providers.sameAsMain')}
+                    placeholder={slot === 'main' ? t('settings.providers.modelIdPlaceholder') : t('settings.providers.sameAsMain')}
                   />
                   <label className="mt-1 inline-flex h-6 w-fit cursor-pointer items-center gap-1.5 rounded-[var(--radius-sm)] px-1 text-xs text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)]">
                     <input
@@ -1671,7 +1812,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
                       checked={model1mSupport[slot]}
                       onChange={(e) => handleModel1mSupportChange(slot, e.target.checked)}
                       aria-label={`1M support: ${slot}`}
-                      className="h-3.5 w-3.5 rounded border-[var(--color-border)] text-[var(--color-brand)] focus:ring-[var(--color-brand)]"
+                      className="h-3.5 w-3.5 rounded border-[var(--color-border)] text-[var(--color-brand)] accent-[var(--color-brand)] focus:ring-[var(--color-brand)]"
                     />
                     <span>{t('settings.providers.model1mSupportShort')}</span>
                   </label>
@@ -1831,6 +1972,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
                     setAuthStrategy(nextAuthStrategy)
                   }
                   setToolSearchEnabled(readToolSearchEnabledFromEnv(env))
+                  setDisableExperimentalBetas(readDisableExperimentalBetasFromEnv(env))
                   if (env[AUTO_COMPACT_WINDOW_ENV_KEY] !== undefined) {
                     setAutoCompactWindow(String(env[AUTO_COMPACT_WINDOW_ENV_KEY]))
                   } else {
@@ -1848,11 +1990,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
                       parsedContextWindows = {}
                     }
                   }
-                  const newModels: Partial<ModelMapping> = {}
-                  if (env.ANTHROPIC_MODEL) newModels.main = env.ANTHROPIC_MODEL
-                  if (env.ANTHROPIC_DEFAULT_HAIKU_MODEL) newModels.haiku = env.ANTHROPIC_DEFAULT_HAIKU_MODEL
-                  if (env.ANTHROPIC_DEFAULT_SONNET_MODEL) newModels.sonnet = env.ANTHROPIC_DEFAULT_SONNET_MODEL
-                  if (env.ANTHROPIC_DEFAULT_OPUS_MODEL) newModels.opus = env.ANTHROPIC_DEFAULT_OPUS_MODEL
+                  const newModels = readModelMappingFromSettingsEnv(env)
                   if (Object.keys(newModels).length > 0) {
                     setModels((prev) => {
                       const mergedModels = { ...prev, ...newModels }
@@ -1910,6 +2048,8 @@ export function GeneralSettings() {
   const {
     thinkingEnabled,
     setThinkingEnabled,
+    permissionMode,
+    setPermissionMode,
     autoDreamEnabled,
     setAutoDreamEnabled,
     locale,
@@ -2017,8 +2157,8 @@ export function GeneralSettings() {
   }, [fetchAppMode])
 
   useEffect(() => {
-    setPortableDirDraft(appMode.portableDir ?? appMode.defaultPortableDir ?? '')
-  }, [appMode.defaultPortableDir, appMode.portableDir])
+    setPortableDirDraft(appMode.portableDir ?? '')
+  }, [appMode.portableDir])
 
   const LANGUAGES: Array<{ value: Locale; label: string }> = [
     { value: 'en', label: 'English' },
@@ -2057,11 +2197,17 @@ export function GeneralSettings() {
     RESPONSE_LANGUAGES.find(({ value }) => value === responseLanguage)?.label ?? RESPONSE_LANGUAGES[0]!.label
   const outputStyleItems = outputStyles.map((style) => ({
     value: style.value,
-    label: style.label,
-    description: `${style.description} · ${getOutputStyleSourceLabel(style.source, t)}`,
+    label: getOutputStyleLabel(style, t),
+    description: `${getOutputStyleDescription(style, t)} · ${getOutputStyleSourceLabel(style.source, t)}`,
   }))
   const selectedOutputStyle =
     outputStyles.find((style) => style.value === outputStyle) ?? outputStyles[0]
+  const selectedOutputStyleLabel = selectedOutputStyle
+    ? getOutputStyleLabel(selectedOutputStyle, t)
+    : outputStyle
+  const selectedOutputStyleDescription = selectedOutputStyle
+    ? getOutputStyleDescription(selectedOutputStyle, t)
+    : ''
   const outputStyleScopeLabel = outputStyleScope === 'localSettings'
     ? t('settings.general.outputStyleScopeLocal')
     : t('settings.general.outputStyleScopeUser')
@@ -2084,6 +2230,11 @@ export function GeneralSettings() {
   ]
 
   const NETWORK_PROXY_MODES: Array<{ value: NetworkProxyMode; label: string; description: string }> = [
+    {
+      value: 'direct',
+      label: t('settings.general.networkProxyModeDirect'),
+      description: t('settings.general.networkProxyModeDirectDescription'),
+    },
     {
       value: 'system',
       label: t('settings.general.networkProxyModeSystem'),
@@ -2235,7 +2386,7 @@ export function GeneralSettings() {
         aiRequestTimeoutMs: parsedNetworkTimeoutSeconds * 1000,
         proxy: {
           mode: networkDraft.proxy.mode,
-          url: networkProxyUrl,
+          url: networkDraft.proxy.mode === 'manual' ? networkProxyUrl : '',
         },
       })
       addToast({
@@ -2475,7 +2626,7 @@ export function GeneralSettings() {
             onClick={() => setLocale(value)}
             className={`flex-1 py-2 text-xs font-semibold rounded-lg border transition-all ${
               locale === value
-                ? 'bg-[var(--color-brand)] text-white border-[var(--color-brand)]'
+                ? 'bg-[var(--color-brand)] text-[var(--color-on-primary)] border-[var(--color-brand)]'
                 : 'border-[var(--color-border)] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)]'
             }`}
           >
@@ -2529,11 +2680,11 @@ export function GeneralSettings() {
                 <span className="block truncate font-medium">
                   {outputStylesLoading
                     ? t('settings.general.outputStyleLoading')
-                    : selectedOutputStyle?.label ?? outputStyle}
+                    : selectedOutputStyleLabel}
                 </span>
-                {selectedOutputStyle?.description && (
+                {selectedOutputStyleDescription && (
                   <span className="mt-0.5 block truncate text-xs text-[var(--color-text-tertiary)]">
-                    {selectedOutputStyle.description}
+                    {selectedOutputStyleDescription}
                   </span>
                 )}
               </span>
@@ -2560,6 +2711,29 @@ export function GeneralSettings() {
             {outputStyleError}
           </p>
         )}
+      </div>
+
+      <div className="mt-8">
+        <h2 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">{t('settings.general.defaultPermissionTitle')}</h2>
+        <p className="text-sm text-[var(--color-text-tertiary)] mb-3">{t('settings.general.defaultPermissionDescription')}</p>
+        <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="min-w-0">
+              <div className="text-sm font-medium text-[var(--color-text-primary)]">
+                {t('settings.general.defaultPermissionLabel')}
+              </div>
+              <div className="mt-1 text-xs leading-5 text-[var(--color-text-tertiary)]">
+                {t('settings.general.defaultPermissionHint')}
+              </div>
+            </div>
+            <PermissionModeSelector
+              value={permissionMode}
+              onChange={(mode) => void setPermissionMode(mode)}
+              workDir={t('settings.general.defaultPermissionScope')}
+              menuPlacement="bottom"
+            />
+          </div>
+        </div>
       </div>
 
       <div className="mt-8">
@@ -2896,7 +3070,7 @@ export function GeneralSettings() {
                 onClick={() => setWebSearchDraft({ ...webSearchDraft, mode: value })}
                 className={`h-9 px-2 text-xs font-semibold rounded-lg border transition-all truncate ${
                   (webSearchDraft.mode ?? 'auto') === value
-                    ? 'bg-[var(--color-brand)] text-white border-[var(--color-brand)]'
+                    ? 'bg-[var(--color-brand)] text-[var(--color-on-primary)] border-[var(--color-brand)]'
                     : 'border-[var(--color-border)] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)]'
                 }`}
                 title={label}
@@ -3049,17 +3223,7 @@ export function GeneralSettings() {
                   </Button>
                 </div>
 
-                <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
-                  <button
-                    type="button"
-                    className="text-xs font-medium text-[var(--color-brand)] hover:underline"
-                    onClick={() => {
-                      setPortableDirDraft(appMode.defaultPortableDir ?? '')
-                      setModeError(null)
-                    }}
-                  >
-                    {t('settings.general.storageUseDefaultPortableDir')}
-                  </button>
+                <div className="mt-3 flex justify-end">
                   <Button
                     type="button"
                     size="sm"
@@ -3151,6 +3315,40 @@ export function GeneralSettings() {
       />
     </div>
   )
+}
+
+function getBuiltInOutputStyleTranslationKeys(style: {
+  value: string
+  source: OutputStyleSource
+}) {
+  if (style.source !== 'built-in') return null
+  return BUILT_IN_OUTPUT_STYLE_TRANSLATION_KEYS[
+    style.value as keyof typeof BUILT_IN_OUTPUT_STYLE_TRANSLATION_KEYS
+  ] ?? null
+}
+
+function getOutputStyleLabel(
+  style: {
+    value: string
+    label: string
+    source: OutputStyleSource
+  },
+  t: (key: TranslationKey) => string,
+) {
+  const keys = getBuiltInOutputStyleTranslationKeys(style)
+  return keys ? t(keys.label) : style.label
+}
+
+function getOutputStyleDescription(
+  style: {
+    value: string
+    description: string
+    source: OutputStyleSource
+  },
+  t: (key: TranslationKey) => string,
+) {
+  const keys = getBuiltInOutputStyleTranslationKeys(style)
+  return keys ? t(keys.description) : style.description
 }
 
 function getOutputStyleSourceLabel(
@@ -3642,7 +3840,7 @@ function SettingsCheckboxMark({ checked, disabled = false }: { checked: boolean;
       aria-hidden="true"
       className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition-all peer-focus-visible:ring-2 peer-focus-visible:ring-[var(--color-brand)]/40 ${
         checked
-          ? 'border-[var(--color-brand)] bg-[var(--color-brand)] text-white shadow-[var(--shadow-button-primary)]'
+          ? 'border-[var(--color-brand)] bg-[var(--color-brand)] text-[var(--color-on-primary)] shadow-[var(--shadow-button-primary)]'
           : 'border-[var(--color-border-focus)] bg-[var(--color-surface)] text-transparent'
       } ${disabled ? 'opacity-50' : ''}`}
     >
@@ -3653,490 +3851,6 @@ function SettingsCheckboxMark({ checked, disabled = false }: { checked: boolean;
   )
 }
 
-// ─── Agents Settings ──────────────────────────────────────
-
-const AGENT_COLORS: Record<string, string> = {
-  red: '#ef4444',
-  orange: '#f97316',
-  yellow: '#eab308',
-  green: '#22c55e',
-  blue: '#3b82f6',
-  purple: '#a855f7',
-  pink: '#ec4899',
-  cyan: '#06b6d4',
-}
-
-const AGENT_SOURCE_ORDER: AgentSource[] = [
-  'userSettings',
-  'projectSettings',
-  'localSettings',
-  'policySettings',
-  'plugin',
-  'flagSettings',
-  'built-in',
-]
-
-function AgentsSettings() {
-  const {
-    activeAgents,
-    allAgents,
-    isLoading,
-    error,
-    selectedAgent,
-    selectedAgentReturnTab,
-    fetchAgents,
-    selectAgent,
-  } = useAgentStore()
-  const sessions = useSessionStore((s) => s.sessions)
-  const activeSessionId = useSessionStore((s) => s.activeSessionId)
-  const t = useTranslation()
-
-  const activeSession = sessions.find((s) => s.id === activeSessionId)
-  const currentWorkDir = activeSession?.workDir || undefined
-
-  useEffect(() => {
-    void fetchAgents(currentWorkDir)
-  }, [fetchAgents, currentWorkDir])
-
-  const groupedAgents = useMemo(() => {
-    const groups: Partial<Record<AgentSource, AgentDefinition[]>> = {}
-    for (const agent of allAgents) {
-      ;(groups[agent.source] ??= []).push(agent)
-    }
-    return groups
-  }, [allAgents])
-
-  const sourceCount = AGENT_SOURCE_ORDER.filter((source) => (groupedAgents[source] ?? []).length > 0).length
-
-  const handleAgentBack = () => {
-    const returnTab = selectedAgentReturnTab
-    selectAgent(null)
-    if (returnTab === 'plugins') {
-      useUIStore.getState().setPendingSettingsTab('plugins')
-    }
-  }
-
-  if (selectedAgent) {
-    return (
-      <div className="w-full min-w-0">
-        <AgentDetailView agent={selectedAgent} onBack={handleAgentBack} />
-      </div>
-    )
-  }
-
-  return (
-    <div className="w-full min-w-0">
-      {isLoading && allAgents.length === 0 ? (
-        <div className="flex justify-center py-12">
-          <div className="animate-spin w-5 h-5 border-2 border-[var(--color-brand)] border-t-transparent rounded-full" />
-        </div>
-      ) : error ? (
-        <div className="text-center py-12 px-4">
-          <span className="material-symbols-outlined text-[40px] text-[var(--color-error)] mb-3 block">error_outline</span>
-          <p className="text-sm text-[var(--color-error)] mb-2">{error}</p>
-          <button
-            onClick={() => void fetchAgents(currentWorkDir)}
-            className="text-xs text-[var(--color-text-accent)] hover:underline"
-          >
-            {t('common.retry')}
-          </button>
-        </div>
-      ) : allAgents.length === 0 ? (
-        <div className="text-center py-12 px-4 rounded-2xl border border-dashed border-[var(--color-border)] bg-[var(--color-surface-container-low)]">
-          <span className="material-symbols-outlined text-[40px] text-[var(--color-text-tertiary)] mb-3 block">smart_toy</span>
-          <p className="text-sm text-[var(--color-text-secondary)] mb-1">{t('settings.agents.empty')}</p>
-          <p className="text-xs text-[var(--color-text-tertiary)]">{t('settings.agents.emptyHint')}</p>
-        </div>
-      ) : (
-        <div className="flex flex-col gap-6 min-w-0">
-          <section className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface-container-low)] overflow-hidden">
-            <div className="grid gap-4 px-5 py-5 min-w-0 xl:grid-cols-[minmax(0,1.6fr)_minmax(320px,1fr)] xl:items-end">
-              <div className="min-w-0">
-                <div className="text-[11px] font-semibold uppercase tracking-[0.2em] text-[var(--color-text-tertiary)] mb-2">
-                  {t('settings.agents.browserEyebrow')}
-                </div>
-                <div className="flex items-center gap-3 mb-2">
-                  <span className="material-symbols-outlined text-[22px] text-[var(--color-brand)]">
-                    smart_toy
-                  </span>
-                  <h3 className="text-lg font-semibold text-[var(--color-text-primary)]">
-                    {t('settings.agents.browserTitle')}
-                  </h3>
-                </div>
-                <p className="text-sm leading-6 text-[var(--color-text-secondary)] max-w-3xl">
-                  {t('settings.agents.description')}
-                </p>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3 min-w-0 sm:grid-cols-3">
-                <SummaryCard
-                  label={t('settings.agents.summary.totalAgents')}
-                  value={String(allAgents.length)}
-                  icon="smart_toy"
-                />
-                <SummaryCard
-                  label={t('settings.agents.summary.activeAgents')}
-                  value={String(activeAgents.length)}
-                  icon="bolt"
-                />
-                <SummaryCard
-                  label={t('settings.agents.summary.sources')}
-                  value={String(sourceCount)}
-                  icon="layers"
-                  className="col-span-2 sm:col-span-1"
-                />
-              </div>
-            </div>
-          </section>
-
-          <div className={`grid gap-4 ${sourceCount >= 2 ? 'xl:grid-cols-2' : ''}`}>
-            {AGENT_SOURCE_ORDER.map((source) => {
-              const group = groupedAgents[source]
-              if (!group?.length) return null
-
-              const sourceLabel = t(`settings.agents.source.${source}`)
-              return (
-                <section
-                  key={source}
-                  className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)] overflow-hidden min-w-0"
-                >
-                  <div className="flex items-start justify-between gap-3 px-5 py-4 border-b border-[var(--color-border)] bg-[var(--color-surface-container-low)]">
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-2 mb-1 flex-wrap">
-                        <span className={`inline-flex h-7 w-7 items-center justify-center rounded-full ${getAgentSourceAccentClass(source)}`}>
-                          <span className="material-symbols-outlined text-[16px]">
-                            {getAgentSourceIcon(source)}
-                          </span>
-                        </span>
-                        <h4 className="text-sm font-semibold text-[var(--color-text-primary)]">
-                          {sourceLabel}
-                        </h4>
-                        <span className="text-xs text-[var(--color-text-tertiary)]">
-                          {group.length}
-                        </span>
-                      </div>
-                      <p className="text-xs leading-5 text-[var(--color-text-tertiary)]">
-                        {t('settings.agents.groupHint', {
-                          source: sourceLabel,
-                          count: String(group.length),
-                        })}
-                      </p>
-                    </div>
-                  </div>
-
-                  <div className="flex flex-col p-2">
-                    {group.map((agent) => (
-                      <button
-                        key={`${agent.source}-${agent.agentType}`}
-                        onClick={() => selectAgent(agent, 'agents')}
-                        className="group rounded-xl border border-transparent px-3 py-3 text-left transition-all hover:border-[var(--color-border-focus)] hover:bg-[var(--color-surface-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-brand)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--color-surface)]"
-                      >
-                        <div className="flex items-start gap-3">
-                          <span
-                            className="mt-0.5 flex-shrink-0 inline-flex items-center justify-center"
-                            style={{ color: getAgentDotColor(agent.color) }}
-                          >
-                            <span className="material-symbols-outlined text-[18px]">smart_toy</span>
-                          </span>
-                          <div className="flex-1 min-w-0">
-                            <div className="flex items-center gap-2 flex-wrap">
-                              <span className="text-sm font-bold text-[var(--color-text-primary)] break-all">
-                                {agent.agentType}
-                              </span>
-                              {agent.modelDisplay && (
-                                <MetaPill>{agent.modelDisplay}</MetaPill>
-                              )}
-                              <MetaPill>{sourceLabel}</MetaPill>
-                              <MetaPill>
-                                {agent.isActive
-                                  ? t('settings.agents.status.active')
-                                  : t('settings.agents.status.available')}
-                              </MetaPill>
-                              {agent.overriddenBy && (
-                                <MetaPill>
-                                  {t('settings.agents.overriddenBy', {
-                                    source: t(`settings.agents.source.${agent.overriddenBy}`),
-                                  })}
-                                </MetaPill>
-                              )}
-                            </div>
-                            <div className="mt-1 text-xs leading-5 text-[var(--color-text-secondary)] break-words [&_.prose]:text-xs [&_.prose]:leading-5 [&_.prose]:text-[var(--color-text-secondary)]">
-                              <MarkdownRenderer
-                                content={agent.description || t('settings.agents.noDescription')}
-                              />
-                            </div>
-                            <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-[var(--color-text-tertiary)]">
-                              <span>
-                                {agent.tools?.length
-                                  ? t('settings.agents.toolCount', { count: String(agent.tools.length) })
-                                  : t('settings.agents.noTools')}
-                              </span>
-                              {agent.baseDir && (
-                                <span className="break-all">{agent.baseDir}</span>
-                              )}
-                            </div>
-                          </div>
-                          <span className="material-symbols-outlined text-[18px] text-[var(--color-text-tertiary)] opacity-60 transition-transform group-hover:translate-x-0.5 group-hover:opacity-100">
-                            chevron_right
-                          </span>
-                        </div>
-                      </button>
-                    ))}
-                  </div>
-                </section>
-              )
-            })}
-          </div>
-        </div>
-      )}
-    </div>
-  )
-}
-
-function AgentDetailView({ agent, onBack }: { agent: AgentDefinition; onBack: () => void }) {
-  const t = useTranslation()
-  const sourceLabel = t(`settings.agents.source.${agent.source}`)
-
-  return (
-    <div className="flex h-full min-h-0 flex-col gap-4 min-w-0">
-      <div>
-        <button
-          onClick={onBack}
-          className="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-sm text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-brand)]"
-        >
-          <span className="material-symbols-outlined text-[16px]">arrow_back</span>
-          {t('settings.agents.backToList')}
-        </button>
-      </div>
-
-      <section className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface-container-low)] overflow-hidden">
-        <div className="grid gap-4 px-5 py-5 lg:grid-cols-[minmax(0,1.5fr)_minmax(280px,0.9fr)] lg:items-start">
-          <div className="min-w-0">
-            <div className="text-[11px] font-semibold uppercase tracking-[0.2em] text-[var(--color-text-tertiary)] mb-2">
-              {t('settings.agents.entryEyebrow')}
-            </div>
-            <div className="flex flex-wrap items-center gap-2 mb-2">
-              <span
-                className="h-3 w-3 rounded-full flex-shrink-0"
-                style={{ backgroundColor: getAgentDotColor(agent.color) }}
-              />
-              <h3 className="text-[22px] font-semibold leading-tight text-[var(--color-text-primary)] break-all">
-                {agent.agentType}
-              </h3>
-              <MetaPill>{sourceLabel}</MetaPill>
-              {agent.modelDisplay && <MetaPill>{agent.modelDisplay}</MetaPill>}
-              <MetaPill>
-                {agent.isActive
-                  ? t('settings.agents.status.active')
-                  : t('settings.agents.status.available')}
-              </MetaPill>
-              {agent.overriddenBy && (
-                <MetaPill>
-                  {t('settings.agents.overriddenByShort', {
-                    source: t(`settings.agents.source.${agent.overriddenBy}`),
-                  })}
-                </MetaPill>
-              )}
-            </div>
-            <div className="max-w-4xl text-sm leading-6 text-[var(--color-text-secondary)]">
-              <MarkdownRenderer
-                content={agent.description || t('settings.agents.noDescription')}
-              />
-            </div>
-            <div className="mt-3 flex flex-wrap gap-x-4 gap-y-2 text-xs text-[var(--color-text-tertiary)]">
-              <span>
-                {agent.tools?.length
-                  ? t('settings.agents.toolCount', { count: String(agent.tools.length) })
-                  : t('settings.agents.noTools')}
-              </span>
-              {agent.baseDir && <span className="break-all">{agent.baseDir}</span>}
-            </div>
-          </div>
-
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-2">
-            <DetailStat
-              label={t('settings.agents.summary.source')}
-              value={sourceLabel}
-              icon="layers"
-            />
-            <DetailStat
-              label={t('settings.agents.summary.model')}
-              value={agent.modelDisplay || '—'}
-              icon="psychology"
-            />
-            <DetailStat
-              label={t('settings.agents.summary.tools')}
-              value={String(agent.tools?.length ?? 0)}
-              icon="build"
-            />
-            <DetailStat
-              label={t('settings.agents.summary.status')}
-              value={agent.isActive ? t('settings.agents.status.active') : t('settings.agents.status.available')}
-              icon="bolt"
-            />
-          </div>
-        </div>
-      </section>
-
-      {agent.tools && agent.tools.length > 0 && (
-        <section className="rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)] px-5 py-4">
-          <div className="flex items-center gap-2 mb-3">
-            <span className="material-symbols-outlined text-[18px] text-[var(--color-text-tertiary)]">
-              build
-            </span>
-            <h4 className="text-sm font-semibold text-[var(--color-text-primary)]">
-              {t('settings.agents.tools')}
-            </h4>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            {agent.tools.map((tool) => (
-              <MetaPill key={tool}>{tool}</MetaPill>
-            ))}
-          </div>
-        </section>
-      )}
-
-      <section className="flex flex-1 min-h-0 min-w-0 overflow-hidden rounded-2xl border border-[var(--color-border)] bg-[var(--color-surface)]">
-        <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
-          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-3">
-            <div className="min-w-0">
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-xs font-mono text-[var(--color-text-secondary)] break-all">
-                  {agent.baseDir || sourceLabel}
-                </span>
-              </div>
-              <div className="mt-1 text-[11px] text-[var(--color-text-tertiary)]">
-                {t('settings.agents.promptHint')}
-              </div>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="rounded-full bg-[var(--color-surface)] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-[var(--color-text-tertiary)] border border-[var(--color-border)]">
-                {t('settings.agents.systemPrompt')}
-              </span>
-            </div>
-          </div>
-
-          <div className="min-h-0 flex-1 overflow-y-auto bg-[var(--color-surface-container-lowest)]">
-            {agent.systemPrompt ? (
-              <div className="px-6 py-5 lg:px-8">
-                <MarkdownRenderer
-                  content={agent.systemPrompt}
-                  variant="document"
-                  className="mx-auto max-w-[72ch]"
-                />
-              </div>
-            ) : (
-              <div className="px-6 py-10 text-center">
-                <span className="material-symbols-outlined text-[32px] text-[var(--color-text-tertiary)] mb-2 block">
-                  article
-                </span>
-                <p className="text-sm text-[var(--color-text-tertiary)]">
-                  {t('settings.agents.noSystemPrompt')}
-                </p>
-              </div>
-            )}
-          </div>
-        </div>
-      </section>
-    </div>
-  )
-}
-
-function getAgentDotColor(color?: string) {
-  return color && AGENT_COLORS[color] ? AGENT_COLORS[color] : 'var(--color-text-tertiary)'
-}
-
-function getAgentSourceIcon(source: AgentSource) {
-  switch (source) {
-    case 'userSettings':
-      return 'person'
-    case 'projectSettings':
-      return 'folder'
-    case 'localSettings':
-      return 'folder_lock'
-    case 'policySettings':
-      return 'shield'
-    case 'plugin':
-      return 'extension'
-    case 'flagSettings':
-      return 'terminal'
-    case 'built-in':
-      return 'inventory_2'
-  }
-}
-
-function getAgentSourceAccentClass(source: AgentSource) {
-  switch (source) {
-    case 'userSettings':
-      return 'bg-[var(--color-primary-fixed)] text-[var(--color-brand)]'
-    case 'projectSettings':
-      return 'bg-[var(--color-success-container)] text-[var(--color-success)]'
-    case 'localSettings':
-      return 'bg-[var(--color-info-container)] text-[var(--color-info)]'
-    case 'policySettings':
-      return 'bg-[var(--color-warning-container)] text-[var(--color-warning)]'
-    case 'plugin':
-      return 'bg-[var(--color-warning-container)] text-[var(--color-warning)]'
-    case 'flagSettings':
-      return 'bg-[var(--color-error)]/10 text-[var(--color-error)]'
-    case 'built-in':
-      return 'bg-[var(--color-surface-container-high)] text-[var(--color-text-tertiary)]'
-  }
-}
-
-function MetaPill({ children }: { children: ReactNode }) {
-  return (
-    <span className="rounded-full border border-[var(--color-border)] bg-[var(--color-surface)] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-[var(--color-text-tertiary)]">
-      {children}
-    </span>
-  )
-}
-
-function SummaryCard({
-  label,
-  value,
-  icon,
-  className = '',
-}: {
-  label: string
-  value: string
-  icon: string
-  className?: string
-}) {
-  return (
-    <div className={`rounded-xl border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-3 min-w-0 ${className}`}>
-      <div className="flex items-center gap-1.5 text-[11px] uppercase tracking-[0.12em] text-[var(--color-text-tertiary)] min-w-0">
-        <span className="material-symbols-outlined text-[14px] flex-shrink-0">{icon}</span>
-        <span className="truncate">{label}</span>
-      </div>
-      <div className="mt-2 text-lg font-semibold text-[var(--color-text-primary)] truncate">
-        {value}
-      </div>
-    </div>
-  )
-}
-
-function DetailStat({
-  label,
-  value,
-  icon,
-}: {
-  label: string
-  value: string
-  icon: string
-}) {
-  return (
-    <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-3">
-      <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.16em] text-[var(--color-text-tertiary)]">
-        <span className="material-symbols-outlined text-[14px]">{icon}</span>
-        <span>{label}</span>
-      </div>
-      <div className="mt-2 text-base font-semibold text-[var(--color-text-primary)] break-all">
-        {value}
-      </div>
-    </div>
-  )
-}
 // ─── Skill Settings ──────────────────────────────────────
 
 function SkillSettings() {
@@ -4331,7 +4045,7 @@ function AboutSettings() {
   })()
 
   return (
-    <div className="w-full min-w-0 max-w-lg mx-auto flex flex-col items-center py-6">
+    <div className="w-full min-w-0 max-w-2xl mx-auto flex flex-col items-center py-6">
       {/* Logo + App Name + Version */}
       <img src={publicAssetPath('app-icon.png')} alt="Claude Code Haha" className="w-20 h-20 mb-4" />
       <h1 className="text-xl font-bold text-[var(--color-text-primary)]">Claude Code Haha</h1>

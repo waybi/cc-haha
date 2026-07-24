@@ -39,6 +39,36 @@ type CLITaskStore = {
   toggleExpanded: () => void
 }
 
+let taskRequestSequence = 0
+let taskRequestGeneration = 0
+const latestAppliedTaskRequestBySession = new Map<string, number>()
+
+type TaskRequest = {
+  requestId: number
+  generation: number
+}
+
+function beginTaskRequest(): TaskRequest {
+  return {
+    requestId: ++taskRequestSequence,
+    generation: taskRequestGeneration,
+  }
+}
+
+function canApplyTaskResponse(sessionId: string, request: TaskRequest): boolean {
+  return request.generation === taskRequestGeneration
+    && request.requestId > (latestAppliedTaskRequestBySession.get(sessionId) ?? 0)
+}
+
+function markTaskResponseApplied(sessionId: string, request: TaskRequest): void {
+  latestAppliedTaskRequestBySession.set(sessionId, request.requestId)
+}
+
+function invalidateTaskRequests(): void {
+  taskRequestGeneration += 1
+  latestAppliedTaskRequestBySession.clear()
+}
+
 function buildCompletedTaskKey(tasks: CLITask[]): string | null {
   if (tasks.length === 0 || tasks.some((task) => task.status !== 'completed')) return null
 
@@ -89,6 +119,7 @@ export const useCLITaskStore = create<CLITaskStore>((set, get) => ({
 
   fetchSessionTasks: async (sessionId) => {
     if (get().sessionId !== sessionId) {
+      invalidateTaskRequests()
       set({
         sessionId,
         tasks: [],
@@ -99,29 +130,37 @@ export const useCLITaskStore = create<CLITaskStore>((set, get) => ({
       })
     }
 
+    const request = beginTaskRequest()
     try {
       const { tasks } = await cliTasksApi.getTasksForList(sessionId)
-      // Only update if still tracking the same session
-      if (get().sessionId === sessionId && !get().resetting) {
+      if (
+        canApplyTaskResponse(sessionId, request)
+        && get().sessionId === sessionId
+        && !get().resetting
+      ) {
+        markTaskResponseApplied(sessionId, request)
         set((state) => ({
           tasks,
           ...resolveDismissState(tasks, state.dismissedCompletionKey),
         }))
       }
     } catch {
-      // No tasks for this session — that's fine
-      if (get().sessionId === sessionId && !get().resetting) {
-        set({ tasks: [], completedAndDismissed: false, dismissedCompletionKey: null, expanded: false })
-      }
+      // Preserve the last known task state across transient polling failures.
     }
   },
 
   refreshTasks: async (targetSessionId) => {
     const sessionId = targetSessionId ?? get().sessionId
     if (!sessionId) return
+    const request = beginTaskRequest()
     try {
       const { tasks } = await cliTasksApi.getTasksForList(sessionId)
-      if (get().sessionId === sessionId && !get().resetting) {
+      if (
+        canApplyTaskResponse(sessionId, request)
+        && get().sessionId === sessionId
+        && !get().resetting
+      ) {
+        markTaskResponseApplied(sessionId, request)
         set((state) => ({
           tasks,
           ...resolveDismissState(tasks, state.dismissedCompletionKey),
@@ -135,6 +174,7 @@ export const useCLITaskStore = create<CLITaskStore>((set, get) => ({
   setTasksFromTodos: (todos, targetSessionId) => {
     const sessionId = targetSessionId ?? get().sessionId
     if (!sessionId || get().sessionId !== sessionId) return
+    invalidateTaskRequests()
     const tasks = mapTodosToTasks(todos, sessionId)
     set((state) => ({
       tasks,
@@ -162,6 +202,7 @@ export const useCLITaskStore = create<CLITaskStore>((set, get) => ({
     const completionKey = buildCompletedTaskKey(tasks)
     if (!completionKey) return
 
+    invalidateTaskRequests()
     set({
       tasks: [],
       resetting: true,
@@ -181,6 +222,7 @@ export const useCLITaskStore = create<CLITaskStore>((set, get) => ({
 
   clearTasks: (targetSessionId) => {
     if (targetSessionId && get().sessionId !== targetSessionId) return
+    invalidateTaskRequests()
     set({
       sessionId: null,
       tasks: [],

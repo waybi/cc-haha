@@ -1,11 +1,73 @@
 // @vitest-environment jsdom
 
 import '@testing-library/jest-dom'
-import { fireEvent, render } from '@testing-library/react'
-import { describe, expect, it, vi } from 'vitest'
+import { fireEvent, render, waitFor } from '@testing-library/react'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { browserHost } from '../../lib/desktopHost/browserHost'
+import { useOpenTargetStore } from '../../stores/openTargetStore'
+import { useSettingsStore } from '../../stores/settingsStore'
+import { useUIStore } from '../../stores/uiStore'
 import { AttachmentGallery } from './AttachmentGallery'
 
 describe('AttachmentGallery', () => {
+  const openPath = vi.fn().mockResolvedValue(undefined)
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    useSettingsStore.setState({ locale: 'en' })
+    useUIStore.setState({ toasts: [] })
+    useOpenTargetStore.setState({
+      targets: [
+        { id: 'code', kind: 'ide', label: 'VS Code', icon: 'vscode', platform: 'darwin' },
+        { id: 'finder', kind: 'file_manager', label: 'Finder', icon: 'finder', platform: 'darwin' },
+      ],
+      fetchedAt: Date.now(),
+      loading: false,
+      error: null,
+    })
+    window.desktopHost = {
+      ...browserHost,
+      kind: 'electron',
+      isDesktop: true,
+      capabilities: {
+        ...browserHost.capabilities,
+        shell: true,
+      },
+      shell: {
+        ...browserHost.shell,
+        openPath,
+      },
+    }
+  })
+
+  it('renders diff comments as note-first composer cards with side-aware locations', () => {
+    const view = render(
+      <AttachmentGallery
+        variant="composer"
+        attachments={[{
+          id: 'diff-comment-1',
+          type: 'file',
+          name: 'a.ts',
+          path: 'src/a.ts',
+          lineStart: 11,
+          lineEnd: 12,
+          diffSide: 'new',
+          hunkId: 'hunk-1',
+          note: 'Use a shared helper',
+          quote: 'const result = buildResult()\nreturn result',
+        }]}
+      />,
+    )
+
+    const card = view.getByTestId('diff-comment-card')
+    expect(card.textContent).toContain('src/a.ts · new L11-L12')
+    expect(card.textContent).toContain('Use a shared helper')
+    expect(card.textContent).toContain('const result = buildResult() return result')
+    expect(card.textContent?.indexOf('Use a shared helper')).toBeLessThan(
+      card.textContent?.indexOf('const result = buildResult()') ?? -1,
+    )
+  })
+
   it('renders a compact quote preview for selected workspace text', () => {
     render(
       <AttachmentGallery
@@ -41,6 +103,114 @@ describe('AttachmentGallery', () => {
 
     expect(document.body.textContent).toContain('README.md')
     expect(document.body.textContent).not.toContain(':L')
+  })
+
+  it.each([
+    ['report.pdf', 'PDF', 'picture_as_pdf'],
+    ['brief.docx', 'DOCX', 'docs'],
+    ['budget.xlsx', 'XLSX', 'table_chart'],
+    ['launch.pptx', 'PPTX', 'slideshow'],
+    ['sources.zip', 'ZIP', 'folder_zip'],
+    ['notes.md', 'MD', 'markdown'],
+  ])('renders a type-specific visual for %s', (name, extension, icon) => {
+    const view = render(
+      <AttachmentGallery
+        attachments={[{
+          type: 'file',
+          name,
+        }]}
+      />,
+    )
+
+    expect(view.container.querySelector(`[data-file-extension="${extension}"]`)).toBeInTheDocument()
+    expect(view.getByText(icon)).toBeInTheDocument()
+  })
+
+  it('opens an absolute desktop attachment with the system default app', async () => {
+    const path = '/Users/example/Desktop/report.pdf'
+    const view = render(
+      <AttachmentGallery
+        attachments={[{
+          type: 'file',
+          name: 'report.pdf',
+          path,
+        }]}
+      />,
+    )
+
+    fireEvent.click(view.getByRole('button', { name: 'Open report.pdf' }))
+
+    await waitFor(() => expect(openPath).toHaveBeenCalledWith(path))
+  })
+
+  it('keeps relative and pathless attachments non-interactive', () => {
+    const view = render(
+      <AttachmentGallery
+        attachments={[
+          { type: 'file', name: 'relative.md', path: 'docs/relative.md' },
+          { type: 'file', name: 'detached.pdf' },
+        ]}
+      />,
+    )
+
+    expect(view.queryByRole('button', { name: 'Open relative.md' })).not.toBeInTheDocument()
+    expect(view.queryByRole('button', { name: 'Open detached.pdf' })).not.toBeInTheDocument()
+    expect(openPath).not.toHaveBeenCalled()
+  })
+
+  it('keeps absolute attachments non-interactive outside the desktop runtime', () => {
+    window.desktopHost = browserHost
+    const view = render(
+      <AttachmentGallery
+        attachments={[{
+          type: 'file',
+          name: 'report.pdf',
+          path: '/Users/example/Desktop/report.pdf',
+        }]}
+      />,
+    )
+
+    expect(view.queryByRole('button', { name: 'Open report.pdf' })).not.toBeInTheDocument()
+    expect(view.queryByRole('button', { name: 'Open with' })).not.toBeInTheDocument()
+  })
+
+  it('shows a localized toast when the local file cannot be opened', async () => {
+    openPath.mockRejectedValueOnce(new Error('missing'))
+    const view = render(
+      <AttachmentGallery
+        attachments={[{
+          type: 'file',
+          name: 'missing.pdf',
+          path: '/Users/example/Desktop/missing.pdf',
+        }]}
+      />,
+    )
+
+    fireEvent.click(view.getByRole('button', { name: 'Open missing.pdf' }))
+
+    await waitFor(() => {
+      expect(useUIStore.getState().toasts.at(-1)?.message).toBe(
+        'Could not open missing.pdf. The file may have been moved or deleted.',
+      )
+    })
+  })
+
+  it('reuses the Open With menu for IDE and file-manager destinations', async () => {
+    const view = render(
+      <AttachmentGallery
+        attachments={[{
+          type: 'file',
+          name: 'report.pdf',
+          path: '/Users/example/Desktop/report.pdf',
+        }]}
+      />,
+    )
+
+    fireEvent.click(view.getByRole('button', { name: 'Open with' }))
+
+    expect(await view.findByText('Open in VS Code')).toBeInTheDocument()
+    expect(view.getByText('Reveal in Finder')).toBeInTheDocument()
+    expect(openPath).not.toHaveBeenCalled()
   })
 
   it('removes a quoted workspace attachment by id', () => {
@@ -89,5 +259,27 @@ describe('AttachmentGallery', () => {
     expect(tooltip).toHaveTextContent('修改内容')
     expect(tooltip).toHaveTextContent('这个标题更轻一点')
     expect(tooltip.className).toContain('group-hover/selection:visible')
+  })
+
+  it('localizes diff sides and remove actions in Chinese', () => {
+    useSettingsStore.setState({ locale: 'zh' })
+    const view = render(
+      <AttachmentGallery
+        variant="composer"
+        onRemove={vi.fn()}
+        attachments={[{
+          id: 'diff-comment-zh',
+          type: 'file',
+          name: 'a.ts',
+          path: 'src/a.ts',
+          lineStart: 11,
+          diffSide: 'new',
+          note: '使用共享辅助函数',
+        }]}
+      />,
+    )
+
+    expect(view.getByTestId('diff-comment-card')).toHaveTextContent('src/a.ts · 新 L11')
+    expect(view.getByRole('button', { name: '移除 a.ts' })).toBeInTheDocument()
   })
 })

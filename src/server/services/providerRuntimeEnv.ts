@@ -22,12 +22,19 @@ import {
   buildOpenAIOfficialRuntimeEnv,
   isOpenAIOfficialProviderId,
 } from './openaiOfficialProvider.js'
+import {
+  GROK_OAUTH_FILE_ENV_KEY,
+  GROK_OAUTH_PROVIDER_ENV_KEY,
+  buildGrokOfficialRuntimeEnv,
+  isGrokOfficialProviderId,
+} from './grokOfficialProvider.js'
 
 export const MANAGED_PROVIDER_ENV_KEYS = [
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_AUTH_TOKEN',
   'ENABLE_TOOL_SEARCH',
+  'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS',
   'ANTHROPIC_MODEL',
   'ANTHROPIC_DEFAULT_HAIKU_MODEL',
   'ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES',
@@ -40,10 +47,15 @@ export const MANAGED_PROVIDER_ENV_KEYS = [
   MODEL_CONTEXT_WINDOWS_ENV_KEY,
   OPENAI_OAUTH_PROVIDER_ENV_KEY,
   OPENAI_CODEX_OAUTH_FILE_ENV_KEY,
+  GROK_OAUTH_PROVIDER_ENV_KEY,
+  GROK_OAUTH_FILE_ENV_KEY,
 ] as const
 
-const CUSTOM_PROVIDER_MODEL_CAPABILITIES = 'thinking,effort,adaptive_thinking,max_effort'
+const CUSTOM_PROVIDER_MODEL_CAPABILITIES =
+  'thinking,effort,adaptive_thinking,xhigh_effort,max_effort'
 const XIAOMI_MIMO_MODEL_CAPABILITIES = 'thinking'
+const KIMI_K3_MODEL_CAPABILITIES = 'thinking,required_thinking,effort,max_effort'
+const KIMI_CODING_FALLBACK_MODEL_CAPABILITIES = 'thinking,required_thinking'
 const AUTH_ENV_KEYS = new Set(['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN'])
 const MODEL_SLOTS = ['main', 'haiku', 'sonnet', 'opus'] as const
 
@@ -80,7 +92,8 @@ function isSavedProvider(value: unknown): value is SavedProvider {
     (
       runtimeKind === undefined ||
       runtimeKind === 'anthropic_compatible' ||
-      runtimeKind === 'openai_oauth'
+      runtimeKind === 'openai_oauth' ||
+      runtimeKind === 'grok_oauth'
     ) &&
     isProviderModels(value.models) &&
     (value.model1mSupport === undefined || isProviderModel1mSupport(value.model1mSupport))
@@ -98,6 +111,17 @@ function normalizeToolSearchEnabled(value: unknown): boolean {
     }
   }
   return true
+}
+
+function normalizeDisableExperimentalBetas(value: unknown): boolean {
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'number') return value !== 0
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase()
+    if (['0', 'false', 'off', 'no'].includes(normalized)) return false
+    if (['1', 'true', 'on', 'yes'].includes(normalized)) return true
+  }
+  return false
 }
 
 export function normalizeModelMapping(models: SavedProvider['models']): SavedProvider['models'] {
@@ -142,7 +166,11 @@ function applyModel1mSupportMapping(
 }
 
 export function normalizeSavedProvider(provider: SavedProvider): SavedProvider {
-  const { model1mSupport: rawModel1mSupport, ...rest } = provider
+  const {
+    disableExperimentalBetas: rawDisableExperimentalBetas,
+    model1mSupport: rawModel1mSupport,
+    ...rest
+  } = provider
   const rawProvider = provider as SavedProvider & Record<string, unknown>
   const model1mSupport = normalizeModel1mSupport(rawModel1mSupport)
   return {
@@ -151,6 +179,7 @@ export function normalizeSavedProvider(provider: SavedProvider): SavedProvider {
     runtimeKind: provider.runtimeKind ?? 'anthropic_compatible',
     models: normalizeModelMapping(provider.models),
     toolSearchEnabled: normalizeToolSearchEnabled(rawProvider.toolSearchEnabled),
+    ...(normalizeDisableExperimentalBetas(rawDisableExperimentalBetas) ? { disableExperimentalBetas: true } : {}),
     ...(model1mSupport !== undefined ? { model1mSupport } : {}),
   }
 }
@@ -210,7 +239,8 @@ export function normalizeProvidersIndex(value: unknown): ProvidersIndex | null {
         : null
   const activeId = rawActiveId && (
     providers.some((provider) => provider.id === rawActiveId) ||
-    isOpenAIOfficialProviderId(rawActiveId)
+    isOpenAIOfficialProviderId(rawActiveId) ||
+    isGrokOfficialProviderId(rawActiveId)
   )
     ? rawActiveId
     : null
@@ -261,6 +291,39 @@ function getCustomProviderModelCapabilities(
   return CUSTOM_PROVIDER_MODEL_CAPABILITIES
 }
 
+function getKimiModelCapabilities(model: string): string {
+  const normalized = model
+    .trim()
+    .replace(/\[1m\]$/i, '')
+    .replace(/:1m$/i, '')
+    .toLowerCase()
+  return normalized === 'k3'
+    ? KIMI_K3_MODEL_CAPABILITIES
+    : KIMI_CODING_FALLBACK_MODEL_CAPABILITIES
+}
+
+function getProviderCapabilityEnv(
+  provider: SavedProvider,
+  models: SavedProvider['models'],
+): Record<string, string> {
+  if (provider.presetId === 'custom') {
+    const capabilities = getCustomProviderModelCapabilities(provider, models)
+    return {
+      ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES: capabilities,
+      ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES: capabilities,
+      ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES: capabilities,
+    }
+  }
+  if (provider.presetId === 'kimi') {
+    return {
+      ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES: getKimiModelCapabilities(models.haiku),
+      ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES: getKimiModelCapabilities(models.sonnet),
+      ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES: getKimiModelCapabilities(models.opus),
+    }
+  }
+  return {}
+}
+
 export function buildProviderAuthEnv(
   provider: SavedProvider,
   presetDefaultEnv: Record<string, string>,
@@ -306,6 +369,9 @@ export function buildProviderManagedEnv(
   if (provider.runtimeKind === 'openai_oauth') {
     return buildOpenAIOfficialRuntimeEnv()
   }
+  if (provider.runtimeKind === 'grok_oauth') {
+    return buildGrokOfficialRuntimeEnv()
+  }
 
   const apiFormat: ApiFormat = provider.apiFormat ?? 'anthropic'
   const needsProxy = apiFormat !== 'anthropic'
@@ -323,19 +389,11 @@ export function buildProviderManagedEnv(
   }
 
   const presetDefaultEnv = getPresetDefaultEnv(provider.presetId)
-  const customProviderCapabilities = getCustomProviderModelCapabilities(provider, models)
-  const customProviderCapabilityEnv =
-    provider.presetId === 'custom'
-      ? {
-          ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES: customProviderCapabilities,
-          ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES: customProviderCapabilities,
-          ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES: customProviderCapabilities,
-        }
-      : {}
+  const providerCapabilityEnv = getProviderCapabilityEnv(provider, models)
 
   return {
     ...omitAuthEnv(presetDefaultEnv),
-    ...customProviderCapabilityEnv,
+    ...providerCapabilityEnv,
     ...(provider.autoCompactWindow !== undefined && {
       CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(provider.autoCompactWindow),
     }),
@@ -344,6 +402,9 @@ export function buildProviderManagedEnv(
     }),
     ...(apiFormat === 'anthropic' && {
       ENABLE_TOOL_SEARCH: provider.toolSearchEnabled === false ? 'false' : 'true',
+    }),
+    ...(provider.disableExperimentalBetas === true && {
+      CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: '1',
     }),
     ANTHROPIC_BASE_URL: baseUrl,
     ...buildProviderAuthEnv(provider, presetDefaultEnv, needsProxy),
@@ -367,6 +428,9 @@ export function readActiveProviderManagedEnv(
     if (isOpenAIOfficialProviderId(index.activeId)) {
       return buildOpenAIOfficialRuntimeEnv()
     }
+    if (isGrokOfficialProviderId(index.activeId)) {
+      return buildGrokOfficialRuntimeEnv()
+    }
 
     const provider = index.providers.find((entry) => entry.id === index.activeId)
     if (!provider) return null
@@ -376,6 +440,27 @@ export function readActiveProviderManagedEnv(
     })
   } catch {
     return null
+  }
+}
+
+export function activeProviderNeedsProxy(configDir: string): boolean {
+  try {
+    const raw = fs.readFileSync(path.join(configDir, 'cc-haha', 'providers.json'), 'utf-8')
+    const index = normalizeProvidersIndex(JSON.parse(raw))
+    if (
+      !index?.activeId ||
+      isOpenAIOfficialProviderId(index.activeId) ||
+      isGrokOfficialProviderId(index.activeId)
+    ) {
+      return false
+    }
+
+    const provider = index.providers.find((entry) => entry.id === index.activeId)
+    if (!provider) return false
+
+    return (provider.apiFormat ?? 'anthropic') !== 'anthropic'
+  } catch {
+    return false
   }
 }
 

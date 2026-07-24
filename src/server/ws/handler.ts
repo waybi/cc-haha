@@ -7,17 +7,36 @@
  */
 
 import type { ServerWebSocket } from 'bun'
-import type { ClientMessage, ServerMessage, StreamingFallbackCause } from './events.js'
+import type {
+  ClientMessage,
+  PermissionMode,
+  ServerMessage,
+  StreamingFallbackCause,
+  TokenUsage,
+} from './events.js'
 import * as os from 'node:os'
 import {
   ConversationStartupError,
   conversationService,
 } from '../services/conversationService.js'
 import { computerUseApprovalService } from '../services/computerUseApprovalService.js'
-import { sessionService } from '../services/sessionService.js'
+import {
+  sessionService,
+  type SessionTaskNotification,
+} from '../services/sessionService.js'
 import { SettingsService } from '../services/settingsService.js'
 import { ProviderService } from '../services/providerService.js'
 import { isOpenAIOfficialProviderId } from '../services/openaiOfficialProvider.js'
+import { isGrokOfficialProviderId } from '../services/grokOfficialProvider.js'
+import { getOpenAICodexModelCatalog } from '../../services/openaiAuth/modelCatalog.js'
+import {
+  OPENAI_DEFAULT_MAIN_MODEL,
+  getOpenAIModelCatalogEntry,
+  isOpenAIReasoningEffort,
+} from '../../services/openaiAuth/models.js'
+import { GROK_DEFAULT_MAIN_MODEL } from '../../services/grokAuth/models.js'
+import { getGrokModelCatalog } from '../../services/grokAuth/modelCatalog.js'
+import { hahaGrokOAuthService } from '../services/hahaGrokOAuthService.js'
 import { diagnosticsService } from '../services/diagnosticsService.js'
 import {
   buildConversationTitleInput,
@@ -29,18 +48,32 @@ import {
 } from '../services/titleService.js'
 import { parseSlashCommand } from '../../utils/slashCommandParsing.js'
 import {
-  COMMAND_ARGS_TAG,
-  COMMAND_MESSAGE_TAG,
   COMMAND_NAME_TAG,
-  LOCAL_COMMAND_CAVEAT_TAG,
   LOCAL_COMMAND_STDERR_TAG,
   LOCAL_COMMAND_STDOUT_TAG,
 } from '../../constants/xml.js'
+import {
+  getCommandMetadataDisplayText,
+  shouldHideCommandMetadataContent,
+} from '../../utils/commandMetadata.js'
 import { shouldCreateWorktreeForSessionLaunch } from '../services/repositoryLaunchService.js'
 import { getDisconnectGraceMs } from './disconnectGraceConfig.js'
+import {
+  isPetClientMessageAllowed,
+  toPetServerMessage,
+} from '../petAccessPolicy.js'
 
 const settingsService = new SettingsService()
 const providerService = new ProviderService()
+
+function buildSdkWebSocketUrl(
+  ws: ServerWebSocket<WebSocketData>,
+  sessionId: string,
+): string {
+  const url = new URL(`ws://${ws.data.serverHost}:${ws.data.serverPort}/sdk/${sessionId}`)
+  url.searchParams.set('token', crypto.randomUUID())
+  return url.toString()
+}
 
 /**
  * Cache slash commands from CLI init messages, keyed by sessionId.
@@ -60,10 +93,10 @@ const sessionSlashCommands = new Map<string, SessionSlashCommand[]>()
 const PENDING_PERMISSION_DISCONNECT_CLEANUP_MS = 30 * 60_000
 const sessionCleanupTimers = new Map<string, ReturnType<typeof setTimeout>>()
 /**
- * Per-session removers for the turn-completion watcher (issue #764). When the
- * last client disconnects while a turn is still running, we let the turn finish
- * in the background instead of killing the CLI, then start the idle grace timer
- * once the result arrives. The remover is also cleared on reconnect/cleanup.
+ * Per-session removers for the active-work watcher (issue #764). When the last
+ * client disconnects while a turn or background task is still running, we let
+ * that work finish instead of killing the CLI, then start the idle grace timer.
+ * The remover is also cleared on reconnect/cleanup.
  */
 const sessionDisconnectWatchers = new Map<string, () => void>()
 
@@ -98,8 +131,147 @@ type ActiveUserTurnState = {
 
 const runtimeOverrides = new Map<string, RuntimeOverride>()
 const activeUserTurns = new Map<string, ActiveUserTurnState>()
+const activeBackgroundTaskIds = new Map<string, Set<string>>()
 const deferredRuntimeRestarts = new Map<string, RuntimeOverride>()
-const deferredPermissionModes = new Map<string, string>()
+const deferredPermissionModes = new Map<string, PermissionMode>()
+
+export type SessionChatActivityState =
+  | 'waiting'
+  | 'failed'
+  | 'review'
+  | 'running'
+  | 'idle'
+
+/**
+ * Pet/activity status deliberately reuses the authoritative WebSocket turn and
+ * permission state above. Only terminal outcomes and the legacy REST queue
+ * fallback need their own memory; waiting/running are derived live.
+ */
+const terminalSessionChatStates = new Map<string, 'failed' | 'review'>()
+const legacyQueuedSessionChats = new Set<string>()
+const interruptedSessionChats = new Set<string>()
+
+function beginSessionChatActivity(sessionId: string): void {
+  terminalSessionChatStates.delete(sessionId)
+  legacyQueuedSessionChats.delete(sessionId)
+  interruptedSessionChats.delete(sessionId)
+}
+
+function failSessionChatActivity(sessionId: string): void {
+  legacyQueuedSessionChats.delete(sessionId)
+  interruptedSessionChats.delete(sessionId)
+  terminalSessionChatStates.set(sessionId, 'failed')
+}
+
+function settleSessionChatActivity(sessionId: string, cliMsg: any): void {
+  if (cliMsg?.type !== 'result') return
+
+  legacyQueuedSessionChats.delete(sessionId)
+  if (interruptedSessionChats.has(sessionId)) {
+    terminalSessionChatStates.delete(sessionId)
+    return
+  }
+  terminalSessionChatStates.set(sessionId, cliMsg.is_error ? 'failed' : 'review')
+}
+
+type CliBackgroundTaskLifecycle = {
+  taskId: string
+  running: boolean
+}
+
+function getCliBackgroundTaskLifecycle(cliMsg: any): CliBackgroundTaskLifecycle | null {
+  if (cliMsg?.type !== 'system') return null
+  const taskId = typeof cliMsg.task_id === 'string' ? cliMsg.task_id.trim() : ''
+  if (!taskId) return null
+
+  if (cliMsg.subtype === 'task_started') {
+    return { taskId, running: true }
+  }
+
+  if (cliMsg.subtype === 'task_notification' && cliMsg.status === 'running') {
+    return { taskId, running: true }
+  }
+
+  if (
+    cliMsg.subtype === 'task_notification' &&
+    (cliMsg.status === 'completed' ||
+      cliMsg.status === 'failed' ||
+      cliMsg.status === 'stopped' ||
+      cliMsg.status === 'killed')
+  ) {
+    return { taskId, running: false }
+  }
+
+  return null
+}
+
+function trackCliBackgroundTaskLifecycle(
+  sessionId: string,
+  cliMsg: any,
+): CliBackgroundTaskLifecycle | null {
+  const lifecycle = getCliBackgroundTaskLifecycle(cliMsg)
+  if (!lifecycle) return null
+
+  if (lifecycle.running) {
+    let taskIds = activeBackgroundTaskIds.get(sessionId)
+    if (!taskIds) {
+      taskIds = new Set()
+      activeBackgroundTaskIds.set(sessionId, taskIds)
+    }
+    taskIds.add(lifecycle.taskId)
+    return lifecycle
+  }
+
+  const taskIds = activeBackgroundTaskIds.get(sessionId)
+  taskIds?.delete(lifecycle.taskId)
+  if (taskIds?.size === 0) activeBackgroundTaskIds.delete(sessionId)
+  return lifecycle
+}
+
+function hasActiveBackgroundTasks(sessionId: string): boolean {
+  return (activeBackgroundTaskIds.get(sessionId)?.size ?? 0) > 0
+}
+
+export function getSessionChatActivityState(sessionId: string): SessionChatActivityState {
+  // An explicit stop wins over permission queues that the CLI has not emitted
+  // cancellation events for yet. Otherwise the stopped pet would remain stuck
+  // in waiting until that asynchronous cleanup arrived.
+  if (interruptedSessionChats.has(sessionId)) return 'idle'
+  if (
+    conversationService.getPendingPermissionRequests(sessionId).length > 0 ||
+    computerUseApprovalService.getPendingRequests(sessionId).length > 0
+  ) {
+    return 'waiting'
+  }
+  if (activeUserTurns.has(sessionId) || hasActiveBackgroundTasks(sessionId)) return 'running'
+  return terminalSessionChatStates.get(sessionId)
+    ?? (legacyQueuedSessionChats.has(sessionId) ? 'running' : 'idle')
+}
+
+/** Compatibility fallback for the legacy REST enqueue endpoint. */
+export function markSessionChatQueued(sessionId: string): void {
+  beginSessionChatActivity(sessionId)
+  legacyQueuedSessionChats.add(sessionId)
+}
+
+/** Compatibility reset for the legacy REST stop endpoint. */
+export function clearLegacySessionChatState(sessionId: string): void {
+  legacyQueuedSessionChats.delete(sessionId)
+  terminalSessionChatStates.delete(sessionId)
+  interruptedSessionChats.delete(sessionId)
+}
+const validPermissionModes = new Set<PermissionMode>([
+  'default',
+  'acceptEdits',
+  'plan',
+  'bypassPermissions',
+  'dontAsk',
+  'auto',
+])
+
+function isPermissionMode(value: unknown): value is PermissionMode {
+  return typeof value === 'string' && validPermissionModes.has(value as PermissionMode)
+}
 
 const runtimeTransitionPromises = new Map<string, Promise<void>>()
 const sessionStartupPromises = new Map<string, Promise<void>>()
@@ -110,7 +282,7 @@ const prewarmPendingSessions = new Set<string>()
 const prewarmedSessions = new Set<string>()
 const prewarmIdleTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const DEFAULT_PREWARM_IDLE_TIMEOUT_MS = 5 * 60_000
-const VALID_EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'max'])
+const VALID_CLAUDE_EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'max'])
 
 async function sendRepositoryStartupStatus(
   ws: ServerWebSocket<WebSocketData>,
@@ -132,10 +304,30 @@ export function getSlashCommands(sessionId: string): SessionSlashCommand[] {
   return sessionSlashCommands.get(sessionId) || []
 }
 
+function usageNumber(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0
+}
+
+function translateCliUsage(usage: unknown): TokenUsage {
+  const record = usage && typeof usage === 'object'
+    ? usage as Record<string, unknown>
+    : {}
+  const cacheReadTokens = usageNumber(record.cache_read_input_tokens ?? record.cache_read_tokens)
+  const cacheCreationTokens = usageNumber(record.cache_creation_input_tokens ?? record.cache_creation_tokens)
+
+  return {
+    input_tokens: usageNumber(record.input_tokens),
+    output_tokens: usageNumber(record.output_tokens),
+    ...(cacheReadTokens > 0 ? { cache_read_tokens: cacheReadTokens } : {}),
+    ...(cacheCreationTokens > 0 ? { cache_creation_tokens: cacheCreationTokens } : {}),
+  }
+}
+
 export type WebSocketData = {
   sessionId: string
   connectedAt: number
   channel: 'client' | 'sdk'
+  clientKind?: 'full' | 'pet'
   sdkToken: string | null
   serverPort: number
   serverHost: string
@@ -144,6 +336,7 @@ export type WebSocketData = {
 // Active WebSocket clients, grouped by session. Desktop, H5, and IM adapters can
 // legitimately watch the same running session at the same time.
 const activeSessions = new Map<string, Set<ServerWebSocket<WebSocketData>>>()
+let activePetClient: ServerWebSocket<WebSocketData> | null = null
 const clientOutputCallbacks = new Map<
   ServerWebSocket<WebSocketData>,
   {
@@ -151,6 +344,7 @@ const clientOutputCallbacks = new Map<
     callback: (cliMsg: any) => void
   }
 >()
+const taskNotificationPersistence = new Map<string, Map<string, Promise<void>>>()
 
 export const handleWebSocket = {
   open(ws: ServerWebSocket<WebSocketData>) {
@@ -166,6 +360,14 @@ export const handleWebSocket = {
       conversationService.attachSdkConnection(sessionId, ws)
       console.log(`[WS] SDK connected for session: ${sessionId}`)
       return
+    }
+
+    if (ws.data.clientKind === 'pet') {
+      const previousPetClient = activePetClient
+      activePetClient = ws
+      if (previousPetClient && previousPetClient !== ws) {
+        previousPetClient.close(1000, 'Pet session switched')
+      }
     }
 
     console.log(`[WS] Client connected for session: ${sessionId}`)
@@ -188,8 +390,16 @@ export const handleWebSocket = {
     }
 
     const msg: ServerMessage = { type: 'connected', sessionId }
-    ws.send(JSON.stringify(msg))
-    replayPendingPermissionRequests(ws, sessionId)
+    sendMessage(ws, msg)
+    const toolRequestIds = replayPendingPermissionRequests(ws, sessionId)
+    const computerUseRequestIds = replayPendingComputerUsePermissionRequests(ws, sessionId)
+    sendMessage(ws, {
+      type: 'permission_requests_snapshot',
+      toolRequestIds,
+      computerUseRequestIds,
+      turnActive:
+        hasPendingOrActiveUserTurn(sessionId) && !sessionStopRequested.has(sessionId),
+    })
   },
 
   message(ws: ServerWebSocket<WebSocketData>, rawMessage: string | Buffer) {
@@ -204,19 +414,47 @@ export const handleWebSocket = {
         typeof rawMessage === 'string' ? rawMessage : rawMessage.toString()
       ) as ClientMessage
 
+      if (ws.data.clientKind === 'pet' && !isPetClientMessageAllowed(message)) {
+        sendError(
+          ws,
+          `Message type ${(message as { type?: unknown }).type ?? 'unknown'} is not available to the pet window`,
+          'PET_CAPABILITY_DENIED',
+        )
+        return
+      }
+
       switch (message.type) {
-        case 'user_message':
-          handleUserMessage(ws, message).catch((err) => {
+        case 'user_message': {
+          const activeTurn: ActiveUserTurnState = { messageSent: false }
+          handleUserMessage(ws, message, activeTurn).catch((err) => {
+            const sessionId = ws.data.sessionId
             void diagnosticsService.recordEvent({
               type: 'ws_user_message_failed',
               severity: 'error',
-              sessionId: ws.data.sessionId,
+              sessionId,
               summary: err instanceof Error ? err.message : String(err),
               details: err,
             })
             console.error(`[WS] Unhandled error in handleUserMessage:`, err)
+            // A queued/newer turn may have replaced this handler while an
+            // earlier await was pending. Only the handler that still owns the
+            // active-turn token may terminate the desktop state.
+            if (activeUserTurns.get(sessionId) === activeTurn) {
+              failSessionChatActivity(sessionId)
+              clearActiveUserTurn(sessionId, activeTurn)
+              const titleState = sessionTitleState.get(sessionId)
+              if (titleState) titleState.activeTurn = undefined
+              sendMessage(ws, {
+                type: 'error',
+                message: 'The request could not be started. Please retry.',
+                code: 'USER_TURN_FAILED',
+                retryable: true,
+              })
+              sendMessage(ws, { type: 'status', state: 'idle' })
+            }
           })
           break
+        }
 
         case 'permission_response':
           handlePermissionResponse(ws, message)
@@ -238,12 +476,25 @@ export const handleWebSocket = {
           void handlePrewarmSession(ws)
           break
 
+        case 'sync_state':
+          sendMessage(ws, {
+            type: 'session_state',
+            turnState: hasPendingOrActiveUserTurn(ws.data.sessionId)
+              ? 'running'
+              : 'idle',
+          })
+          break
+
         case 'stop_generation':
           handleStopGeneration(ws)
           break
 
+        case 'stop_background_task':
+          void handleStopBackgroundTask(ws, message)
+          break
+
         case 'ping':
-          ws.send(JSON.stringify({ type: 'pong' } satisfies ServerMessage))
+          sendMessage(ws, { type: 'pong' })
           break
 
         default:
@@ -259,9 +510,11 @@ export const handleWebSocket = {
 
     if (channel === 'sdk') {
       console.log(`[WS] SDK disconnected from session: ${sessionId} (${code}: ${reason})`)
-      conversationService.detachSdkConnection(sessionId)
+      conversationService.detachSdkConnection(sessionId, ws)
       return
     }
+
+    if (activePetClient === ws) activePetClient = null
 
     console.log(`[WS] Client disconnected from session: ${sessionId} (${code}: ${reason})`)
     if (!removeActiveClient(sessionId, ws)) {
@@ -274,17 +527,24 @@ export const handleWebSocket = {
       return
     }
 
-    // No clients left. A turn that is still running must finish in the
-    // background (issue #764) — never kill it just because a phone locked its
-    // screen. Defer cleanup until the turn completes, then apply the idle
-    // grace period. Sessions that are already idle go straight to the timer.
-    if (isSessionTurnActive(sessionId)) {
-      console.log(`[WS] Session ${sessionId} still running after disconnect; keeping CLI alive until the turn finishes`)
+    // No clients left. A foreground turn or background task that is still
+    // running must finish (issue #764) — never kill it just because a renderer
+    // closed. Defer cleanup until all active work completes, then apply the
+    // idle grace period. Sessions that are already idle go straight to the timer.
+    if (hasPendingOrActiveUserTurn(sessionId) || hasActiveBackgroundTasks(sessionId)) {
+      // A turn blocked on permission cannot finish without user input. Keep the
+      // completion watcher for early cleanup, but also enforce the existing
+      // pending-permission maximum so an abandoned prompt cannot pin the CLI.
+      if (conversationService.getPendingPermissionRequests(sessionId).length > 0) {
+        scheduleDisconnectCleanup(sessionId)
+      }
+      console.log(`[WS] Session ${sessionId} still running after disconnect; keeping CLI alive until active work finishes`)
       watchTurnCompletionForCleanup(sessionId)
       return
     }
 
     scheduleDisconnectCleanup(sessionId)
+    watchTurnCompletionForCleanup(sessionId)
   },
 
   drain(ws: ServerWebSocket<WebSocketData>) {
@@ -298,12 +558,14 @@ export const handleWebSocket = {
 
 async function handleUserMessage(
   ws: ServerWebSocket<WebSocketData>,
-  message: Extract<ClientMessage, { type: 'user_message' }>
+  message: Extract<ClientMessage, { type: 'user_message' }>,
+  activeTurn: ActiveUserTurnState,
 ) {
   const { sessionId } = ws.data
 
   // Clear any stale stop flag from a previous turn
   sessionStopRequested.delete(sessionId)
+  beginSessionChatActivity(sessionId)
   clearPrewarmState(sessionId)
 
   const desktopSlashCommand = getDesktopSlashCommand(message.content)
@@ -325,7 +587,6 @@ async function handleUserMessage(
   // Send thinking status
   sendMessage(ws, { type: 'status', state: 'thinking', verb: 'Thinking' })
 
-  const activeTurn: ActiveUserTurnState = { messageSent: false }
   activeUserTurns.set(sessionId, activeTurn)
 
   const initialRuntimeTransition = await waitForRuntimeTransitionBeforeUserTurn(ws, sessionId)
@@ -382,6 +643,7 @@ async function handleUserMessage(
         err instanceof ConversationStartupError ? err.retryable : false,
     })
     sendMessage(ws, { type: 'status', state: 'idle' })
+    failSessionChatActivity(sessionId)
     clearActiveUserTurn(sessionId, activeTurn)
     return
   }
@@ -416,6 +678,13 @@ async function handleUserMessage(
   })
   const removeActiveTurnOutputCallback = bindActiveUserTurnCompletion(ws, sessionId, activeTurn)
 
+  // The renderer may have left while the CLI was still starting, before this
+  // turn could flip messageSent=true. The disconnect handler cannot attach an
+  // effective output watcher until the ConversationService session exists, so
+  // refresh it here, immediately before sending the turn, to observe a
+  // permission request that arrives after the disconnect.
+  refreshDisconnectedTurnCleanupWatcher(sessionId)
+
   const sent = await conversationService.sendMessage(
     sessionId,
     message.content,
@@ -432,6 +701,7 @@ async function handleUserMessage(
       code: 'CLI_NOT_RUNNING',
     })
     sendMessage(ws, { type: 'status', state: 'idle' })
+    failSessionChatActivity(sessionId)
     return
   }
 
@@ -451,8 +721,12 @@ function bindActiveUserTurnCompletion(
   activeTurn: ActiveUserTurnState,
 ): () => void {
   const callback = (cliMsg: any) => {
-    if (!activeTurn.messageSent || cliMsg?.type !== 'result') return
+    if (
+      cliMsg?.type !== 'result' ||
+      (!activeTurn.messageSent && !cliMsg.is_error)
+    ) return
 
+    settleSessionChatActivity(sessionId, cliMsg)
     conversationService.removeOutputCallback(sessionId, callback)
     clearActiveUserTurn(sessionId, activeTurn)
     // Structurally disarm any prewarm idle timer that a concurrent
@@ -515,6 +789,9 @@ async function handleDesktopClearCommand(
   const { sessionId } = ws.data
 
   const workDir = conversationService.getSessionWorkDir(sessionId)
+  const permissionMode = conversationService.hasSession(sessionId)
+    ? conversationService.getSessionPermissionMode(sessionId)
+    : undefined
   conversationService.stopSession(sessionId)
   conversationService.clearOutputCallbacks(sessionId)
   sessionSlashCommands.delete(sessionId)
@@ -522,7 +799,7 @@ async function handleDesktopClearCommand(
   cleanupStreamState(sessionId)
 
   try {
-    await sessionService.clearSessionTranscript(sessionId, workDir || undefined)
+    await sessionService.clearSessionTranscript(sessionId, workDir || undefined, permissionMode)
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err)
     sendMessage(ws, {
@@ -598,7 +875,7 @@ function handlePermissionResponse(
   message: Extract<ClientMessage, { type: 'permission_response' }>
 ) {
   const { sessionId } = ws.data
-  conversationService.respondToPermission(
+  const resolved = conversationService.respondToPermission(
     sessionId,
     message.requestId,
     message.allowed,
@@ -607,6 +884,14 @@ function handlePermissionResponse(
     message.denyMessage,
     message.permissionUpdates,
   )
+  if (resolved) {
+    sendToSession(sessionId, {
+      type: 'permission_resolved',
+      requestId: message.requestId,
+      permissionType: 'tool',
+      allowed: message.allowed,
+    })
+  }
   console.log(`[WS] Permission response for ${message.requestId}: ${message.allowed}`)
 }
 
@@ -623,7 +908,14 @@ function handleComputerUsePermissionResponse(
     console.warn(
       `[WS] Ignored Computer Use permission response for unknown request ${message.requestId} from ${sessionId}`
     )
+    return
   }
+  sendToSession(sessionId, {
+    type: 'permission_resolved',
+    requestId: message.requestId,
+    permissionType: 'computer_use',
+    allowed: message.response.userConsented !== false,
+  })
 }
 
 async function handleSetPermissionMode(
@@ -631,10 +923,17 @@ async function handleSetPermissionMode(
   message: Extract<ClientMessage, { type: 'set_permission_mode' }>
 ): Promise<void> {
   const { sessionId } = ws.data
+  if (!isPermissionMode(message.mode)) {
+    sendMessage(ws, {
+      type: 'error',
+      message: 'Permission mode is invalid.',
+      code: 'PERMISSION_MODE_INVALID',
+    })
+    return
+  }
   const pendingStartup = sessionStartupPromises.get(sessionId)
 
   if (pendingStartup) {
-    await persistSessionPermissionMode(sessionId, message.mode)
     await enqueueRuntimeTransition(sessionId, async () => {
       await pendingStartup.catch(() => undefined)
       if (!conversationService.hasSession(sessionId)) return
@@ -644,62 +943,69 @@ async function handleSetPermissionMode(
   }
 
   if (!conversationService.hasSession(sessionId)) {
-    await persistSessionPermissionMode(sessionId, message.mode)
+    if (await persistSessionPermissionMode(sessionId, message.mode)) {
+      sendMessage(ws, { type: 'permission_mode_changed', mode: message.mode })
+    }
     return
   }
 
-  await applyPermissionModeToActiveSession(ws, sessionId, message.mode)
+  await enqueueRuntimeTransition(sessionId, () =>
+    applyPermissionModeToActiveSession(ws, sessionId, message.mode),
+  )
 }
 
+const BYPASS_CAPABILITY_UNAVAILABLE =
+  'Cannot set permission mode to bypassPermissions because the session was not launched with --dangerously-skip-permissions'
+
 /**
- * 决定一次权限模式切换是否需要重启 CLI 子进程。
- *
- * 只有"进入 bypassPermissions"才需要重启：CLI 必须带 --dangerously-skip-permissions
- * 启动，否则运行时的 set_permission_mode → bypassPermissions 会被拒绝，所以重启子进程
- * 带上该 flag。
- *
- * 反过来"从 bypassPermissions 切到更严格的模式"**不要**重启：此时进程已带 flag，运行时
- * 降级即可。更关键的是——重启会把进程内的 prePlanMode 记忆冲掉：若 bypass→plan 走重启，
- * 新 CLI 直接以 plan 启动、prePlanMode 为空，ExitPlanMode 只能恢复成 default 而非进入前的
- * bypassPermissions。保持进程不变、走 setPermissionMode 做进程内 transition，CLI 才会像 TUI
- * 一样栈存 prePlanMode='bypassPermissions'，退出 plan 时正确恢复 bypass。
+ * Sessions launched by this desktop build can switch into bypass in-process.
+ * A session that was already running before an app update may lack that launch
+ * capability, so retain the old restart path only for that exact CLI error.
  */
-export function shouldRestartForPermissionMode(
-  currentMode: string,
-  mode: string,
+export function shouldFallbackToPermissionRestart(
+  mode: PermissionMode,
+  error: unknown,
 ): boolean {
-  if (currentMode === mode) return false
-  return mode === 'bypassPermissions'
+  if (mode !== 'bypassPermissions') return false
+  const message = error instanceof Error ? error.message : String(error)
+  return message.includes(BYPASS_CAPABILITY_UNAVAILABLE)
 }
 
 async function applyPermissionModeToActiveSession(
   ws: ServerWebSocket<WebSocketData>,
   sessionId: string,
-  mode: string,
+  mode: PermissionMode,
 ): Promise<void> {
   const currentMode = conversationService.getSessionPermissionMode(sessionId)
   if (shouldDeferRuntimeRestartForActiveTurn(sessionId)) {
     deferredPermissionModes.set(sessionId, mode)
-    await persistSessionPermissionMode(sessionId, mode)
     return
   }
 
-  if (currentMode === mode) return
-  const needsRestart = shouldRestartForPermissionMode(currentMode, mode)
-
-  if (needsRestart) {
-    void enqueueRuntimeTransition(sessionId, () =>
-      restartSessionWithPermissionMode(ws, sessionId, mode),
-    )
+  if (currentMode === mode) {
+    sendToSession(sessionId, { type: 'permission_mode_changed', mode })
     return
   }
-
-  const ok = conversationService.setPermissionMode(sessionId, mode)
-  if (!ok) {
-    console.warn(`[WS] Ignored permission mode update for inactive session ${sessionId}`)
-    return
+  try {
+    const ok = await conversationService.setPermissionMode(sessionId, mode)
+    if (!ok) {
+      console.warn(`[WS] Ignored permission mode update for inactive session ${sessionId}`)
+      return
+    }
+    await commitConfirmedPermissionMode(sessionId, mode)
+  } catch (err) {
+    if (shouldFallbackToPermissionRestart(mode, err)) {
+      await restartSessionWithPermissionMode(ws, sessionId, mode)
+      return
+    }
+    const errMsg = err instanceof Error ? err.message : String(err)
+    console.warn(`[WS] Failed to set permission mode for ${sessionId}: ${errMsg}`)
+    sendMessage(ws, {
+      type: 'error',
+      message: `Failed to set permission mode: ${errMsg}`,
+      code: 'PERMISSION_MODE_CHANGE_FAILED',
+    })
   }
-  await persistSessionPermissionMode(sessionId, mode)
 }
 
 async function handleSetRuntimeConfig(
@@ -707,7 +1013,7 @@ async function handleSetRuntimeConfig(
   message: Extract<ClientMessage, { type: 'set_runtime_config' }>
 ) {
   const { sessionId } = ws.data
-  const modelId = typeof message.modelId === 'string' ? message.modelId.trim() : ''
+  let modelId = typeof message.modelId === 'string' ? message.modelId.trim() : ''
   if (!modelId) {
     sendMessage(ws, {
       type: 'error',
@@ -716,9 +1022,15 @@ async function handleSetRuntimeConfig(
     })
     return
   }
+  if (isGrokOfficialProviderId(message.providerId)) {
+    modelId = (await getGrokReasoningEfforts(modelId)).modelId
+  }
   const effortLevel =
     typeof message.effortLevel === 'string' ? message.effortLevel.trim() : undefined
-  if (effortLevel !== undefined && !VALID_EFFORT_LEVELS.has(effortLevel)) {
+  if (
+    effortLevel !== undefined &&
+    !(await isRuntimeEffortSupported(message.providerId, modelId, effortLevel))
+  ) {
     sendMessage(ws, {
       type: 'error',
       message: 'Runtime effort selection is invalid.',
@@ -794,21 +1106,23 @@ async function handleSetRuntimeConfig(
 async function restartSessionWithPermissionMode(
   ws: ServerWebSocket<WebSocketData>,
   sessionId: string,
-  mode: string,
+  mode: PermissionMode,
 ): Promise<void> {
   try {
     const workDir = conversationService.getSessionWorkDir(sessionId)
-    await persistSessionPermissionMode(sessionId, mode, workDir)
     conversationService.stopSession(sessionId)
 
-    // Rebuild runtime settings (will pick up the session-scoped mode)
-    const runtimeSettings = await getRuntimeSettings(sessionId)
-    const sdkUrl =
-      `ws://${ws.data.serverHost}:${ws.data.serverPort}/sdk/${sessionId}` +
-      `?token=${encodeURIComponent(crypto.randomUUID())}`
+    // Launch with the requested mode in-memory. Persist it only after startup
+    // succeeds so a failed bypass restart cannot leave dangerous metadata.
+    const runtimeSettings = {
+      ...await getRuntimeSettings(sessionId),
+      permissionMode: mode,
+    }
+    const sdkUrl = buildSdkWebSocketUrl(ws, sessionId)
     await conversationService.startSession(sessionId, workDir, sdkUrl, runtimeSettings)
 
-    sendMessage(ws, { type: 'status', state: 'idle' })
+    await commitConfirmedPermissionMode(sessionId, mode, workDir)
+    sendToSession(sessionId, { type: 'status', state: 'idle' })
     console.log(`[WS] Restarted CLI for ${sessionId} with permission mode: ${mode}`)
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err)
@@ -832,22 +1146,36 @@ async function restartSessionWithPermissionMode(
   }
 }
 
+async function commitConfirmedPermissionMode(
+  sessionId: string,
+  mode: PermissionMode,
+  knownWorkDir?: string | null,
+): Promise<void> {
+  const persisted = await persistSessionPermissionMode(sessionId, mode, knownWorkDir)
+  if (!persisted) {
+    throw new Error(`Unable to persist confirmed permission mode: ${mode}`)
+  }
+  conversationService.recordSessionPermissionMode(sessionId, mode)
+  sendToSession(sessionId, { type: 'permission_mode_changed', mode })
+}
+
 async function persistSessionPermissionMode(
   sessionId: string,
   mode: string,
   knownWorkDir?: string | null,
-): Promise<void> {
+): Promise<boolean> {
   const workDir =
     knownWorkDir ||
     conversationService.getSessionWorkDir(sessionId) ||
     await sessionService.getSessionWorkDir(sessionId).catch(() => null)
 
-  if (!workDir) return
+  if (!workDir) return false
 
   await sessionService.appendSessionMetadata(sessionId, {
     workDir,
     permissionMode: mode,
   })
+  return true
 }
 
 async function persistSessionRuntimeConfig(
@@ -877,9 +1205,7 @@ async function restartSessionWithRuntimeConfig(
     conversationService.stopSession(sessionId)
 
     const runtimeSettings = await getRuntimeSettings(sessionId)
-    const sdkUrl =
-      `ws://${ws.data.serverHost}:${ws.data.serverPort}/sdk/${sessionId}` +
-      `?token=${encodeURIComponent(crypto.randomUUID())}`
+    const sdkUrl = buildSdkWebSocketUrl(ws, sessionId)
     await conversationService.startSession(sessionId, workDir, sdkUrl, runtimeSettings)
 
     sendMessage(ws, { type: 'status', state: 'idle' })
@@ -908,17 +1234,25 @@ async function restartSessionWithRuntimeConfig(
 
 function handleStopGeneration(ws: ServerWebSocket<WebSocketData>) {
   const { sessionId } = ws.data
+  const stoppedTurn = activeUserTurns.get(sessionId)
   console.log(`[WS] Stop generation requested for session: ${sessionId}`)
 
   sessionStopRequested.add(sessionId)
+  legacyQueuedSessionChats.delete(sessionId)
+  terminalSessionChatStates.delete(sessionId)
+  interruptedSessionChats.add(sessionId)
 
-  if (conversationService.hasSession(sessionId)) {
+  if (stoppedTurn && conversationService.hasSession(sessionId)) {
     // First try graceful interrupt via SDK control message
     conversationService.sendInterrupt(sessionId)
 
     // Force-kill if still running after 3 seconds
     setTimeout(() => {
-      if (conversationService.hasSession(sessionId)) {
+      if (
+        sessionStopRequested.has(sessionId) &&
+        activeUserTurns.get(sessionId) === stoppedTurn &&
+        conversationService.hasSession(sessionId)
+      ) {
         console.log(`[WS] Force-killing CLI subprocess for session: ${sessionId}`)
         conversationService.stopSession(sessionId)
       }
@@ -926,6 +1260,36 @@ function handleStopGeneration(ws: ServerWebSocket<WebSocketData>) {
   }
 
   sendMessage(ws, { type: 'status', state: 'idle' })
+}
+
+async function handleStopBackgroundTask(
+  ws: ServerWebSocket<WebSocketData>,
+  message: Extract<ClientMessage, { type: 'stop_background_task' }>,
+): Promise<void> {
+  const { sessionId } = ws.data
+  const taskId = typeof message.taskId === 'string' ? message.taskId.trim() : ''
+
+  if (!taskId) {
+    sendMessage(ws, {
+      type: 'background_task_stop_failed',
+      taskId,
+      message: 'Background task id is required',
+    })
+    return
+  }
+
+  try {
+    await conversationService.requestControl(sessionId, {
+      subtype: 'stop_task',
+      task_id: taskId,
+    })
+  } catch (error) {
+    sendMessage(ws, {
+      type: 'background_task_stop_failed',
+      taskId,
+      message: error instanceof Error ? error.message : String(error),
+    })
+  }
 }
 
 // ============================================================================
@@ -1179,6 +1543,13 @@ function getStreamState(sessionId: string): SessionStreamState {
   return state
 }
 
+function resetCurrentStreamAttempt(state: SessionStreamState): void {
+  state.hasReceivedStreamEvents = false
+  state.activeBlockTypes.clear()
+  state.activeToolBlocks.clear()
+  state.pendingToolBlocks.clear()
+}
+
 function cliParentToolUseId(cliMsg: any): string | undefined {
   return typeof cliMsg.parent_tool_use_id === 'string' && cliMsg.parent_tool_use_id.length > 0
     ? cliMsg.parent_tool_use_id
@@ -1216,11 +1587,17 @@ function cleanupSessionRuntimeState(sessionId: string) {
   sessionTitleState.delete(sessionId)
   runtimeOverrides.delete(sessionId)
   activeUserTurns.delete(sessionId)
+  sessionStopRequested.delete(sessionId)
+  activeBackgroundTaskIds.delete(sessionId)
+  terminalSessionChatStates.delete(sessionId)
+  legacyQueuedSessionChats.delete(sessionId)
+  interruptedSessionChats.delete(sessionId)
   deferredRuntimeRestarts.delete(sessionId)
   deferredPermissionModes.delete(sessionId)
   runtimeTransitionPromises.delete(sessionId)
   sessionStartupPromises.delete(sessionId)
   lastResolvedStartupWorkDirs.delete(sessionId)
+  taskNotificationPersistence.delete(sessionId)
   clearPrewarmState(sessionId)
 }
 
@@ -1328,6 +1705,19 @@ function isDuplicateOfLastApiError(
   )
 }
 
+function classifyRuntimeErrorCode(message: string, fallbackCode: string): string {
+  if (/Stream max duration exceeded/i.test(message)) {
+    return 'STREAM_MAX_DURATION'
+  }
+  if (
+    /Provider stream stalled after partial response/i.test(message) ||
+    /Stream idle timeout/i.test(message)
+  ) {
+    return 'STREAM_IDLE_TIMEOUT'
+  }
+  return fallbackCode
+}
+
 function bindPrewarmMetadataCapture(sessionId: string) {
   for (const msg of conversationService.getRecentSdkMessages(sessionId)) {
     cacheSessionInitMetadata(sessionId, msg)
@@ -1383,9 +1773,7 @@ async function ensureCliSessionStarted(
     const startupSettings = reason === 'prewarm_session'
       ? { ...runtimeSettings, resumeInterruptedTurn: false }
       : runtimeSettings
-    const sdkUrl =
-      `ws://${ws.data.serverHost}:${ws.data.serverPort}/sdk/${sessionId}` +
-      `?token=${encodeURIComponent(crypto.randomUUID())}`
+    const sdkUrl = buildSdkWebSocketUrl(ws, sessionId)
     await sendRepositoryStartupStatus(ws, sessionId, reason)
     console.log(`[WS] Starting CLI for ${sessionId} due to ${reason}`)
     await conversationService.startSession(sessionId, workDir, sdkUrl, startupSettings)
@@ -1415,7 +1803,8 @@ export function translateCliMessage(cliMsg: any, sessionId: string): ServerMessa
           return []
         }
         const message = extractAssistantText(cliMsg) || cliMsg.error || 'Unknown API error'
-        const code = typeof cliMsg.error === 'string' ? cliMsg.error : 'API_ERROR'
+        const fallbackCode = typeof cliMsg.error === 'string' ? cliMsg.error : 'API_ERROR'
+        const code = classifyRuntimeErrorCode(message, fallbackCode)
         streamState.lastApiError = { message, code }
         return [{
           type: 'error',
@@ -1470,9 +1859,6 @@ export function translateCliMessage(cliMsg: any, sessionId: string): ServerMessa
           }
         }
 
-        // Reset flags for next turn
-        streamState.hasReceivedStreamEvents = false
-        streamState.pendingToolBlocks.clear()
         return messages
       }
       return []
@@ -1554,7 +1940,7 @@ export function translateCliMessage(cliMsg: any, sessionId: string): ServerMessa
 
       switch (event.type) {
         case 'message_start': {
-          return [{ type: 'status', state: 'thinking' }]
+          return [{ type: 'status', state: 'thinking', attemptStart: true }]
         }
 
         case 'content_block_start': {
@@ -1686,15 +2072,40 @@ export function translateCliMessage(cliMsg: any, sessionId: string): ServerMessa
       return []
     }
 
-    case 'control_response':
-      return []
+    case 'control_cancel_request':
+      return typeof cliMsg.request_id === 'string'
+        ? [{
+            type: 'permission_resolved',
+            requestId: cliMsg.request_id,
+            permissionType: 'tool',
+          }]
+        : []
+
+    case 'control_response': {
+      const requestId = typeof cliMsg.response?.request_id === 'string'
+        ? cliMsg.response.request_id
+        : typeof cliMsg.request_id === 'string'
+          ? cliMsg.request_id
+          : null
+      if (!requestId) return []
+      const behavior = cliMsg.response?.response?.behavior
+      return [{
+        type: 'permission_resolved',
+        requestId,
+        permissionType: 'tool',
+        ...(behavior === 'allow' || behavior === 'deny'
+          ? { allowed: behavior === 'allow' }
+          : {}),
+      }]
+    }
 
     case 'result': {
       // 对话结果（成功或错误）
-      const usage = {
-        input_tokens: cliMsg.usage?.input_tokens || 0,
-        output_tokens: cliMsg.usage?.output_tokens || 0,
-      }
+      const usage = translateCliUsage(cliMsg.usage)
+      // Buffered assistant blocks can arrive as a batch after all raw events
+      // for one provider message. Keep deduplication active across the entire
+      // batch, then clear it only at the terminal result boundary.
+      resetCurrentStreamAttempt(streamState)
 
       if (cliMsg.is_error) {
         // If the user requested stop, this "error" is just the interrupt
@@ -1718,7 +2129,7 @@ export function translateCliMessage(cliMsg: any, sessionId: string): ServerMessa
           {
             type: 'error',
             message: resultMessage,
-            code: 'CLI_ERROR',
+            code: classifyRuntimeErrorCode(resultMessage, 'CLI_ERROR'),
           },
           { type: 'message_complete', usage },
         ]
@@ -1738,6 +2149,9 @@ export function translateCliMessage(cliMsg: any, sessionId: string): ServerMessa
         return apiRetryMessage ? [apiRetryMessage] : []
       }
       if (subtype === 'streaming_fallback') {
+        // The next attempt is a new stream or a full non-streaming response;
+        // neither should inherit raw-event dedup/tool JSON from the failed one.
+        resetCurrentStreamAttempt(streamState)
         return [toStreamingFallbackServerMessage(cliMsg)]
       }
       if (subtype === 'init') {
@@ -1786,7 +2200,7 @@ export function translateCliMessage(cliMsg: any, sessionId: string): ServerMessa
         // Shift+Tab）广播给前端。它带 status:null 但**不是** thinking 信号，
         // 必须在下面的 null→thinking 兜底之前拦截，否则字段会被丢弃，桌面端
         // 选择器就会一直卡在"计划模式"。
-        if (typeof cliMsg.permissionMode === 'string') {
+        if (isPermissionMode(cliMsg.permissionMode)) {
           return [{ type: 'permission_mode_changed', mode: cliMsg.permissionMode }]
         }
         if (cliMsg.status == null) {
@@ -1838,13 +2252,17 @@ export function translateCliMessage(cliMsg: any, sessionId: string): ServerMessa
         }]
       }
       if (subtype === 'task_started') {
+        const notification: ServerMessage = {
+          type: 'system_notification',
+          subtype: 'task_started',
+          message: cliMsg.message || cliMsg.description || 'Task started',
+          data: cliMsg,
+        }
+        // AutoDream is detached maintenance work. Keep it visible in Activity,
+        // but do not revive the already-completed foreground turn.
+        if (cliMsg.task_type === 'dream') return [notification]
         return [
-          {
-            type: 'system_notification',
-            subtype: 'task_started',
-            message: cliMsg.message || cliMsg.description || 'Task started',
-            data: cliMsg,
-          },
+          notification,
           {
             type: 'status',
             state: 'tool_executing',
@@ -1982,6 +2400,7 @@ const STREAMING_FALLBACK_CAUSES: ReadonlySet<StreamingFallbackCause> = new Set([
   'watchdog',
   'stream_error',
   '404_stream_creation',
+  'stream_retry',
 ])
 
 function toStreamingFallbackServerMessage(cliMsg: any): ServerMessage {
@@ -1994,7 +2413,10 @@ function toStreamingFallbackServerMessage(cliMsg: any): ServerMessage {
 }
 
 function sendMessage(ws: ServerWebSocket<WebSocketData>, message: ServerMessage) {
-  ws.send(JSON.stringify(message))
+  const outgoing = ws.data.clientKind === 'pet'
+    ? toPetServerMessage(message)
+    : message
+  if (outgoing) ws.send(JSON.stringify(outgoing))
 }
 
 function sendError(ws: ServerWebSocket<WebSocketData>, message: string, code: string) {
@@ -2014,19 +2436,11 @@ function getDisconnectCleanupDelayMs(sessionId: string): number {
 }
 
 /**
- * Whether the session is mid-turn (a user message was sent and no result has
- * arrived yet). Such a turn must not be killed on disconnect.
- */
-function isSessionTurnActive(sessionId: string): boolean {
-  return activeUserTurns.get(sessionId)?.messageSent === true
-}
-
-/**
  * Whether a user turn has been registered for this session and not yet settled,
  * INCLUDING the CLI-startup window before messageSent flips true. handleUserMessage
  * registers the turn in its synchronous prefix (activeUserTurns.set), well before
- * the message is actually sent. Unlike isSessionTurnActive, this is not blind to
- * that window, so the prewarm idle timer can neither arm on nor fire against a
+ * the message is actually sent. Checking the registration is not blind to that
+ * window, so the prewarm idle timer can neither arm on nor fire against a
  * session a user turn has already claimed — even when a concurrent
  * prewarm_session/user_message flush inverts their ordering.
  */
@@ -2047,27 +2461,69 @@ function scheduleDisconnectCleanup(sessionId: string): void {
   const cleanupDelayMs = getDisconnectCleanupDelayMs(sessionId)
   const cleanupTimer = setTimeout(() => {
     sessionCleanupTimers.delete(sessionId)
-    if (!hasActiveClients(sessionId)) {
-      console.log(`[WS] Session ${sessionId} not reconnected after ${cleanupDelayMs}ms, stopping CLI subprocess`)
-      conversationService.stopSession(sessionId)
-      cleanupSessionRuntimeState(sessionId)
+    if (hasActiveClients(sessionId)) return
+
+    const permissionBoundExpired = conversationService
+      .getPendingPermissionRequests(sessionId).length > 0
+    if (
+      !permissionBoundExpired &&
+      (hasPendingOrActiveUserTurn(sessionId) || hasActiveBackgroundTasks(sessionId))
+    ) {
+      console.log(`[WS] Session ${sessionId} became active during its idle grace period; keeping CLI alive`)
+      watchTurnCompletionForCleanup(sessionId)
+      return
     }
+
+    console.log(`[WS] Session ${sessionId} not reconnected after ${cleanupDelayMs}ms, stopping CLI subprocess`)
+    conversationService.stopSession(sessionId)
+    cleanupSessionRuntimeState(sessionId)
   }, cleanupDelayMs)
   sessionCleanupTimers.set(sessionId, cleanupTimer)
 }
 
 /**
- * Keep a still-running session alive after the last client leaves, and start
- * the idle grace timer only once the current turn completes (issue #764). If a
- * client reconnects first, cancelSessionDisconnectWatcher() tears this down.
+ * Keep a session with active foreground/background work alive after the last
+ * client leaves, and start the idle grace timer only once all work completes
+ * (issue #764). If a client reconnects first, the watcher is torn down.
  */
 function watchTurnCompletionForCleanup(sessionId: string): void {
   cancelSessionDisconnectWatcher(sessionId)
 
   const onComplete = (cliMsg: any) => {
-    if (cliMsg?.type !== 'result') return
+    const taskLifecycle = trackCliBackgroundTaskLifecycle(sessionId, cliMsg)
+    if (taskLifecycle?.running && !hasActiveClients(sessionId)) {
+      // A pending permission uses a hard 30-minute disconnect bound. A late
+      // background task may outlive (or never emit) its terminal notification,
+      // so it must not turn that bound into an unbounded watcher. Ordinary idle
+      // grace timers are still cancelled while observed work is running.
+      if (conversationService.getPendingPermissionRequests(sessionId).length === 0) {
+        const cleanupTimer = sessionCleanupTimers.get(sessionId)
+        if (cleanupTimer) clearTimeout(cleanupTimer)
+        sessionCleanupTimers.delete(sessionId)
+      }
+      return
+    }
+    if (
+      cliMsg?.type === 'control_request' &&
+      cliMsg.request?.subtype === 'can_use_tool' &&
+      !hasActiveClients(sessionId)
+    ) {
+      // The permission request may arrive after the renderer disconnected.
+      // ConversationService records it before notifying this callback, so the
+      // cleanup delay resolves to the bounded pending-permission window.
+      scheduleDisconnectCleanup(sessionId)
+      return
+    }
+
+    const foregroundTurnCompleted = cliMsg?.type === 'result'
+    const backgroundTaskCompleted = taskLifecycle?.running === false
+    if (!foregroundTurnCompleted && !backgroundTaskCompleted) return
+    if (hasActiveBackgroundTasks(sessionId)) return
+    if (!foregroundTurnCompleted && hasPendingOrActiveUserTurn(sessionId)) return
+
     cancelSessionDisconnectWatcher(sessionId)
-    // The turn finished while still unobserved — fall back to the idle timer.
+    // All observed work finished while still disconnected — fall back to the
+    // bounded idle timer rather than stopping the CLI immediately.
     if (!hasActiveClients(sessionId)) {
       scheduleDisconnectCleanup(sessionId)
     }
@@ -2079,7 +2535,27 @@ function watchTurnCompletionForCleanup(sessionId: string): void {
   })
 }
 
-/** Remove any pending turn-completion watcher for a session. */
+/**
+ * Re-arm the disconnect watcher once CLI startup has completed. A client can
+ * leave during the startup window, when the user turn is registered but the
+ * ConversationService session (and therefore its output callback list) does
+ * not exist yet.
+ */
+function refreshDisconnectedTurnCleanupWatcher(sessionId: string): void {
+  if (
+    hasActiveClients(sessionId) ||
+    (!hasPendingOrActiveUserTurn(sessionId) && !hasActiveBackgroundTasks(sessionId))
+  ) return
+
+  const pendingTimer = sessionCleanupTimers.get(sessionId)
+  if (pendingTimer) {
+    clearTimeout(pendingTimer)
+    sessionCleanupTimers.delete(sessionId)
+  }
+  watchTurnCompletionForCleanup(sessionId)
+}
+
+/** Remove any pending active-work completion watcher for a session. */
 function cancelSessionDisconnectWatcher(sessionId: string): void {
   const remove = sessionDisconnectWatchers.get(sessionId)
   if (remove) {
@@ -2091,8 +2567,9 @@ function cancelSessionDisconnectWatcher(sessionId: string): void {
 function replayPendingPermissionRequests(
   ws: ServerWebSocket<WebSocketData>,
   sessionId: string,
-): void {
-  for (const request of conversationService.getPendingPermissionRequests(sessionId)) {
+): string[] {
+  const requests = conversationService.getPendingPermissionRequests(sessionId)
+  for (const request of requests) {
     sendMessage(ws, {
       type: 'permission_request',
       requestId: request.requestId,
@@ -2102,6 +2579,22 @@ function replayPendingPermissionRequests(
       ...(request.description ? { description: request.description } : {}),
     })
   }
+  return requests.map((request) => request.requestId)
+}
+
+function replayPendingComputerUsePermissionRequests(
+  ws: ServerWebSocket<WebSocketData>,
+  sessionId: string,
+): string[] {
+  const requests = computerUseApprovalService.getPendingRequests(sessionId)
+  for (const request of requests) {
+    sendMessage(ws, {
+      type: 'computer_use_permission_request',
+      requestId: request.requestId,
+      request,
+    })
+  }
+  return requests.map((request) => request.requestId)
 }
 
 function getDesktopSlashCommand(content: string): ReturnType<typeof parseSlashCommand> {
@@ -2271,6 +2764,13 @@ function extractGoalEvent(
   if (trimmed === 'No active goal.') {
     return { action: 'message', message: trimmed }
   }
+  if (trimmed.startsWith('Goal continuing:')) {
+    return {
+      action: 'status',
+      status: 'continuing',
+      message: trimmed,
+    }
+  }
 
   if (trimmed.startsWith('Goal set:')) {
     const objective = trimmed.slice('Goal set:'.length).trim()
@@ -2289,6 +2789,7 @@ function looksLikeGoalCommandOutput(output: string): boolean {
   const trimmed = output.trim()
   return (
     trimmed.startsWith('Goal set:') ||
+    trimmed.startsWith('Goal continuing:') ||
     trimmed.startsWith('Goal cleared:') ||
     trimmed === 'Goal cleared.' ||
     trimmed === 'Goal marked complete.' ||
@@ -2323,34 +2824,12 @@ function hasToolResultBlock(content: unknown): boolean {
       (block as { type?: unknown }).type === 'tool_result')
 }
 
-function isInternalCommandBreadcrumb(content: unknown): boolean {
-  const textBlocks = typeof content === 'string'
-    ? [content]
-    : Array.isArray(content)
-      ? content.flatMap((block) => {
-        if (!block || typeof block !== 'object') return []
-        const typedBlock = block as { type?: unknown; text?: unknown }
-        return typedBlock.type === 'text' && typeof typedBlock.text === 'string'
-          ? [typedBlock.text]
-          : []
-      })
-      : []
-
-  return textBlocks.length > 0 && textBlocks.every((text) => {
-    const trimmed = text.trim()
-    return (
-      trimmed.includes(`<${COMMAND_NAME_TAG}>`) ||
-      trimmed.includes(`<${COMMAND_MESSAGE_TAG}>`) ||
-      trimmed.includes(`<${COMMAND_ARGS_TAG}>`) ||
-      trimmed.includes(`<${LOCAL_COMMAND_CAVEAT_TAG}>`)
-    )
-  })
-}
-
 function extractReplayUserText(cliMsg: any): string | null {
   if (cliMsg?.isReplay !== true) return null
   const content = cliMsg.message?.content
-  if (isInternalCommandBreadcrumb(content)) return null
+  const commandDisplayText = getCommandMetadataDisplayText(content)
+  if (commandDisplayText) return commandDisplayText
+  if (shouldHideCommandMetadataContent(content)) return null
   if (isCompactSummaryMessageContent(content)) return null
   if (hasToolResultBlock(content)) return null
   if (extractLocalCommandOutput(content)) return null
@@ -2409,6 +2888,66 @@ function removeClientOutputCallback(ws: ServerWebSocket<WebSocketData>): void {
   clientOutputCallbacks.delete(ws)
 }
 
+function normalizeCliTaskNotification(cliMsg: any): SessionTaskNotification | null {
+  if (cliMsg?.type !== 'system' || cliMsg.subtype !== 'task_notification') return null
+  const toolUseId = typeof cliMsg.tool_use_id === 'string' && cliMsg.tool_use_id
+    ? cliMsg.tool_use_id
+    : null
+  const rawStatus = cliMsg.status
+  const status = rawStatus === 'killed' ? 'stopped' : rawStatus
+  if (
+    !toolUseId ||
+    (status !== 'completed' && status !== 'failed' && status !== 'stopped')
+  ) {
+    return null
+  }
+
+  const optionalString = (value: unknown) =>
+    typeof value === 'string' && value ? value : undefined
+  return {
+    taskId: optionalString(cliMsg.task_id) ?? toolUseId,
+    toolUseId,
+    status,
+    ...(optionalString(cliMsg.summary) ? { summary: optionalString(cliMsg.summary) } : {}),
+    ...(optionalString(cliMsg.result) ? { result: optionalString(cliMsg.result) } : {}),
+    ...(optionalString(cliMsg.output_file) ? { outputFile: optionalString(cliMsg.output_file) } : {}),
+    timestamp: optionalString(cliMsg.timestamp) ?? new Date().toISOString(),
+  }
+}
+
+function persistCliTaskNotification(
+  sessionId: string,
+  cliMsg: any,
+): Promise<void> | null {
+  const notification = normalizeCliTaskNotification(cliMsg)
+  if (!notification) return null
+
+  let sessionWrites = taskNotificationPersistence.get(sessionId)
+  if (!sessionWrites) {
+    sessionWrites = new Map()
+    taskNotificationPersistence.set(sessionId, sessionWrites)
+  }
+  const eventKey = typeof cliMsg.uuid === 'string' && cliMsg.uuid
+    ? cliMsg.uuid
+    : JSON.stringify(notification)
+  const existing = sessionWrites.get(eventKey)
+  if (existing) return existing
+
+  const write = sessionService.appendSessionTaskNotification(sessionId, notification)
+    .catch((error) => {
+      sessionWrites?.delete(eventKey)
+      console.warn(
+        `[WS] Failed to persist task notification for ${sessionId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      )
+    })
+  sessionWrites.set(eventKey, write)
+  return write
+}
+
+export const __persistCliTaskNotificationForTests = persistCliTaskNotification
+
 function bindAllClientSessionOutputs(
   sessionId: string,
   options?: {
@@ -2434,19 +2973,71 @@ function bindClientSessionOutput(
   removeClientOutputCallback(ws)
 
   const callback = (cliMsg: any) => {
+    trackCliBackgroundTaskLifecycle(sessionId, cliMsg)
     if (options?.shouldForward && !options.shouldForward(cliMsg)) {
       return
     }
 
-    const serverMsgs = translateCliMessage(cliMsg, sessionId)
-    for (const msg of serverMsgs) {
-      sendMessage(ws, msg)
+    const cliPermissionMode = getCliPermissionModeBroadcast(cliMsg)
+    if (
+      cliPermissionMode &&
+      conversationService.isPermissionModeChangePending(sessionId, cliPermissionMode)
+    ) {
+      return
     }
 
+    const forward = () => {
+      handleCliPermissionModeBroadcast(sessionId, cliMsg)
+      const serverMsgs = translateCliMessage(cliMsg, sessionId)
+      for (const msg of serverMsgs) {
+        sendMessage(ws, msg)
+      }
+    }
+
+    const persistence = persistCliTaskNotification(sessionId, cliMsg)
+    if (persistence) {
+      void persistence
+        .then(() => {
+          if (activeSessions.get(sessionId)?.has(ws)) forward()
+        })
+        .catch((error) => {
+          console.warn(
+            `[WS] Failed to forward persisted task notification for ${sessionId}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          )
+        })
+      return
+    }
+    forward()
   }
 
   clientOutputCallbacks.set(ws, { sessionId, callback })
   conversationService.onOutput(sessionId, callback)
+}
+
+function getCliPermissionModeBroadcast(cliMsg: any): PermissionMode | null {
+  if (
+    cliMsg?.type === 'system' &&
+    cliMsg.subtype === 'status' &&
+    isPermissionMode(cliMsg.permissionMode)
+  ) {
+    return cliMsg.permissionMode
+  }
+  return null
+}
+
+function handleCliPermissionModeBroadcast(sessionId: string, cliMsg: any): void {
+  const mode = getCliPermissionModeBroadcast(cliMsg)
+  if (!mode) return
+
+  const currentMode = conversationService.getSessionPermissionMode(sessionId)
+  if (currentMode === mode) return
+
+  if (!conversationService.recordSessionPermissionMode(sessionId, mode)) return
+  void persistSessionPermissionMode(sessionId, mode).catch((err) => {
+    console.warn(`[WS] Failed to persist CLI permission mode broadcast for ${sessionId}:`, err)
+  })
 }
 
 type RuntimeSettings = {
@@ -2457,12 +3048,59 @@ type RuntimeSettings = {
   providerId?: string | null
 }
 
+async function getDefaultOpenAIReasoningEffort(modelId: string): Promise<string> {
+  const catalog = await getOpenAICodexModelCatalog()
+  return getOpenAIModelCatalogEntry(modelId, catalog)?.defaultReasoningEffort ?? 'medium'
+}
+
+async function getGrokReasoningEfforts(modelId: string): Promise<{
+  modelId: string
+  defaultEffort?: string
+  supportedEfforts: string[]
+}> {
+  const tokens = await hahaGrokOAuthService.ensureFreshTokens()
+  const catalog = await getGrokModelCatalog({
+    ...(tokens?.accessToken ? { accessToken: tokens.accessToken } : {}),
+    accountKey: tokens?.email ?? (tokens ? 'authenticated-default' : 'logged-out'),
+  })
+  const model = catalog.find((entry) => entry.value === modelId)
+    ?? catalog.find((entry) => entry.value === GROK_DEFAULT_MAIN_MODEL)
+    ?? catalog[0]
+  return {
+    modelId: model?.value ?? GROK_DEFAULT_MAIN_MODEL,
+    ...(model?.reasoningEffort ? { defaultEffort: model.reasoningEffort } : {}),
+    supportedEfforts: model?.reasoningEfforts ?? [],
+  }
+}
+
+async function isRuntimeEffortSupported(
+  providerId: string | null | undefined,
+  modelId: string,
+  effort: string,
+): Promise<boolean> {
+  if (isGrokOfficialProviderId(providerId)) {
+    const { supportedEfforts } = await getGrokReasoningEfforts(modelId)
+    return supportedEfforts.includes(effort)
+  }
+  if (!isOpenAIOfficialProviderId(providerId)) {
+    return VALID_CLAUDE_EFFORT_LEVELS.has(effort)
+  }
+  if (!isOpenAIReasoningEffort(effort)) {
+    return false
+  }
+
+  const catalog = await getOpenAICodexModelCatalog()
+  const model = getOpenAIModelCatalogEntry(modelId, catalog)
+  return !model || model.supportedReasoningEfforts.includes(effort)
+}
+
 function isKnownRuntimeProviderId(
   providerId: string,
   providers: Array<{ id: string }>,
 ): boolean {
   return (
     isOpenAIOfficialProviderId(providerId) ||
+    isGrokOfficialProviderId(providerId) ||
     providers.some((provider) => provider.id === providerId)
   )
 }
@@ -2503,12 +3141,25 @@ async function getRuntimeSettings(sessionId?: string): Promise<RuntimeSettings> 
     }
 
     const userSettings = await settingsService.getUserSettings()
-    const thinking = resolveDesktopThinkingMode(userSettings)
+    const thinking = resolveDesktopThinkingMode(
+      userSettings,
+      runtimeOverride.providerId,
+    )
+    let effort = runtimeOverride.effort
+    if (isOpenAIOfficialProviderId(runtimeOverride.providerId)) {
+      effort = effort ?? await getDefaultOpenAIReasoningEffort(runtimeOverride.modelId)
+    } else if (isGrokOfficialProviderId(runtimeOverride.providerId)) {
+      const grokEffort = await getGrokReasoningEfforts(runtimeOverride.modelId)
+      runtimeOverride.modelId = grokEffort.modelId
+      effort = effort && grokEffort.supportedEfforts.includes(effort)
+        ? effort
+        : grokEffort.defaultEffort
+    }
 
     return {
       permissionMode: sessionPermissionMode ?? await settingsService.getPermissionMode().catch(() => undefined),
       model: runtimeOverride.modelId,
-      effort: runtimeOverride.effort,
+      effort,
       thinking,
       providerId: runtimeOverride.providerId,
     }
@@ -2525,6 +3176,21 @@ async function getRuntimeSettings(sessionId?: string): Promise<RuntimeSettings> 
 async function getSessionPermissionMode(sessionId: string): Promise<string | undefined> {
   const launchInfo = await sessionService.getSessionLaunchInfo(sessionId).catch(() => null)
   return launchInfo?.permissionMode
+}
+
+
+function pickEffortLevel(
+  settings: Record<string, unknown> | undefined | null,
+): string | undefined {
+  if (!settings) return undefined
+  for (const key of ['effort', 'effortLevel'] as const) {
+    const value = settings[key]
+    if (typeof value === 'string') {
+      const level = value.trim()
+      if (VALID_EFFORT_LEVELS.has(level)) return level
+    }
+  }
+  return undefined
 }
 
 async function getDefaultRuntimeSettings(): Promise<RuntimeSettings> {
@@ -2546,11 +3212,11 @@ async function getDefaultRuntimeSettings(): Promise<RuntimeSettings> {
     typeof modelSettings.modelContext === 'string' && modelSettings.modelContext.trim()
       ? modelSettings.modelContext
       : undefined
-  const effort =
-    typeof userSettings.effort === 'string' && userSettings.effort.trim()
-      ? userSettings.effort
-      : undefined
-  const thinking = resolveDesktopThinkingMode(userSettings)
+  let effort =
+    pickEffortLevel(providerSettings) ??
+    pickEffortLevel(userSettings) ??
+    'max'
+  const thinking = resolveDesktopThinkingMode(userSettings, resolvedActiveId)
 
   let model: string | undefined
   if (resolvedActiveId) {
@@ -2563,6 +3229,13 @@ async function getDefaultRuntimeSettings(): Promise<RuntimeSettings> {
     if (baseModel) {
       model = baseModel
       if (modelContext) model += `:${modelContext}`
+    }
+    if (isOpenAIOfficialProviderId(resolvedActiveId)) {
+      model = model || OPENAI_DEFAULT_MAIN_MODEL
+      effort = await getDefaultOpenAIReasoningEffort(model)
+    } else if (isGrokOfficialProviderId(resolvedActiveId)) {
+      model = model || GROK_DEFAULT_MAIN_MODEL
+      effort = (await getGrokReasoningEfforts(model)).defaultEffort
     }
   } else {
     // No provider — pass model normally
@@ -2584,7 +3257,9 @@ async function getDefaultRuntimeSettings(): Promise<RuntimeSettings> {
 
 function resolveDesktopThinkingMode(
   settings: Record<string, unknown>,
+  providerId?: string | null,
 ): 'disabled' | undefined {
+  if (isOpenAIOfficialProviderId(providerId)) return undefined
   return settings.alwaysThinkingEnabled === false ? 'disabled' : undefined
 }
 
@@ -2680,6 +3355,7 @@ async function waitForRuntimeTransitionBeforeUserTurn(
         code: 'CLI_RESTART_FAILED',
       })
       sendMessage(ws, { type: 'status', state: 'idle' })
+      failSessionChatActivity(sessionId)
       return { ok: false, waited }
     }
 
@@ -2699,9 +3375,8 @@ async function waitForRuntimeTransitionBeforeUserTurn(
 export function sendToSession(sessionId: string, message: ServerMessage): boolean {
   const clients = activeSessions.get(sessionId)
   if (!clients || clients.size === 0) return false
-  const payload = JSON.stringify(message)
   for (const ws of clients) {
-    ws.send(payload)
+    sendMessage(ws, message)
   }
   return true
 }
@@ -2770,6 +3445,7 @@ export function closeSessionConnection(sessionId: string, reason = 'session clos
 
   activeSessions.delete(sessionId)
   for (const ws of clients) {
+    if (activePetClient === ws) activePetClient = null
     clientOutputCallbacks.delete(ws)
     ws.close(1000, reason)
   }
@@ -2785,12 +3461,20 @@ export function __resetWebSocketHandlerStateForTests(): void {
   for (const timer of prewarmIdleTimers.values()) clearTimeout(timer)
   for (const remove of sessionDisconnectWatchers.values()) remove()
   activeSessions.clear()
+  activePetClient = null
   clientOutputCallbacks.clear()
+  taskNotificationPersistence.clear()
   sessionCleanupTimers.clear()
   sessionDisconnectWatchers.clear()
   prewarmPendingSessions.clear()
   prewarmedSessions.clear()
   prewarmIdleTimers.clear()
+  activeUserTurns.clear()
+  activeBackgroundTaskIds.clear()
+  sessionStopRequested.clear()
+  terminalSessionChatStates.clear()
+  legacyQueuedSessionChats.clear()
+  interruptedSessionChats.clear()
 }
 
 export function __markPrewarmPendingForTests(sessionId: string): void {
@@ -2799,15 +3483,28 @@ export function __markPrewarmPendingForTests(sessionId: string): void {
 
 /** Test hook: mark a session as mid-turn so disconnect keeps the CLI alive. */
 export function __markActiveTurnForTests(sessionId: string): void {
+  beginSessionChatActivity(sessionId)
   activeUserTurns.set(sessionId, { messageSent: true })
 }
 
 /**
  * Test hook: register a user turn still in the pre-send (messageSent:false)
- * window — i.e. the CLI-startup window that isSessionTurnActive is blind to.
+ * window — i.e. the CLI-startup window before messageSent becomes true.
  */
 export function __registerPendingUserTurnForTests(sessionId: string): void {
+  beginSessionChatActivity(sessionId)
   activeUserTurns.set(sessionId, { messageSent: false })
+}
+
+/** Test hook: settle a registered turn through the same CLI-result seam. */
+export function __settleActiveTurnForTests(sessionId: string, cliMsg: any): void {
+  settleSessionChatActivity(sessionId, cliMsg)
+  activeUserTurns.delete(sessionId)
+}
+
+/** Test hook: simulate CLI startup completing after the last client left. */
+export function __refreshDisconnectedTurnCleanupWatcherForTests(sessionId: string): void {
+  refreshDisconnectedTurnCleanupWatcher(sessionId)
 }
 
 /** Test hook: arm the prewarm idle timer for a session, as markPrewarmed does. */

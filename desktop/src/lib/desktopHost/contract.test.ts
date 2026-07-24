@@ -23,12 +23,33 @@ describe('desktop host contract', () => {
 
   it('rejects desktop-only browser calls with actionable errors', async () => {
     await expect(browserHost.runtime.getServerUrl()).rejects.toThrow('desktop app runtime')
+    await expect(browserHost.runtime.getLocalAccessToken()).rejects.toThrow('desktop app runtime')
     await expect(browserHost.dialogs.open({ directory: true })).rejects.toThrow('desktop app runtime')
     await expect(browserHost.shell.openPath('/tmp/report.md')).rejects.toThrow('desktop app runtime')
     await expect(browserHost.terminal.spawn({ cwd: '/tmp', cols: 80, rows: 24 })).rejects.toThrow(
       'desktop app runtime',
     )
     await expect(browserHost.updates.check()).resolves.toBeNull()
+    await expect(browserHost.pets.list()).rejects.toThrow('desktop app runtime')
+    await expect(browserHost.pets.createFromImage({
+      slug: 'moon-cat',
+      displayName: 'Moon Cat',
+      description: 'A quiet companion.',
+    })).rejects.toThrow('desktop app runtime')
+    await expect(browserHost.pets.createFromAtlas({
+      slug: 'moon-cat',
+      displayName: 'Moon Cat',
+      description: 'A quiet companion.',
+    })).rejects.toThrow('desktop app runtime')
+    await expect(browserHost.pets.openFolder()).rejects.toThrow('desktop app runtime')
+    await expect(browserHost.pets.show()).rejects.toThrow('desktop app runtime')
+    await expect(browserHost.pets.hide()).rejects.toThrow('desktop app runtime')
+    await expect(browserHost.pets.showContextMenu('Close pet')).rejects.toThrow('desktop app runtime')
+    await expect(browserHost.pets.dragWindow({ phase: 'start', x: 100, y: 100 })).rejects.toThrow('desktop app runtime')
+    await expect(browserHost.pets.setIgnoreMouseEvents(true)).rejects.toThrow('desktop app runtime')
+    await expect(browserHost.pets.setInteractiveRegions([{ x: 0, y: 0, width: 10, height: 10 }])).rejects.toThrow('desktop app runtime')
+    await expect(browserHost.pets.focusSession('session-1')).rejects.toThrow('desktop app runtime')
+    await expect(browserHost.pets.onNavigateSession(vi.fn())).resolves.toEqual(expect.any(Function))
   })
 
   it('detects the browser fallback when native host globals are absent', () => {

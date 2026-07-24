@@ -18,6 +18,8 @@ import { handleHahaOpenAIOAuthCallback } from './api/haha-openai-oauth.js'
 import { handlePreviewFs } from './api/previewFs.js'
 import { handleLocalFile } from './api/localFile.js'
 import { sessionService } from './services/sessionService.js'
+import { localIndexCoordinator } from './services/localIndex/coordinator.js'
+import { searchContentCoordinator } from './services/localIndex/searchContentCoordinator.js'
 import { conversationService } from './services/conversationService.js'
 import { OPENAI_CODEX_REDIRECT_PATH } from '../services/openaiAuth/client.js'
 import { ensureDesktopCliLauncherInstalled } from './services/desktopCliLauncherService.js'
@@ -28,6 +30,18 @@ import { handleStaticH5Request } from './staticH5.js'
 import { classifyH5Request, shouldBlockDisabledH5Access, shouldRequireH5Token } from './h5AccessPolicy.js'
 import { H5AccessService } from './services/h5AccessService.js'
 import { refreshDisconnectGraceMs } from './ws/disconnectGraceConfig.js'
+import {
+  hasConfiguredLocalAccessToken,
+  hasConfiguredPetAccessToken,
+  isLocalAccessAuthorized,
+  isPetAccessAuthorized,
+} from './localAccessAuth.js'
+import {
+  getPetScopedSessionId,
+  isPetHttpRequestAllowed,
+  isPetSessionInProjection,
+  PET_SESSION_LIMIT,
+} from './petAccessPolicy.js'
 
 function readArgValue(flag: string): string | undefined {
   const args = process.argv.slice(2)
@@ -57,6 +71,61 @@ function resolveServerOptions() {
 const SERVER_OPTIONS = resolveServerOptions()
 const PORT = SERVER_OPTIONS.port
 const HOST = SERVER_OPTIONS.host
+const SEARCH_INDEX_PRIMARY_WAIT_MS = 30_000
+const SEARCH_INDEX_PRIMARY_POLL_MS = 50
+
+type BackgroundIndexStartupOptions = {
+  startPrimary?: () => Promise<void>
+  getPrimaryState?: () => string
+  startSearch?: () => Promise<void>
+  wait?: () => Promise<void>
+  now?: () => number
+  maxPrimaryWaitMs?: number
+  signal?: AbortSignal
+}
+
+/** Give the session-list projection first access to cold-start I/O. */
+export async function startBackgroundIndexesInPriorityOrder(
+  options: BackgroundIndexStartupOptions = {},
+): Promise<void> {
+  const startPrimary = options.startPrimary ?? (() => localIndexCoordinator.start())
+  const getPrimaryState = options.getPrimaryState ?? (
+    () => localIndexCoordinator.getPublicStatus().state
+  )
+  const startSearch = options.startSearch ?? (() => searchContentCoordinator.start())
+  const wait = options.wait ?? (
+    () => new Promise<void>(resolve => setTimeout(resolve, SEARCH_INDEX_PRIMARY_POLL_MS))
+  )
+  const now = options.now ?? Date.now
+  const deadline = now() + Math.max(
+    0,
+    options.maxPrimaryWaitMs ?? SEARCH_INDEX_PRIMARY_WAIT_MS,
+  )
+
+  await startPrimary()
+  while (
+    !options.signal?.aborted &&
+    getPrimaryState() === 'building' &&
+    now() < deadline
+  ) await wait()
+  if (!options.signal?.aborted) await startSearch()
+}
+
+let backgroundIndexStartupController: AbortController | undefined
+let backgroundIndexStartup: Promise<void> | undefined
+
+function beginBackgroundIndexStartup(): void {
+  backgroundIndexStartupController?.abort()
+  const controller = new AbortController()
+  backgroundIndexStartupController = controller
+  const operation = startBackgroundIndexesInPriorityOrder({
+    signal: controller.signal,
+  }).catch(() => undefined)
+  backgroundIndexStartup = operation
+  void operation.finally(() => {
+    if (backgroundIndexStartup === operation) backgroundIndexStartup = undefined
+  })
+}
 
 function withCors(response: Response, cors: CorsResolution): Response {
   const headers = new Headers(response.headers)
@@ -164,7 +233,54 @@ export function startServer(port = PORT, host = HOST) {
         const url = new URL(req.url)
         const origin = req.headers.get('Origin')
         const clientAddress = server.requestIP(req)?.address ?? null
-        const h5RequestContext = { clientAddress }
+        const localTokenOverride = url.searchParams.get('localToken') ?? url.searchParams.get('token')
+        // Browser WebSockets cannot set Authorization headers. Keep the pet
+        // query-token exception scoped to /ws; REST pet access remains bearer-only.
+        const petTokenOverride = url.pathname.startsWith('/ws/')
+          ? url.searchParams.get('token')
+          : null
+        const petAccessAuthorized = isPetAccessAuthorized(req, petTokenOverride)
+        if (petAccessAuthorized && !isPetHttpRequestAllowed(req, url)) {
+          return Response.json(
+            {
+              error: 'Forbidden',
+              message: 'The pet token cannot access this capability.',
+            },
+            { status: 403 },
+          )
+        }
+        const petScopedSessionId = petAccessAuthorized
+          ? getPetScopedSessionId(url.pathname)
+          : null
+        if (petScopedSessionId) {
+          const projection = await sessionService.listSessions({
+            limit: PET_SESSION_LIMIT,
+            offset: 0,
+          })
+          if (!isPetSessionInProjection(petScopedSessionId, projection.sessions)) {
+            return Response.json(
+              {
+                error: 'Forbidden',
+                message: 'The pet token cannot access this session.',
+              },
+              { status: 403 },
+            )
+          }
+        }
+        const sdkSessionId = url.pathname.startsWith('/sdk/')
+          ? url.pathname.split('/').pop() || ''
+          : ''
+        const sdkToken = url.searchParams.get('token')
+        const h5RequestContext = {
+          clientAddress,
+          localAccessTokenConfigured:
+            hasConfiguredLocalAccessToken() || hasConfiguredPetAccessToken(),
+          localAccessAuthorized:
+            isLocalAccessAuthorized(req, localTokenOverride) || petAccessAuthorized,
+          internalSdkAuthorized: Boolean(
+            sdkSessionId && sdkToken && conversationService.authorizeSdkConnection(sdkSessionId, sdkToken),
+          ),
+        }
         const h5Settings = await h5AccessService.getSettings()
         const h5PublicOrigin = originFromUrl(h5Settings.publicBaseUrl)
         const cors = await resolveCors(origin, url.origin, {
@@ -211,12 +327,12 @@ export function startServer(port = PORT, host = HOST) {
           }
 
           // Enforce authentication when required
-          if (authRequired) {
+          if (!petAccessAuthorized && authRequired) {
             const authError = await requireH5Token(req, url.searchParams.get('token'))
             if (authError) {
               return withCors(authError, cors)
             }
-          } else if (forceAuth) {
+          } else if (!petAccessAuthorized && forceAuth) {
             const authError = await requireAuth(req, url.searchParams.get('token'))
             if (authError) {
               return withCors(authError, cors)
@@ -233,6 +349,7 @@ export function startServer(port = PORT, host = HOST) {
               sessionId,
               connectedAt: Date.now(),
               channel: 'client',
+              clientKind: petAccessAuthorized ? 'pet' : 'full',
               sdkToken: null,
               serverPort,
               serverHost: localConnectHost,
@@ -268,6 +385,7 @@ export function startServer(port = PORT, host = HOST) {
               sessionId,
               connectedAt: Date.now(),
               channel: 'sdk',
+              clientKind: 'full',
               sdkToken: url.searchParams.get('token'),
               serverPort,
               serverHost: localConnectHost,
@@ -348,12 +466,12 @@ export function startServer(port = PORT, host = HOST) {
           }
 
           // Enforce authentication when required
-          if (authRequired) {
+          if (!petAccessAuthorized && authRequired) {
             const authError = await requireH5Token(req)
             if (authError) {
               return withCors(authError, cors)
             }
-          } else if (forceAuth) {
+          } else if (!petAccessAuthorized && forceAuth) {
             const authError = await requireAuth(req)
             if (authError) {
               return withCors(authError, cors)
@@ -446,6 +564,11 @@ export function startServer(port = PORT, host = HOST) {
     throw new Error(message, { cause: error })
   }
 
+  // Bun.serve is already accepting requests. Both projections remain
+  // background work; session-list metadata gets priority on a cold start so
+  // full-text backfill cannot make the sidebar slower on low-memory machines.
+  beginBackgroundIndexStartup()
+
   // Start watching ~/.claude/teams/ for real-time WebSocket push
   teamWatcher.start()
 
@@ -472,6 +595,13 @@ export async function stopServerRuntimeForShutdown(
 ): Promise<void> {
   teamWatcher.stop()
   cronScheduler.stop()
+  backgroundIndexStartupController?.abort()
+  const pendingIndexStartup = backgroundIndexStartup
+  await Promise.all([
+    localIndexCoordinator.stop(),
+    searchContentCoordinator.stop(),
+    pendingIndexStartup,
+  ])
 
   const active = conversationService.getActiveSessions()
   if (active.length > 0) {

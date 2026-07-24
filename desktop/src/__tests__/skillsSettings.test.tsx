@@ -21,9 +21,7 @@ vi.mock('../stores/providerStore', () => ({
     activeId: null,
     presets: [],
     isLoading: false,
-    isPresetsLoading: false,
     fetchProviders: vi.fn(),
-    fetchPresets: vi.fn(),
     deleteProvider: vi.fn(),
     activateProvider: vi.fn(),
     activateOfficial: vi.fn(),
@@ -84,7 +82,7 @@ describe('Settings > Skills tab', () => {
       error: null,
     })
     useTabStore.setState({ tabs: [], activeTabId: null })
-    useUIStore.setState({ pendingSettingsTab: null })
+    useUIStore.setState({ activeSettingsTab: 'providers', pendingSettingsTab: null })
     useSkillStore.setState({
       skills: [],
       selectedSkill: null,
@@ -253,10 +251,10 @@ describe('Settings > Skills tab', () => {
     render(<Settings />)
     switchToSkillsTab()
 
-    expect(screen.getByText('Skill metadata')).toBeInTheDocument()
-    expect(screen.getByText('/slash')).toBeInTheDocument()
-    expect(screen.getByText('Frontmatter description')).toBeInTheDocument()
+    expect(screen.getByText('Alpha Skill')).toBeInTheDocument()
+    expect(screen.getByText('First skill description')).toBeInTheDocument()
     expect(screen.getByText('Read, Edit')).toBeInTheDocument()
+    expect(screen.getByText('sonnet')).toBeInTheDocument()
     expect(screen.getByText('Hello')).toBeInTheDocument()
     expect(screen.queryByText(/^---$/)).not.toBeInTheDocument()
   })

@@ -21,6 +21,7 @@ import {
   getSettingSourceDisplayNameLowercase,
   SETTING_SOURCES,
 } from '../settings/constants.js'
+import { getAutoModeConfig } from '../settings/settings.js'
 import { plural } from '../stringUtils.js'
 import { permissionModeTitle } from './PermissionMode.js'
 import type {
@@ -70,7 +71,6 @@ import {
   getTotalInputTokens,
   getTotalOutputTokens,
 } from '../../bootstrap/state.js'
-import { getFeatureValue_CACHED_WITH_REFRESH } from '../../services/analytics/growthbook.js'
 import {
   type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
   logEvent,
@@ -103,8 +103,6 @@ import {
   classifyYoloAction,
   formatActionForClassifier,
 } from './yoloClassifier.js'
-
-const CLASSIFIER_FAIL_CLOSED_REFRESH_MS = 30 * 60 * 1000 // 30 minutes
 
 const PERMISSION_RULE_SOURCES = [
   ...SETTING_SOURCES,
@@ -227,6 +225,16 @@ export function getAskRules(context: ToolPermissionContext): PermissionRule[] {
       ruleBehavior: 'ask',
       ruleValue: permissionRuleValueFromString(ruleString),
     })),
+  )
+}
+
+function shouldBypassToolPermissions(
+  toolPermissionContext: ToolPermissionContext,
+): boolean {
+  return (
+    toolPermissionContext.mode === 'bypassPermissions' ||
+    (toolPermissionContext.mode === 'plan' &&
+      toolPermissionContext.isBypassPermissionsModeAvailable)
   )
 }
 
@@ -477,7 +485,33 @@ export const hasPermissionsToUseTool: CanUseToolFn = async (
   assistantMessage,
   toolUseID,
 ): Promise<PermissionDecision> => {
-  const result = await hasPermissionsToUseToolInner(tool, input, context)
+  let result = await hasPermissionsToUseToolInner(tool, input, context)
+  const currentPermissionContext =
+    context.getAppState().toolPermissionContext
+  let autoModeActive = false
+  if (feature('TRANSCRIPT_CLASSIFIER')) {
+    autoModeActive =
+      currentPermissionContext.mode === 'auto' ||
+      (currentPermissionContext.mode === 'plan' &&
+        (autoModeStateModule?.isAutoModeActive() ?? false))
+  }
+  const forceShellClassifier =
+    autoModeActive &&
+    getAutoModeConfig()?.classifyAllShell === true &&
+    (tool.name === BASH_TOOL_NAME || tool.name === POWERSHELL_TOOL_NAME)
+  let classifierInput = input
+
+  // Entry-time rule stripping is defense in depth. This runtime conversion is
+  // the final guard for policy, flag, session, and dynamic shell allows added
+  // after Auto mode starts.
+  if (forceShellClassifier && result.behavior === 'allow') {
+    classifierInput = getUpdatedInputOrFallback(result, input)
+    result = {
+      behavior: 'ask',
+      message: createPermissionRequestMessage(tool.name),
+      decisionReason: result.decisionReason,
+    }
+  }
 
 
   // Reset consecutive denials on any allowed tool use in auto mode.
@@ -571,7 +605,8 @@ export const hasPermissionsToUseTool: CanUseToolFn = async (
       // prefix rules for ant users and auto mode entry.
       if (
         tool.name === POWERSHELL_TOOL_NAME &&
-        !feature('POWERSHELL_AUTO_MODE')
+        !feature('POWERSHELL_AUTO_MODE') &&
+        !forceShellClassifier
       ) {
         if (appState.toolPermissionContext.shouldAvoidPermissionPrompts) {
           return {
@@ -600,10 +635,11 @@ export const hasPermissionsToUseTool: CanUseToolFn = async (
       if (
         result.behavior === 'ask' &&
         tool.name !== AGENT_TOOL_NAME &&
-        tool.name !== REPL_TOOL_NAME
+        tool.name !== REPL_TOOL_NAME &&
+        !forceShellClassifier
       ) {
         try {
-          const parsedInput = tool.inputSchema.parse(input)
+          const parsedInput = tool.inputSchema.parse(classifierInput)
           const acceptEditsResult = await tool.checkPermissions(parsedInput, {
             ...context,
             getAppState: () => {
@@ -677,7 +713,7 @@ export const hasPermissionsToUseTool: CanUseToolFn = async (
         })
         return {
           behavior: 'allow',
-          updatedInput: input,
+          updatedInput: classifierInput,
           decisionReason: {
             type: 'mode',
             mode: 'auto',
@@ -686,7 +722,7 @@ export const hasPermissionsToUseTool: CanUseToolFn = async (
       }
 
       // Run the auto mode classifier
-      const action = formatActionForClassifier(tool.name, input)
+      const action = formatActionForClassifier(tool.name, classifierInput)
       setClassifierChecking(toolUseID)
       let classifierResult
       try {
@@ -841,15 +877,9 @@ export const hasPermissionsToUseTool: CanUseToolFn = async (
           }
         }
         // When classifier is unavailable (API error), behavior depends on
-        // the tengu_iron_gate_closed gate.
+        // whether an interactive approval path exists.
         if (classifierResult.unavailable) {
-          if (
-            getFeatureValue_CACHED_WITH_REFRESH(
-              'tengu_iron_gate_closed',
-              true,
-              CLASSIFIER_FAIL_CLOSED_REFRESH_MS,
-            )
-          ) {
+          if (appState.toolPermissionContext.shouldAvoidPermissionPrompts) {
             logForDebugging(
               'Auto mode classifier unavailable, denying with retry guidance (fail closed)',
               { level: 'warn' },
@@ -867,7 +897,8 @@ export const hasPermissionsToUseTool: CanUseToolFn = async (
               ),
             }
           }
-          // Fail open: fall back to normal permission handling
+          // Interactive sessions retain the exact original ask decision so
+          // the existing permission prompt remains authoritative.
           logForDebugging(
             'Auto mode classifier unavailable, falling back to normal permission handling (fail open)',
             { level: 'warn' },
@@ -917,7 +948,7 @@ export const hasPermissionsToUseTool: CanUseToolFn = async (
 
       return {
         behavior: 'allow',
-        updatedInput: input,
+        updatedInput: classifierInput,
         decisionReason: {
           type: 'classifier',
           classifier: 'auto-mode',
@@ -1058,11 +1089,11 @@ function handleDenialLimitExceeded(
 }
 
 /**
- * Check only the rule-based steps of the permission pipeline — the subset
- * that bypassPermissions mode respects (everything that fires before step 2a).
+ * Check only the rule-based steps of the permission pipeline.
  *
  * Returns a deny/ask decision if a rule blocks the tool, or null if no rule
- * objects. Unlike hasPermissionsToUseTool, this does NOT run the auto mode classifier,
+ * objects. In bypassPermissions mode, ask decisions are ignored but denies are
+ * still enforced. Unlike hasPermissionsToUseTool, this does NOT run the auto mode classifier,
  * mode-based transformations (dontAsk/auto/asyncAgent), PermissionRequest hooks,
  * or bypassPermissions / always-allowed checks.
  *
@@ -1074,6 +1105,9 @@ export async function checkRuleBasedPermissions(
   context: ToolUseContext,
 ): Promise<PermissionAskDecision | PermissionDenyDecision | null> {
   const appState = context.getAppState()
+  const shouldBypassPermissions = shouldBypassToolPermissions(
+    appState.toolPermissionContext,
+  )
 
   // 1a. Entire tool is denied by rule
   const denyRule = getDenyRuleForTool(appState.toolPermissionContext, tool)
@@ -1090,7 +1124,7 @@ export async function checkRuleBasedPermissions(
 
   // 1b. Entire tool has an ask rule
   const askRule = getAskRuleForTool(appState.toolPermissionContext, tool)
-  if (askRule) {
+  if (askRule && !shouldBypassPermissions) {
     const canSandboxAutoAllow =
       tool.name === BASH_TOOL_NAME &&
       SandboxManager.isSandboxingEnabled() &&
@@ -1134,6 +1168,7 @@ export async function checkRuleBasedPermissions(
   // 1f. Content-specific ask rules from tool.checkPermissions
   // (e.g. Bash(npm publish:*) → {ask, type:'rule', ruleBehavior:'ask'})
   if (
+    !shouldBypassPermissions &&
     toolPermissionResult?.behavior === 'ask' &&
     toolPermissionResult.decisionReason?.type === 'rule' &&
     toolPermissionResult.decisionReason.rule.ruleBehavior === 'ask'
@@ -1141,10 +1176,12 @@ export async function checkRuleBasedPermissions(
     return toolPermissionResult
   }
 
-  // 1g. Safety checks (e.g. .git/, .claude/, .vscode/, shell configs) are
-  // bypass-immune — they must prompt even when a PreToolUse hook returned
-  // allow. checkPathSafetyForAutoEdit returns {type:'safetyCheck'} for these.
+  // 1g. Safety checks (e.g. .git/, .claude/, .vscode/, shell configs) prompt in
+  // normal modes. Bypass mode means the user already opted into unattended
+  // execution. checkPathSafetyForAutoEdit returns {type:'safetyCheck'} for these
+  // paths.
   if (
+    !shouldBypassPermissions &&
     toolPermissionResult?.behavior === 'ask' &&
     toolPermissionResult.decisionReason?.type === 'safetyCheck'
   ) {
@@ -1165,6 +1202,9 @@ async function hasPermissionsToUseToolInner(
   }
 
   let appState = context.getAppState()
+  let shouldBypassPermissions = shouldBypassToolPermissions(
+    appState.toolPermissionContext,
+  )
 
   // 1. Check if the tool is denied
   // 1a. Entire tool is denied
@@ -1182,7 +1222,7 @@ async function hasPermissionsToUseToolInner(
 
   // 1b. Check if the entire tool should always ask for permission
   const askRule = getAskRuleForTool(appState.toolPermissionContext, tool)
-  if (askRule) {
+  if (askRule && !shouldBypassPermissions) {
     // When autoAllowBashIfSandboxed is on, sandboxed commands skip the ask rule and
     // auto-allow via Bash's checkPermissions. Commands that won't be sandboxed (excluded
     // commands, dangerouslyDisableSandbox) still need to respect the ask rule.
@@ -1235,13 +1275,14 @@ async function hasPermissionsToUseToolInner(
     return toolPermissionResult
   }
 
-  // 1f. Content-specific ask rules from tool.checkPermissions take precedence
-  // over bypassPermissions mode. When a user explicitly configures a
+  // 1f. Content-specific ask rules from tool.checkPermissions are honored in
+  // normal modes. When a user explicitly configures a
   // content-specific ask rule (e.g. Bash(npm publish:*)), the tool's
   // checkPermissions returns {behavior:'ask', decisionReason:{type:'rule',
-  // rule:{ruleBehavior:'ask'}}}. This must be respected even in bypass mode,
-  // just as deny rules are respected at step 1d.
+  // rule:{ruleBehavior:'ask'}}}. Bypass mode ignores ask decisions while still
+  // preserving deny rules at step 1d.
   if (
+    !shouldBypassPermissions &&
     toolPermissionResult?.behavior === 'ask' &&
     toolPermissionResult.decisionReason?.type === 'rule' &&
     toolPermissionResult.decisionReason.rule.ruleBehavior === 'ask'
@@ -1249,10 +1290,12 @@ async function hasPermissionsToUseToolInner(
     return toolPermissionResult
   }
 
-  // 1g. Safety checks (e.g. .git/, .claude/, .vscode/, shell configs) are
-  // bypass-immune — they must prompt even in bypassPermissions mode.
-  // checkPathSafetyForAutoEdit returns {type:'safetyCheck'} for these paths.
+  // 1g. Safety checks (e.g. .git/, .claude/, .vscode/, shell configs) prompt in
+  // normal modes. Bypass mode means the user already opted into unattended
+  // execution. checkPathSafetyForAutoEdit returns {type:'safetyCheck'} for these
+  // paths.
   if (
+    !shouldBypassPermissions &&
     toolPermissionResult?.behavior === 'ask' &&
     toolPermissionResult.decisionReason?.type === 'safetyCheck'
   ) {
@@ -1262,13 +1305,9 @@ async function hasPermissionsToUseToolInner(
   // 2a. Check if mode allows the tool to run
   // IMPORTANT: Call getAppState() to get the latest value
   appState = context.getAppState()
-  // Check if permissions should be bypassed:
-  // - Direct bypassPermissions mode
-  // - Plan mode when the user originally started with bypass mode (isBypassPermissionsModeAvailable)
-  const shouldBypassPermissions =
-    appState.toolPermissionContext.mode === 'bypassPermissions' ||
-    (appState.toolPermissionContext.mode === 'plan' &&
-      appState.toolPermissionContext.isBypassPermissionsModeAvailable)
+  shouldBypassPermissions = shouldBypassToolPermissions(
+    appState.toolPermissionContext,
+  )
   if (shouldBypassPermissions) {
     return {
       behavior: 'allow',
@@ -1450,19 +1489,16 @@ export function syncPermissionRulesFromDisk(
   // would leave the old rule in the context because convertRulesToUpdates
   // only generates replaceRules for source:behavior pairs that have rules —
   // an empty group produces no update, so stale rules persist.
-  const diskSources: PermissionUpdateDestination[] = [
-    'userSettings',
-    'projectSettings',
-    'localSettings',
-  ]
-  for (const diskSource of diskSources) {
-    for (const behavior of ['allow', 'deny', 'ask'] as PermissionBehavior[]) {
-      context = applyPermissionUpdate(context, {
-        type: 'replaceRules',
-        rules: [],
-        behavior,
-        destination: diskSource,
-      })
+  // Clear every synchronized settings source in memory, including immutable
+  // flag and policy sources. This does not write settings; the fresh snapshot
+  // below repopulates the currently enabled sources. Session/CLI rules remain
+  // untouched unless managed-only mode explicitly clears them above.
+  for (const source of SETTING_SOURCES) {
+    context = {
+      ...context,
+      alwaysAllowRules: { ...context.alwaysAllowRules, [source]: [] },
+      alwaysDenyRules: { ...context.alwaysDenyRules, [source]: [] },
+      alwaysAskRules: { ...context.alwaysAskRules, [source]: [] },
     }
   }
 

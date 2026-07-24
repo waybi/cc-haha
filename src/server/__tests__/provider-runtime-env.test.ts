@@ -7,8 +7,12 @@ import {
   mergeActiveProviderManagedEnv,
   readActiveProviderManagedEnv,
 } from '../services/providerRuntimeEnv.js'
+import { resolveAppliedEffort } from '../../utils/effort.js'
+import { get3PModelCapabilityOverride } from '../../utils/model/modelSupportOverrides.js'
 
 let tmpDir: string
+let originalConfigDir: string | undefined
+let originalHome: string | undefined
 
 async function writeJson(filePath: string, value: unknown): Promise<void> {
   await fs.mkdir(path.dirname(filePath), { recursive: true })
@@ -18,10 +22,50 @@ async function writeJson(filePath: string, value: unknown): Promise<void> {
 describe('providerRuntimeEnv', () => {
   beforeEach(async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'provider-runtime-env-'))
+    originalConfigDir = process.env.CLAUDE_CONFIG_DIR
+    originalHome = process.env.HOME
+    process.env.CLAUDE_CONFIG_DIR = tmpDir
+    process.env.HOME = tmpDir
   })
 
   afterEach(async () => {
+    if (originalConfigDir !== undefined) process.env.CLAUDE_CONFIG_DIR = originalConfigDir
+    else delete process.env.CLAUDE_CONFIG_DIR
+    if (originalHome !== undefined) process.env.HOME = originalHome
+    else delete process.env.HOME
     await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  test('normalizes and preserves Grok Official as the active runtime provider', async () => {
+    await writeJson(path.join(tmpDir, 'cc-haha', 'providers.json'), {
+      activeId: 'grok-official',
+      providers: [],
+      providerOrder: ['claude-official', 'openai-official'],
+    })
+
+    const env = mergeActiveProviderManagedEnv(
+      {
+        CC_HAHA_OPENAI_OAUTH_PROVIDER: '1',
+        OPENAI_CODEX_OAUTH_FILE: path.join(tmpDir, 'stale-openai-oauth.json'),
+        ANTHROPIC_MODEL: 'stale-openai-model',
+        DISABLE_AUTOUPDATER: '1',
+      },
+      tmpDir,
+    )
+
+    expect(env).toMatchObject({
+      CC_HAHA_GROK_OAUTH_PROVIDER: '1',
+      GROK_OAUTH_FILE: path.join(tmpDir, 'cc-haha', 'grok-oauth.json'),
+      ANTHROPIC_MODEL: 'grok-4.5',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'grok-4.5',
+      ANTHROPIC_DEFAULT_SONNET_MODEL: 'grok-4.5',
+      ANTHROPIC_DEFAULT_OPUS_MODEL: 'grok-4.5',
+      DISABLE_AUTOUPDATER: '1',
+    })
+    expect(env.CC_HAHA_OPENAI_OAUTH_PROVIDER).toBeUndefined()
+    expect(env.OPENAI_CODEX_OAUTH_FILE).toBeUndefined()
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined()
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
   })
 
   test('derives native Anthropic provider env from the active provider index', async () => {
@@ -55,9 +99,43 @@ describe('providerRuntimeEnv', () => {
       ENABLE_TOOL_SEARCH: 'true',
       ANTHROPIC_MODEL: 'active-main',
       ANTHROPIC_DEFAULT_HAIKU_MODEL: 'active-main',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES:
+        'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
       ANTHROPIC_DEFAULT_SONNET_MODEL: 'active-sonnet',
+      ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES:
+        'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
       ANTHROPIC_DEFAULT_OPUS_MODEL: 'active-main',
+      ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES:
+        'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
     })
+
+    const runtimeKeys = [
+      'ANTHROPIC_BASE_URL',
+      'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+      'ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES',
+      'CLAUDE_CODE_EFFORT_LEVEL',
+    ] as const
+    const originalRuntimeEnv = Object.fromEntries(
+      runtimeKeys.map(key => [key, process.env[key]]),
+    )
+    try {
+      process.env.ANTHROPIC_BASE_URL = env.ANTHROPIC_BASE_URL
+      process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL =
+        env.ANTHROPIC_DEFAULT_HAIKU_MODEL
+      process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES =
+        env.ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES
+      delete process.env.CLAUDE_CODE_EFFORT_LEVEL
+      clearCapabilityCache()
+
+      expect(resolveAppliedEffort('active-main', 'xhigh')).toBe('xhigh')
+    } finally {
+      for (const key of runtimeKeys) {
+        const value = originalRuntimeEnv[key]
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+      clearCapabilityCache()
+    }
   })
 
   test('active provider env overrides stale proxy settings while preserving unrelated env', async () => {
@@ -87,6 +165,7 @@ describe('providerRuntimeEnv', () => {
         ANTHROPIC_BASE_URL: 'http://127.0.0.1:3456/proxy',
         ANTHROPIC_API_KEY: 'proxy-managed',
         ANTHROPIC_MODEL: 'deepseek-v4-pro',
+        CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: '1',
         DISABLE_AUTOUPDATER: '1',
       },
       tmpDir,
@@ -103,6 +182,7 @@ describe('providerRuntimeEnv', () => {
       ANTHROPIC_DEFAULT_OPUS_MODEL: 'gpt-5.5',
       DISABLE_AUTOUPDATER: '1',
     })
+    expect(env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS).toBeUndefined()
   })
 
   test('honors disabled tool search for native Anthropic providers', async () => {
@@ -131,6 +211,34 @@ describe('providerRuntimeEnv', () => {
     const env = readActiveProviderManagedEnv(tmpDir)
 
     expect(env.ENABLE_TOOL_SEARCH).toBe('false')
+  })
+
+  test('honors disabled experimental betas for active providers', async () => {
+    await writeJson(path.join(tmpDir, 'cc-haha', 'providers.json'), {
+      activeId: 'provider-1',
+      providers: [
+        {
+          id: 'provider-1',
+          presetId: 'custom',
+          name: 'Experimental Betas Off',
+          apiKey: 'sk-active',
+          authStrategy: 'auth_token',
+          baseUrl: 'https://api.example.com/anthropic',
+          apiFormat: 'anthropic',
+          disableExperimentalBetas: true,
+          models: {
+            main: 'active-main',
+            haiku: 'active-main',
+            sonnet: 'active-main',
+            opus: 'active-main',
+          },
+        },
+      ],
+    })
+
+    const env = readActiveProviderManagedEnv(tmpDir)
+
+    expect(env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS).toBe('1')
   })
 
   test('keeps providers readable when stored tool search values are stringly typed', async () => {
@@ -189,4 +297,113 @@ describe('providerRuntimeEnv', () => {
 
     expect(env.ENABLE_TOOL_SEARCH).toBeUndefined()
   })
+
+  test('applies updated docs-backed preset env for domestic Anthropic-compatible providers', async () => {
+    await writeJson(path.join(tmpDir, 'cc-haha', 'providers.json'), {
+      activeId: 'provider-kimi',
+      providers: [
+        {
+          id: 'provider-kimi',
+          presetId: 'kimi',
+          name: 'Kimi',
+          apiKey: 'sk-kimi',
+          authStrategy: 'api_key',
+          baseUrl: 'https://api.kimi.com/coding/',
+          apiFormat: 'anthropic',
+          models: {
+            main: 'k3',
+            haiku: 'k3',
+            sonnet: 'k3',
+            opus: 'k3',
+          },
+        },
+      ],
+    })
+
+    const kimiEnv = readActiveProviderManagedEnv(tmpDir)
+
+    expect(kimiEnv).toMatchObject({
+      ANTHROPIC_BASE_URL: 'https://api.kimi.com/coding/',
+      ANTHROPIC_API_KEY: 'sk-kimi',
+      ANTHROPIC_MODEL: 'k3',
+      ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES:
+        'thinking,required_thinking,effort,max_effort',
+    })
+    expect(kimiEnv?.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
+    expect(JSON.parse(kimiEnv!.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS)).toMatchObject({
+      k3: 262144,
+      'kimi-for-coding': 262144,
+      'kimi-for-coding-highspeed': 262144,
+    })
+
+    await writeJson(path.join(tmpDir, 'cc-haha', 'providers.json'), {
+      activeId: 'provider-kimi-legacy',
+      providers: [
+        {
+          id: 'provider-kimi-legacy',
+          presetId: 'kimi',
+          name: 'Kimi Open Platform',
+          apiKey: 'sk-kimi-legacy',
+          authStrategy: 'auth_token',
+          baseUrl: 'https://api.moonshot.cn/anthropic',
+          apiFormat: 'anthropic',
+          models: {
+            main: 'kimi-k2.7-code',
+            haiku: 'kimi-k2.7-code',
+            sonnet: 'kimi-k2.7-code',
+            opus: 'kimi-k2.7-code',
+          },
+        },
+      ],
+    })
+
+    const legacyKimiEnv = readActiveProviderManagedEnv(tmpDir)
+
+    expect(legacyKimiEnv).toMatchObject({
+      ANTHROPIC_BASE_URL: 'https://api.moonshot.cn/anthropic',
+      ANTHROPIC_API_KEY: '',
+      ANTHROPIC_AUTH_TOKEN: 'sk-kimi-legacy',
+      ANTHROPIC_MODEL: 'kimi-k2.7-code',
+      ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES: 'thinking,required_thinking',
+    })
+
+    await writeJson(path.join(tmpDir, 'cc-haha', 'providers.json'), {
+      activeId: 'provider-zhipu',
+      providers: [
+        {
+          id: 'provider-zhipu',
+          presetId: 'zhipuglm',
+          name: 'Zhipu GLM',
+          apiKey: 'sk-zhipu',
+          authStrategy: 'auth_token',
+          baseUrl: 'https://open.bigmodel.cn/api/anthropic',
+          apiFormat: 'anthropic',
+          models: {
+            main: 'glm-5.2[1m]',
+            haiku: 'glm-4.7',
+            sonnet: 'glm-5.2[1m]',
+            opus: 'glm-5.2[1m]',
+          },
+        },
+      ],
+    })
+
+    const zhipuEnv = readActiveProviderManagedEnv(tmpDir)
+
+    expect(zhipuEnv).toMatchObject({
+      ANTHROPIC_MODEL: 'glm-5.2[1m]',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.7',
+      CLAUDE_CODE_AUTO_COMPACT_WINDOW: '1000000',
+    })
+    expect(JSON.parse(zhipuEnv!.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS)).toMatchObject({
+      'glm-5.2[1m]': 1000000,
+      'glm-4.7': 200000,
+    })
+  })
 })
+
+function clearCapabilityCache() {
+  ;(get3PModelCapabilityOverride as typeof get3PModelCapabilityOverride & {
+    cache?: { clear?: () => void }
+  }).cache?.clear?.()
+}

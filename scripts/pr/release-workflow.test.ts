@@ -57,8 +57,63 @@ describe('release desktop workflow', () => {
         expect(workflow).toContain(electronBuilderCli)
       }
       expect(workflow).toContain('smoke_platform')
-      expect(workflow).toContain('bun run test:package-smoke --platform ${{ matrix.smoke_platform }} --package-kind release --artifacts-dir desktop/build-artifacts/electron')
+      expect(workflow).toContain('bun run test:package-smoke --platform ${{ matrix.smoke_platform }} --arch ${{ matrix.arch }} --package-kind release --artifacts-dir desktop/build-artifacts/electron')
       expect(workflow).not.toContain('tauri-apps/tauri-action@v0')
+    }
+  })
+
+  test('desktop build workflows install the Bun version declared by packageManager', () => {
+    for (const workflowPath of [
+      '.github/workflows/build-desktop-dev.yml',
+      '.github/workflows/release-desktop.yml',
+    ]) {
+      const workflow = readFileSync(workflowPath, 'utf8')
+      const setupBunStepCount = workflow.match(/uses: oven-sh\/setup-bun@v2/g)?.length ?? 0
+      const packageVersionCount = workflow.match(/bun-version-file: package\.json/g)?.length ?? 0
+
+      expect(setupBunStepCount, workflowPath).toBeGreaterThan(0)
+      expect(packageVersionCount, workflowPath).toBe(setupBunStepCount)
+      expect(workflow, workflowPath).not.toContain('bun-version: latest')
+    }
+  })
+
+  test('Windows x64 builds execute the compiled sidecar before packaging', () => {
+    for (const workflowPath of [
+      '.github/workflows/build-desktop-dev.yml',
+      '.github/workflows/release-desktop.yml',
+    ]) {
+      const workflow = readFileSync(workflowPath, 'utf8')
+      const smokeStep = extractStep(workflow, 'Verify compiled Windows sidecar startup')
+
+      expect(smokeStep, workflowPath).toContain(
+        "if: matrix.smoke_platform == 'windows' && matrix.arch == 'x64'",
+      )
+      expect(smokeStep, workflowPath).toContain('working-directory: desktop')
+      expect(smokeStep, workflowPath).toContain("CC_HAHA_COMPILED_SIDECAR_SMOKE_STARTS: '20'")
+      expect(smokeStep, workflowPath).toContain('bun run test:compiled-sidecar-smoke')
+      expect(workflow.indexOf('Build sidecars'), workflowPath).toBeLessThan(
+        workflow.indexOf('Verify compiled Windows sidecar startup'),
+      )
+      expect(workflow.indexOf('Verify compiled Windows sidecar startup'), workflowPath)
+        .toBeLessThan(workflow.indexOf('Build renderer and Electron bundles'))
+    }
+  })
+
+  test('desktop build workflows prepare the pinned ripgrep asset before sidecars', () => {
+    for (const workflowPath of [
+      '.github/workflows/build-desktop-dev.yml',
+      '.github/workflows/release-desktop.yml',
+    ]) {
+      const workflow = readFileSync(workflowPath, 'utf8')
+      const prepareStep = extractStep(workflow, 'Prepare bundled ripgrep')
+
+      expect(prepareStep, workflowPath).toContain(
+        'SIDECAR_TARGET_TRIPLE: ${{ matrix.target_triple }}',
+      )
+      expect(prepareStep, workflowPath).toContain('bun run prepare:ripgrep')
+      expect(workflow.indexOf('Prepare bundled ripgrep')).toBeLessThan(
+        workflow.indexOf('Build sidecars'),
+      )
     }
   })
 
@@ -116,7 +171,7 @@ describe('release desktop workflow', () => {
     expect(workflow).toContain('notarize_macos:')
     expect(workflow).toContain("description: 'Notarize macOS artifacts'")
     expect(gatekeeperStep).toContain("if: matrix.smoke_platform == 'macos' && needs.signing-preflight.outputs.macos_signed == 'true' && (github.event_name != 'workflow_dispatch' || inputs.notarize_macos == true)")
-    expect(gatekeeperStep).toContain('bun run test:package-smoke --platform macos --package-kind release --artifacts-dir desktop/build-artifacts/electron --require-macos-gatekeeper')
+    expect(gatekeeperStep).toContain('bun run test:package-smoke --platform macos --arch ${{ matrix.arch }} --package-kind release --artifacts-dir desktop/build-artifacts/electron --require-macos-gatekeeper')
     expect(notarizationWarningStep).toContain("if: matrix.smoke_platform == 'macos' && needs.signing-preflight.outputs.macos_signed == 'true' && github.event_name == 'workflow_dispatch' && inputs.notarize_macos == false")
     expect(notarizationWarningStep).toContain('Developer ID signed but not notarized')
     expect(unsignedWarningStep).toContain("if: matrix.smoke_platform == 'macos' && needs.signing-preflight.outputs.macos_signed != 'true'")
@@ -218,6 +273,8 @@ describe('release desktop workflow', () => {
     expect(signingJob).toContain('Missing macOS signing/notarization secrets')
     expect(signingJob).toContain('macOS artifacts will be unsigned')
     expect(signingJob).toContain('install-macos-unsigned.sh')
+    expect(signingJob).toContain("RELEASE_DRAFT: ${{ github.event_name == 'workflow_dispatch' && inputs.draft == true }}")
+    expect(signingJob).toContain('Refusing to publish a non-draft desktop release without macOS signing/notarization secrets.')
     expect(signingJob).toContain('macos_signed=false')
     expect(signingJob).toContain('macos_signed=true')
     expect(signingJob).toContain('Windows signing secrets missing')
@@ -229,7 +286,8 @@ describe('release desktop workflow', () => {
     const windowsOptionalBlock = signingJob?.match(
       /win_missing=\(\)[\s\S]*?fi\n/,
     )?.[0]
-    expect(macRequiredBlock).not.toContain('exit 1')
+    expect(macRequiredBlock).toContain('if [ "$RELEASE_DRAFT" != "true" ]; then')
+    expect(macRequiredBlock).toContain('exit 1')
     expect(windowsOptionalBlock).toContain('::warning::')
     expect(windowsOptionalBlock).not.toContain('exit 1')
     expect(buildJob).toContain('- signing-preflight')
@@ -253,9 +311,12 @@ describe('release desktop workflow', () => {
     const buildJob = extractJob(workflow, 'build')
 
     expect(buildJob).toContain('Validate matrix release asset set')
-    for (const label of ['macOS-ARM64', 'macOS-x64', 'Linux-x64', 'Linux-ARM64', 'Windows-x64']) {
+    for (const label of ['macOS-ARM64', 'macOS-x64', 'Linux-x64', 'Linux-ARM64', 'Windows-x64', 'Windows-ARM64']) {
       expect(buildJob).toContain(`${label})`)
     }
+    expect(buildJob).toContain('target_triple: aarch64-pc-windows-msvc')
+    expect(buildJob).toContain('builder_args: --win nsis --arm64')
+    expect(buildJob).toContain('Claude-Code-Haha-${APP_VERSION}-win-arm64.exe')
     expect(buildJob).toContain('Upload release artifacts for final publish')
     expect(buildJob).toContain('actions/upload-artifact@v4')
     expect(buildJob).toContain('name: desktop-release-artifacts-${{ matrix.label }}')
@@ -285,13 +346,29 @@ describe('release desktop workflow', () => {
     expect(publishJob).toContain('artifacts/release-assets/**/*.blockmap')
     expect(publishJob).toContain('artifacts/update-metadata-standard/*.yml')
     expect(publishJob).toContain('desktop/scripts/install-macos-unsigned.sh')
-    expect(publishJob).toContain("draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft == true }}")
-    expect(publishJob).toContain('Ensure workflow-dispatch release remains draft')
+    expect(publishJob).toContain('draft: true')
+    expect(publishJob).toContain('Publish GitHub release after complete upload')
+    expect(publishJob).toContain("if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.draft == false)")
+    expect(publishJob).toContain('gh release edit "v${{ steps.version.outputs.value }}" --draft=false --repo "${{ github.repository }}"')
+    expect(publishJob).toContain('Keep workflow-dispatch release as draft')
     expect(publishJob).toContain("if: github.event_name == 'workflow_dispatch' && inputs.draft == true")
-    expect(publishJob).toContain('gh release edit "v${{ steps.version.outputs.value }}" --draft --repo "${{ github.repository }}"')
+    expect(publishJob).toContain('release remains draft')
     expect(publishJob).toContain('fail_on_unmatched_files: true')
     expect(publishJob).toContain('Load release notes')
+    expect(publishJob.indexOf('Publish complete GitHub release')).toBeLessThan(publishJob.indexOf('Publish GitHub release after complete upload'))
     expect(workflow.indexOf('publish-release:')).toBeGreaterThan(workflow.indexOf('build:'))
+  })
+
+  test('release workflow keeps updater-visible releases draft until every asset is uploaded', () => {
+    const workflow = readReleaseWorkflow()
+    const publishJob = extractJob(workflow, 'publish-release')
+
+    expect(publishJob).toContain('draft: true')
+    expect(publishJob).toContain('fail_on_unmatched_files: true')
+    expect(publishJob).toContain('Publish GitHub release after complete upload')
+    expect(publishJob).toContain('--draft=false')
+    expect(publishJob.indexOf('Publish complete GitHub release')).toBeLessThan(publishJob.indexOf('Publish GitHub release after complete upload'))
+    expect(publishJob.indexOf('Validate standard update metadata set')).toBeLessThan(publishJob.indexOf('Publish complete GitHub release'))
   })
 
   test('release matrix asset basenames remain unique when final artifacts are flattened', () => {
@@ -319,6 +396,8 @@ describe('release desktop workflow', () => {
       `Claude-Code-Haha-${version}-linux-arm64.deb`,
       `Claude-Code-Haha-${version}-win-x64.exe`,
       `Claude-Code-Haha-${version}-win-x64.exe.blockmap`,
+      `Claude-Code-Haha-${version}-win-arm64.exe`,
+      `Claude-Code-Haha-${version}-win-arm64.exe.blockmap`,
     ]
     const namespacedMetadata = [
       'latest-mac-macOS-ARM64.yml',
@@ -344,7 +423,7 @@ describe('release desktop workflow', () => {
     expect(expectedReleaseAssets.filter((name) => name.endsWith('.zip')).length).toBe(2)
     expect(expectedReleaseAssets.filter((name) => name.endsWith('.AppImage')).length).toBe(2)
     expect(expectedReleaseAssets.filter((name) => name.endsWith('.deb')).length).toBe(2)
-    expect(expectedReleaseAssets.filter((name) => name.endsWith('.exe')).length).toBe(1)
+    expect(expectedReleaseAssets.filter((name) => name.endsWith('.exe')).length).toBe(2)
     expect(expectedReleaseAssets.some((name) => name.includes('-linux-') && name.endsWith('.blockmap'))).toBe(false)
     for (const platform of ['mac', 'linux', 'win']) {
       expect(expectedReleaseAssets.some((name) => name.includes(`-${platform}-`))).toBe(true)
@@ -371,6 +450,9 @@ describe('release desktop workflow', () => {
       'Claude-Code-Haha-${APP_VERSION}-linux-arm64.AppImage',
       'Claude-Code-Haha-${APP_VERSION}-linux-arm64.deb',
       'Claude-Code-Haha-${APP_VERSION}-win-x64.exe',
+      'Claude-Code-Haha-${APP_VERSION}-win-x64.exe.blockmap',
+      'Claude-Code-Haha-${APP_VERSION}-win-arm64.exe',
+      'Claude-Code-Haha-${APP_VERSION}-win-arm64.exe.blockmap',
     ]
 
     for (const file of expectedFiles) {
@@ -448,5 +530,101 @@ describe('release desktop workflow', () => {
 
     expect(desktopPackage.build.nsis?.oneClick).toBe(false)
     expect(desktopPackage.build.nsis?.allowToChangeInstallationDirectory).toBe(true)
+  })
+
+  test('Windows NSIS installer recovers only registered legacy install-directory data', () => {
+    const desktopPackage = JSON.parse(readFileSync('desktop/package.json', 'utf8')) as {
+      scripts?: Record<string, string>
+      build: {
+        nsis?: {
+          include?: string
+        }
+      }
+    }
+
+    expect(desktopPackage.build.nsis?.include).toBe('build/installer.nsh')
+    expect(desktopPackage.scripts?.['test:windows-storage-recovery']).toContain('-SelfTest')
+
+    const installerHook = readFileSync('desktop/build/installer.nsh', 'utf8')
+    const recoveryHelper = readFileSync('desktop/build/recover-legacy-install-data.ps1', 'utf8')
+    expect(installerHook).toContain('!macro customInit')
+    expect(installerHook).toContain('!macro customCheckAppRunning')
+    expect(installerHook).toContain('!macro customPageAfterChangeDir')
+    expect(installerHook).toContain('UAC_AsUser_Call Function CcHahaRecoverLegacy')
+    expect(installerHook).toContain('${UAC_IsInnerInstance}')
+    expect(installerHook).toContain('recover-legacy-install-data.ps1')
+    expect(installerHook).toContain('ReadRegStr $4 HKCU "${INSTALL_REGISTRY_KEY}" InstallLocation')
+    expect(installerHook).toContain('ReadRegStr $5 HKLM "${INSTALL_REGISTRY_KEY}" InstallLocation')
+    expect(installerHook).toContain('Function CcHahaUninstallerParent')
+    expect(installerHook).toContain('Function CcHahaFinalInstallDir')
+    expect(installerHook).toContain('HKCU "${UNINSTALL_REGISTRY_KEY}" UninstallString')
+    expect(installerHook).toContain('HKLM "${UNINSTALL_REGISTRY_KEY}" UninstallString')
+    expect(installerHook).toContain('UNINSTALL_REGISTRY_KEY_2')
+    expect(installerHook).toContain('ReadEnvStr $2 APPDATA')
+    expect(installerHook).toContain('ReadEnvStr $3 USERPROFILE')
+    expect(installerHook).toContain('ReadEnvStr $6 CLAUDE_CONFIG_DIR')
+    expect(installerHook).toContain('ReadEnvStr $7 CC_HAHA_APP_PORTABLE_DIR')
+    expect(installerHook).toContain('No registered installation needs legacy data recovery')
+    expect(installerHook).toContain('Var ccHahaPerUserInstallLocation')
+    expect(installerHook).toContain('Var ccHahaPerMachineInstallLocation')
+    expect(installerHook).toMatch(/!macro CcHahaRunLegacyRecovery[\s\S]*ReadRegStr \$ccHahaPerUserInstallLocation[\s\S]*\$ccHahaPerUserUninstallString == ""[\s\S]*No registered installation needs legacy data recovery[\s\S]*Call CcHahaRecoverLegacy/)
+    expect(installerHook).toContain('SetErrorLevel 20')
+    expect(installerHook).toContain('/SD IDOK')
+    expect(installerHook).toContain('Quit')
+    expect(recoveryHelper).toContain('function Get-LegacyActiveSource')
+    expect(recoveryHelper).toContain('function Get-PotentialInstallDirs')
+    expect(recoveryHelper).toContain('param([AllowEmptyString()][string[]]$InstallDirs)')
+    expect(recoveryHelper).toContain('function Assert-NoUndiscoveredLegacySources')
+    expect(recoveryHelper).toContain('function Assert-NoRunningApplication')
+    expect(recoveryHelper).toContain('function Get-TreeManifest')
+    expect(recoveryHelper).toContain('function Assert-TreeManifestsEqual')
+    expect(recoveryHelper).toContain('function Write-AppModeAtomically')
+    expect(recoveryHelper).toContain('[IO.File]::Replace')
+    expect(recoveryHelper).not.toContain('Add-Type')
+    expect(recoveryHelper).toContain('function Assert-NoReparsePointInPath')
+    expect(recoveryHelper).toContain('robocopy.exe')
+    expect(recoveryHelper).not.toMatch(/\/XC|\/XN|\/XO/)
+    expect(recoveryHelper).toContain('Multiple distinct legacy data sources')
+    expect(recoveryHelper).toContain('Active CLAUDE_CONFIG_DIR is managed outside Claude Code Haha')
+    expect(recoveryHelper).toContain('Test-LexicalPathAtOrBelow')
+    expect(recoveryHelper).toContain('-SharedInstallDirs @($PerMachineInstallDir)')
+    expect(recoveryHelper).toContain("function Invoke-LegacyRecovery {\n  param(\n    [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]]$InstallDirs")
+    expect(recoveryHelper).toContain('$installDirInputs.Count -eq 0')
+    expect(recoveryHelper).toContain('$sharedInstallDirInputs.Count -gt 0')
+    expect(recoveryHelper).toContain('per-user default-mode reinstall scanned the packaged application tree')
+    expect(recoveryHelper).toContain('untrusted-elevated')
+    expect(recoveryHelper).toContain('External CLAUDE_CONFIG_DIR is active while install-contained legacy data still exists')
+    expect(recoveryHelper).toMatch(/\$source = Get-UnsafeLegacySource[\s\S]*Assert-NoRunningApplication/)
+    expect(recoveryHelper).not.toMatch(/InstallerIdentitySafety -eq 'untrusted-elevated' -and\s+@\(Get-ExistingInstallDirs/)
+    expect(recoveryHelper).toMatch(/Assert-TreeManifestsEqual[\s\S]*Assert-NoRunningApplication[\s\S]*Write-AppModeAtomically/)
+    expect(recoveryHelper).toContain("AddSeconds(30)")
+    expect(recoveryHelper).toContain('[Console]::Out.WriteLine("Legacy recovery error:')
+    expect(recoveryHelper).toContain('reparse point')
+    expect(recoveryHelper).toContain('Run-SelfTest')
+  })
+
+  test('Windows build and release jobs execute helper and compiled-installer smoke tests', () => {
+    const devWorkflow = readFileSync('.github/workflows/build-desktop-dev.yml', 'utf8')
+    const releaseWorkflow = readFileSync('.github/workflows/release-desktop.yml', 'utf8')
+    const installerSmoke = readFileSync('desktop/scripts/windows-installer-smoke.ps1', 'utf8')
+
+    for (const workflow of [devWorkflow, releaseWorkflow]) {
+      expect(workflow).toContain("if: matrix.smoke_platform == 'windows'")
+      expect(workflow).toContain('bun run test:windows-storage-recovery')
+      expect(workflow).toContain("matrix.arch == 'x64'")
+      expect(workflow).toContain('windows-installer-smoke.ps1')
+    }
+
+    expect(installerSmoke).toContain('Invoke-CheckedProcess')
+    expect(installerSmoke).toContain('Invoke-LegacyRecoveryDiagnostic')
+    expect(installerSmoke).toContain('Direct legacy recovery diagnostic completed successfully')
+    expect(installerSmoke).toContain("@('/S', '/currentuser'")
+    expect(installerSmoke).toContain("@('--updated', '/S', '/currentuser'")
+    expect(installerSmoke).toContain('$process.WaitForExit($TimeoutSeconds * 1000)')
+    expect(installerSmoke).not.toContain('-Wait -PassThru')
+    expect(installerSmoke).toContain('$Stage starting...')
+    expect(installerSmoke).toContain('$Stage completed successfully.')
+    expect(installerSmoke).toContain('Fresh install did not create the application executable')
+    expect(installerSmoke).toContain('Reinstall removed the application executable')
   })
 })

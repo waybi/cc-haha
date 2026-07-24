@@ -23,6 +23,11 @@ import {
 } from './openaiOfficialProvider.js'
 import { hahaOpenAIOAuthService } from './hahaOpenAIOAuthService.js'
 import {
+  GROK_OFFICIAL_PROVIDER,
+  isGrokOfficialProviderId,
+} from './grokOfficialProvider.js'
+import { hahaGrokOAuthService } from './hahaGrokOAuthService.js'
+import {
   CURRENT_PROVIDER_INDEX_SCHEMA_VERSION,
   ensurePersistentStorageUpgraded,
 } from './persistentStorageMigrations.js'
@@ -35,9 +40,8 @@ import {
   normalizeModelMapping,
   normalizeProvidersIndex,
 } from './providerRuntimeEnv.js'
-import { getProxyFetchOptions } from '../../utils/proxy.js'
 import {
-  getManualNetworkProxyUrl,
+  getNetworkProxyFetchOptions,
   loadNetworkSettings,
   type NetworkSettings,
 } from './networkSettings.js'
@@ -203,6 +207,9 @@ export class ProviderService {
     if (isOpenAIOfficialProviderId(id)) {
       return OPENAI_OFFICIAL_PROVIDER
     }
+    if (isGrokOfficialProviderId(id)) {
+      return GROK_OFFICIAL_PROVIDER
+    }
 
     const index = await this.readIndex()
     const provider = index.providers.find((p) => p.id === id)
@@ -227,6 +234,7 @@ export class ProviderService {
       ...(input.autoCompactWindow !== undefined && { autoCompactWindow: input.autoCompactWindow }),
       ...(input.modelContextWindows !== undefined && { modelContextWindows: input.modelContextWindows }),
       toolSearchEnabled: input.toolSearchEnabled ?? true,
+      ...(input.disableExperimentalBetas === true && { disableExperimentalBetas: true }),
       ...(input.notes !== undefined && { notes: input.notes }),
     }
 
@@ -255,6 +263,7 @@ export class ProviderService {
       ...(typeof input.autoCompactWindow === 'number' && { autoCompactWindow: input.autoCompactWindow }),
       ...(input.modelContextWindows !== undefined && input.modelContextWindows !== null && { modelContextWindows: input.modelContextWindows }),
       ...(input.toolSearchEnabled !== undefined && { toolSearchEnabled: input.toolSearchEnabled }),
+      ...(input.disableExperimentalBetas === true && { disableExperimentalBetas: true }),
       ...(input.notes !== undefined && { notes: input.notes }),
     }
     if (input.model1mSupport === null) {
@@ -265,6 +274,9 @@ export class ProviderService {
     }
     if (input.modelContextWindows === null) {
       delete updated.modelContextWindows
+    }
+    if (input.disableExperimentalBetas === false) {
+      delete updated.disableExperimentalBetas
     }
 
     index.providers[idx] = updated
@@ -328,13 +340,15 @@ export class ProviderService {
     const index = await this.readIndex()
     const provider = isOpenAIOfficialProviderId(id)
       ? OPENAI_OFFICIAL_PROVIDER
-      : index.providers.find((p) => p.id === id)
+      : isGrokOfficialProviderId(id)
+        ? GROK_OFFICIAL_PROVIDER
+        : index.providers.find((p) => p.id === id)
     if (!provider) throw ApiError.notFound(`Provider not found: ${id}`)
 
     index.activeId = id
     await this.writeIndex(index)
 
-    if (provider.runtimeKind === 'openai_oauth') {
+    if (provider.runtimeKind === 'openai_oauth' || provider.runtimeKind === 'grok_oauth') {
       await this.syncToSettings(provider)
     } else if (provider.presetId === 'official') {
       await this.clearProviderFromSettings()
@@ -427,7 +441,7 @@ export class ProviderService {
    */
   async checkAuthStatus(): Promise<{
     hasAuth: boolean
-    source: 'cc-haha-provider' | 'openai-oauth' | 'original-settings' | 'env' | 'none'
+    source: 'cc-haha-provider' | 'openai-oauth' | 'grok-oauth' | 'original-settings' | 'env' | 'none'
     activeProvider?: string
   }> {
     // 1. Check cc-haha active provider
@@ -446,6 +460,21 @@ export class ProviderService {
           hasAuth: false,
           source: 'none',
           activeProvider: OPENAI_OFFICIAL_PROVIDER.name,
+        }
+      }
+      if (isGrokOfficialProviderId(index.activeId)) {
+        const tokens = await hahaGrokOAuthService.ensureFreshTokens()
+        if (tokens?.accessToken && tokens.refreshToken) {
+          return {
+            hasAuth: true,
+            source: 'grok-oauth',
+            activeProvider: GROK_OFFICIAL_PROVIDER.name,
+          }
+        }
+        return {
+          hasAuth: false,
+          source: 'none',
+          activeProvider: GROK_OFFICIAL_PROVIDER.name,
         }
       }
 
@@ -491,7 +520,7 @@ export class ProviderService {
     apiFormat: ApiFormat
   } | null> {
     if (providerId) {
-      if (isOpenAIOfficialProviderId(providerId)) {
+      if (isOpenAIOfficialProviderId(providerId) || isGrokOfficialProviderId(providerId)) {
         return null
       }
       const provider = await this.getProvider(providerId)
@@ -506,7 +535,7 @@ export class ProviderService {
 
     const index = await this.readIndex()
     if (!index.activeId) return null
-    if (isOpenAIOfficialProviderId(index.activeId)) {
+    if (isOpenAIOfficialProviderId(index.activeId) || isGrokOfficialProviderId(index.activeId)) {
       return null
     }
     const provider = await this.getProvider(index.activeId).catch(() => null)
@@ -597,7 +626,7 @@ export class ProviderService {
     const start = Date.now()
     try {
       const { url, headers, body } = buildDirectTestRequest(base, apiKey, modelId, format, authStrategy)
-      const proxyOptions = getProxyFetchOptions({ proxyUrl: getManualNetworkProxyUrl(networkSettings) })
+      const proxyOptions = getNetworkProxyFetchOptions(networkSettings, url)
       const response = await fetch(url, {
         method: 'POST',
         headers,
@@ -660,7 +689,7 @@ export class ProviderService {
         transformedBody = anthropicToOpenaiResponses(anthropicReq)
         upstreamUrl = `${base}/v1/responses`
       }
-      const proxyOptions = getProxyFetchOptions({ proxyUrl: getManualNetworkProxyUrl(networkSettings) })
+      const proxyOptions = getNetworkProxyFetchOptions(networkSettings, upstreamUrl)
 
       // Call upstream with transformed request
       const response = await fetch(upstreamUrl, {

@@ -1,11 +1,15 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import * as fs from 'node:fs/promises'
-import { createServer } from 'node:net'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { startServer } from '../index.js'
+import {
+  clearFilesystemAccessRootsForTests,
+  registerFilesystemAccessRoot,
+} from '../services/filesystemAccessRoots.js'
 import { H5AccessService } from '../services/h5AccessService.js'
 import { ProviderService } from '../services/providerService.js'
+import { sessionService } from '../services/sessionService.js'
 
 let server: ReturnType<typeof Bun.serve> | undefined
 let baseUrl = ''
@@ -18,6 +22,8 @@ let originalAnthropicApiKey: string | undefined
 let originalH5DistDir: string | undefined
 let originalClaudeAppRoot: string | undefined
 let originalServerAuthRequired: string | undefined
+let originalLocalAccessToken: string | undefined
+let originalPetAccessToken: string | undefined
 let originalServerPort = 3456
 const PHONE_ORIGIN = 'https://phone.example'
 
@@ -34,22 +40,6 @@ async function waitForServer(url: string): Promise<void> {
   }
 
   throw new Error(`Timed out waiting for server at ${url}`)
-}
-
-async function availablePort(): Promise<number> {
-  return await new Promise((resolve, reject) => {
-    const probe = createServer()
-    probe.once('error', reject)
-    probe.listen(0, '0.0.0.0', () => {
-      const address = probe.address()
-      if (!address || typeof address === 'string') {
-        probe.close(() => reject(new Error('Failed to allocate an H5 access test port')))
-        return
-      }
-      const port = address.port
-      probe.close(() => resolve(port))
-    })
-  })
 }
 
 function resolvePrivateLanBaseUrl(port: number): string | null {
@@ -79,8 +69,8 @@ async function startRemoteServer(options: { authRequired?: boolean } = {}): Prom
     delete process.env.SERVER_AUTH_REQUIRED
   }
 
-  const port = await availablePort()
-  server = startServer(port, '0.0.0.0')
+  server = startServer(0, '0.0.0.0')
+  const port = server.port
   baseUrl = `http://127.0.0.1:${port}`
   wsBaseUrl = `ws://127.0.0.1:${port}`
   lanBaseUrl = resolvePrivateLanBaseUrl(port) ?? ''
@@ -197,17 +187,23 @@ const settingsSurfaceEndpoints = [
 ] as const
 
 beforeEach(async () => {
+  clearFilesystemAccessRootsForTests()
+  registerFilesystemAccessRoot(process.cwd())
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'h5-access-auth-test-'))
   originalConfigDir = process.env.CLAUDE_CONFIG_DIR
   originalAnthropicApiKey = process.env.ANTHROPIC_API_KEY
   originalH5DistDir = process.env.CLAUDE_H5_DIST_DIR
   originalClaudeAppRoot = process.env.CLAUDE_APP_ROOT
   originalServerAuthRequired = process.env.SERVER_AUTH_REQUIRED
+  originalLocalAccessToken = process.env.CC_HAHA_LOCAL_ACCESS_TOKEN
+  originalPetAccessToken = process.env.CC_HAHA_PET_ACCESS_TOKEN
   originalServerPort = ProviderService.getServerPort()
   process.env.CLAUDE_CONFIG_DIR = tmpDir
   const h5DistDir = path.join(tmpDir, 'dist')
   process.env.CLAUDE_H5_DIST_DIR = h5DistDir
   delete process.env.ANTHROPIC_API_KEY
+  delete process.env.CC_HAHA_LOCAL_ACCESS_TOKEN
+  delete process.env.CC_HAHA_PET_ACCESS_TOKEN
   await fs.mkdir(path.join(h5DistDir, 'assets'), { recursive: true })
   await fs.writeFile(
     path.join(h5DistDir, 'index.html'),
@@ -221,6 +217,7 @@ beforeEach(async () => {
 afterEach(async () => {
   server?.stop(true)
   server = undefined
+  clearFilesystemAccessRootsForTests()
   ProviderService.setServerPort(originalServerPort)
 
   if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR
@@ -234,6 +231,10 @@ afterEach(async () => {
   else process.env.CLAUDE_APP_ROOT = originalClaudeAppRoot
   if (originalServerAuthRequired === undefined) delete process.env.SERVER_AUTH_REQUIRED
   else process.env.SERVER_AUTH_REQUIRED = originalServerAuthRequired
+  if (originalLocalAccessToken === undefined) delete process.env.CC_HAHA_LOCAL_ACCESS_TOKEN
+  else process.env.CC_HAHA_LOCAL_ACCESS_TOKEN = originalLocalAccessToken
+  if (originalPetAccessToken === undefined) delete process.env.CC_HAHA_PET_ACCESS_TOKEN
+  else process.env.CC_HAHA_PET_ACCESS_TOKEN = originalPetAccessToken
 
   await fs.rm(tmpDir, { recursive: true, force: true })
 })
@@ -300,6 +301,172 @@ describe('remote H5 auth and CORS integration', () => {
         status: 'ok',
       })
     }
+  })
+
+  test('rejects a tokenless loopback proxy hop when desktop local auth is configured', async () => {
+    process.env.CC_HAHA_LOCAL_ACCESS_TOKEN = 'desktop-local-secret'
+    await restartRemoteServer()
+
+    const proxyShapedResponse = await fetch(`${baseUrl}/api/status`)
+    expect(proxyShapedResponse.status).toBe(403)
+
+    const desktopResponse = await fetch(`${baseUrl}/api/status`, {
+      headers: { Authorization: 'Bearer desktop-local-secret' },
+    })
+    expect(desktopResponse.status).toBe(200)
+    await expect(desktopResponse.json()).resolves.toMatchObject({ status: 'ok' })
+  })
+
+  test('enforces the pet bearer capability allowlist before API routing', async () => {
+    process.env.CC_HAHA_LOCAL_ACCESS_TOKEN = 'desktop-local-secret'
+    process.env.CC_HAHA_PET_ACCESS_TOKEN = 'pet-capability-secret'
+    await restartRemoteServer()
+    const petHeaders = { Authorization: 'Bearer pet-capability-secret' }
+    const privateWorkDir = path.join(tmpDir, 'private-workspace')
+    await fs.mkdir(privateWorkDir, { recursive: true })
+    const { sessionId } = await sessionService.createSession(privateWorkDir)
+
+    for (const pathName of [
+      '/api/desktop-ui/preferences/pet',
+      `/api/sessions/${sessionId}/chat/status`,
+    ]) {
+      const response = await fetch(`${baseUrl}${pathName}`, { headers: petHeaders })
+      expect(response.status).toBe(200)
+    }
+
+    const sessionsResponse = await fetch(`${baseUrl}/api/sessions?limit=400`, {
+      headers: petHeaders,
+    })
+    expect(sessionsResponse.status).toBe(200)
+    const sessionsBody = await sessionsResponse.json() as {
+      sessions: Array<Record<string, unknown>>
+      total: number
+    }
+    const projectedSession = sessionsBody.sessions.find((session) => session.id === sessionId)
+    expect(projectedSession).toMatchObject({
+      id: sessionId,
+      title: 'Untitled Session',
+      messageCount: 0,
+      projectPath: '',
+      workDir: null,
+      workDirExists: false,
+    })
+    expect(typeof projectedSession?.createdAt).toBe('string')
+    expect(typeof projectedSession?.modifiedAt).toBe('string')
+    expect(JSON.stringify(sessionsBody)).not.toContain(privateWorkDir)
+    expect(sessionsBody.sessions.length).toBeLessThanOrEqual(9)
+
+    const desktopSessionsResponse = await fetch(`${baseUrl}/api/sessions?limit=400`, {
+      headers: { Authorization: 'Bearer desktop-local-secret' },
+    })
+    expect(desktopSessionsResponse.status).toBe(200)
+    const desktopSessionsBody = await desktopSessionsResponse.json() as {
+      sessions: Array<Record<string, unknown>>
+    }
+    const realPrivateWorkDir = await fs.realpath(privateWorkDir)
+    expect(desktopSessionsBody.sessions.find((session) => session.id === sessionId)).toMatchObject({
+      workDir: realPrivateWorkDir,
+      projectRoot: realPrivateWorkDir,
+    })
+
+    const updateResponse = await fetch(`${baseUrl}/api/desktop-ui/preferences/pet`, {
+      method: 'PUT',
+      headers: { ...petHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ collapsed: true }),
+    })
+    expect(updateResponse.status).toBe(200)
+    const updateBody = await updateResponse.json() as Record<string, unknown>
+    expect(updateBody).toEqual({
+      ok: true,
+      pet: {
+        enabled: false,
+        selectedPetId: 'dada-code',
+        size: 144,
+        collapsed: true,
+        motionEnabled: true,
+        lastSessionId: null,
+      },
+    })
+    expect(updateBody).not.toHaveProperty('preferences')
+    const hiddenSessionStatus = await fetch(`${baseUrl}/api/sessions/pet-test/chat/status`, {
+      headers: petHeaders,
+    })
+    expect(hiddenSessionStatus.status).toBe(403)
+    await expect(hiddenSessionStatus.json()).resolves.toMatchObject({
+      error: 'Forbidden',
+      message: 'The pet token cannot access this session.',
+    })
+
+    const hiddenSessionSocket = await fetch(
+      `${baseUrl}/ws/pet-test?token=pet-capability-secret`,
+      { headers: makeUpgradeHeaders() },
+    )
+    expect(hiddenSessionSocket.status).toBe(403)
+    await expectWebSocketOpen(`${wsBaseUrl}/ws/${sessionId}?token=pet-capability-secret`)
+
+    for (const [method, pathName] of [
+      ['GET', '/api/providers'],
+      ['GET', '/api/desktop-ui/preferences'],
+      ['GET', '/api/filesystem'],
+      ['GET', '/api/computer-use/authorized-apps'],
+      ['GET', '/api/settings/user'],
+      ['POST', '/api/doctor/repair'],
+      ['GET', '/preview-fs/pet-test/index.html'],
+      ['GET', '/local-file/tmp/private.txt'],
+      ['POST', '/proxy/v1/messages'],
+    ]) {
+      const response = await fetch(`${baseUrl}${pathName}`, {
+        method,
+        headers: petHeaders,
+      })
+      expect(response.status).toBe(403)
+      await expect(response.json()).resolves.toMatchObject({
+        error: 'Forbidden',
+        message: 'The pet token cannot access this capability.',
+      })
+    }
+
+    const desktopResponse = await fetch(`${baseUrl}/api/settings/user`, {
+      headers: { Authorization: 'Bearer desktop-local-secret' },
+    })
+    expect(desktopResponse.status).toBe(200)
+  })
+
+  test('keeps the host-managed provider proxy working with local auth across H5 modes', async () => {
+    process.env.CC_HAHA_LOCAL_ACCESS_TOKEN = 'desktop-local-secret'
+    await restartRemoteServer()
+
+    const requestProxy = (authorized: boolean) => fetch(`${baseUrl}/proxy/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': 'proxy-managed',
+        ...(authorized
+          ? { Authorization: 'Bearer desktop-local-secret' }
+          : {}),
+      },
+      body: JSON.stringify({ model: 'test', max_tokens: 8, messages: [] }),
+    })
+
+    const disabledTokenlessResponse = await requestProxy(false)
+    expect(disabledTokenlessResponse.status).toBe(403)
+
+    const disabledAuthorizedResponse = await requestProxy(true)
+    expect(disabledAuthorizedResponse.status).toBe(400)
+    await expect(disabledAuthorizedResponse.json()).resolves.toMatchObject({
+      error: { message: 'No active provider configured for proxy' },
+    })
+
+    await new H5AccessService().enable()
+
+    const enabledTokenlessResponse = await requestProxy(false)
+    expect(enabledTokenlessResponse.status).toBe(401)
+
+    const enabledAuthorizedResponse = await requestProxy(true)
+    expect(enabledAuthorizedResponse.status).toBe(400)
+    await expect(enabledAuthorizedResponse.json()).resolves.toMatchObject({
+      error: { message: 'No active provider configured for proxy' },
+    })
   })
 
   test('does not keep retired Tauri origins trusted after Electron replacement', async () => {

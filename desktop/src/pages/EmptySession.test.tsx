@@ -66,6 +66,10 @@ vi.mock('../api/websocket', () => ({
   wsManager: {
     clearHandlers: mocks.wsClearHandlers,
     connect: mocks.wsConnect,
+    onConnectionState: vi.fn((_sessionId: string, handler: (state: string) => void) => {
+      handler('connecting')
+      return () => {}
+    }),
     onMessage: mocks.wsOnMessage,
     send: mocks.wsSend,
     disconnect: mocks.wsDisconnect,
@@ -103,24 +107,41 @@ vi.mock('../components/shared/DirectoryPicker', () => ({
 }))
 
 vi.mock('../components/controls/PermissionModeSelector', () => ({
-  PermissionModeSelector: ({ compact }: { compact?: boolean }) => (
-    <button type="button" data-testid="permission-mode-selector" data-compact={compact ? 'true' : 'false'}>
-      Bypass
+  PermissionModeSelector: ({ compact, value, onChange }: { compact?: boolean; value?: string; onChange?: (mode: string) => void }) => (
+    <button
+      type="button"
+      data-testid="permission-mode-selector"
+      data-compact={compact ? 'true' : 'false'}
+      aria-label={`Permission mode: ${value ?? 'default'}`}
+      onClick={() => onChange?.('auto')}
+    >
+      {value ?? 'default'}
     </button>
   ),
 }))
 
-vi.mock('../components/controls/ModelSelector', () => ({
-  ModelSelector: ({ compact }: { compact?: boolean }) => (
-    <button type="button" data-testid="model-selector" data-compact={compact ? 'true' : 'false'}>
-      Model
-    </button>
-  ),
-}))
+vi.mock('../components/controls/ModelSelector', async () => {
+  const React = await vi.importActual<typeof import('react')>('react')
+  return {
+    ModelSelector: React.forwardRef<{ open: () => void }, { compact?: boolean }>(({ compact }, ref) => {
+      const [open, setOpen] = React.useState(false)
+      React.useImperativeHandle(ref, () => ({ open: () => setOpen(true) }), [])
+      return (
+        <>
+          <button type="button" data-testid="model-selector" data-compact={compact ? 'true' : 'false'}>
+            Model
+          </button>
+          {open && <div data-testid="model-selector-dropdown">Model selector opened</div>}
+        </>
+      )
+    }),
+  }
+})
 
 import { EmptySession } from './EmptySession'
 import { ApiError } from '../api/client'
 import { useChatStore } from '../stores/chatStore'
+import { useProviderStore } from '../stores/providerStore'
 import { useSessionRuntimeStore } from '../stores/sessionRuntimeStore'
 import { useSessionStore } from '../stores/sessionStore'
 import { useSettingsStore } from '../stores/settingsStore'
@@ -176,19 +197,28 @@ describe('EmptySession', () => {
   const initialRuntimeState = useSessionRuntimeStore.getInitialState()
   const initialUiState = useUIStore.getInitialState()
   const initialPluginState = usePluginStore.getInitialState()
+  const initialProviderState = useProviderStore.getInitialState()
 
   beforeEach(() => {
     vi.clearAllMocks()
     mocks.webviewDragHandlers.length = 0
     mocks.isMobile = false
     mocks.isTauriRuntime = false
-    useSettingsStore.setState({ locale: 'en', activeProviderName: null, permissionMode: 'default' })
+    useSettingsStore.setState({
+      locale: 'en',
+      activeProviderName: null,
+      permissionMode: 'default',
+      currentModel: { id: 'claude-opus-4-6', name: 'claude-opus-4-6', description: '', context: '' },
+      effortLevel: 'max',
+      availableModels: [{ id: 'claude-opus-4-6', name: 'claude-opus-4-6', description: '', context: '' }],
+    })
     useSessionStore.setState(initialSessionState, true)
     useChatStore.setState(initialChatState, true)
     useTabStore.setState(initialTabState, true)
     useSessionRuntimeStore.setState(initialRuntimeState, true)
     useUIStore.setState(initialUiState, true)
     usePluginStore.setState(initialPluginState, true)
+    useProviderStore.setState(initialProviderState, true)
 
     mocks.createSession.mockResolvedValue({ sessionId: 'draft-session' })
     mocks.getRepositoryContext.mockResolvedValue(okRepositoryContext())
@@ -228,6 +258,7 @@ describe('EmptySession', () => {
     useSessionRuntimeStore.setState(initialRuntimeState, true)
     useUIStore.setState(initialUiState, true)
     usePluginStore.setState(initialPluginState, true)
+    useProviderStore.setState(initialProviderState, true)
   })
 
   it('uses compact composer controls on phone-sized H5 browsers', async () => {
@@ -353,6 +384,29 @@ describe('EmptySession', () => {
     expect(input).toHaveValue('/agent debugger ')
   })
 
+  it('opens the draft model selector for /model without creating or sending a session', async () => {
+    useSettingsStore.setState({
+      chatSendBehavior: 'enter',
+    })
+
+    render(<EmptySession />)
+
+    const input = screen.getByRole('textbox') as HTMLTextAreaElement
+    fireEvent.change(input, {
+      target: {
+        value: '/model',
+        selectionStart: 6,
+      },
+    })
+
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    expect(mocks.createSession).not.toHaveBeenCalled()
+    expect(mocks.wsSend).not.toHaveBeenCalled()
+    expect(await screen.findByTestId('model-selector-dropdown')).toHaveTextContent('Model selector opened')
+    expect(input).toHaveValue('')
+  })
+
   it('selects a highlighted agent entry from /agent without creating a session', async () => {
     useSettingsStore.setState({
       chatSendBehavior: 'enter',
@@ -455,7 +509,25 @@ describe('EmptySession', () => {
       attachments: [],
     })
     expect(mocks.wsConnect).toHaveBeenCalledWith('draft-session')
-    expect(useSessionRuntimeStore.getState().selections['draft-session']).toBeUndefined()
+    // Visible composer defaults (model + 最大) are now materialized into session runtime
+    // so the first request matches the UI without an extra click.
+    expect(useSessionRuntimeStore.getState().selections['draft-session']).toEqual({
+      providerId: null,
+      modelId: 'claude-opus-4-6',
+      effortLevel: 'max',
+    })
+    expect(mocks.wsSend.mock.calls.slice(0, 2)).toEqual([
+      [
+        'draft-session',
+        {
+          type: 'set_runtime_config',
+          providerId: null,
+          modelId: 'claude-opus-4-6',
+          effortLevel: 'max',
+        },
+      ],
+      ['draft-session', { type: 'prewarm_session' }],
+    ])
   })
 
   it('stores and replays a draft runtime only when the user explicitly selected one', async () => {
@@ -479,6 +551,7 @@ describe('EmptySession', () => {
     expect(useSessionRuntimeStore.getState().selections['draft-session']).toEqual({
       providerId: 'provider-explicit',
       modelId: 'model-explicit',
+      effortLevel: 'max',
     })
     expect(useSessionRuntimeStore.getState().selections['__draft__']).toBeUndefined()
     expect(mocks.wsSend.mock.calls.slice(0, 2)).toEqual([
@@ -488,9 +561,84 @@ describe('EmptySession', () => {
           type: 'set_runtime_config',
           providerId: 'provider-explicit',
           modelId: 'model-explicit',
+          effortLevel: 'max',
         },
       ],
       ['draft-session', { type: 'prewarm_session' }],
+    ])
+  })
+
+  it('creates a new session with the draft Auto permission mode', async () => {
+    render(<EmptySession />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Permission mode: default' }))
+    fireEvent.change(screen.getByRole('textbox'), {
+      target: { value: 'run automatically', selectionStart: 17 },
+    })
+    fireEvent.click(screen.getByRole('button', { name: /Run/i }))
+
+    await waitFor(() => {
+      expect(mocks.createSession).toHaveBeenCalledWith({ permissionMode: 'auto' })
+    })
+  })
+
+  it('materializes the active provider runtime before the first draft message', async () => {
+    useProviderStore.setState({
+      providers: [{
+        id: 'provider-minimax',
+        presetId: 'minimax',
+        name: 'MiniMax',
+        apiKey: 'sk-minimax',
+        baseUrl: 'https://api.minimaxi.com/anthropic',
+        apiFormat: 'anthropic',
+        runtimeKind: 'anthropic_compatible',
+        models: {
+          main: 'MiniMax-M3[1m]',
+          haiku: 'MiniMax-M3[1m]',
+          sonnet: 'MiniMax-M3[1m]',
+          opus: 'MiniMax-M3[1m]',
+        },
+        toolSearchEnabled: true,
+      }],
+      activeId: 'provider-minimax',
+      providerOrder: ['provider-minimax', 'claude-official', 'openai-official', 'grok-official'],
+      hasLoadedProviders: true,
+    })
+
+    render(<EmptySession />)
+
+    fireEvent.change(screen.getByRole('textbox'), {
+      target: { value: 'draft question', selectionStart: 14 },
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /Run/i }))
+
+    await waitFor(() => {
+      expect(mocks.createSession).toHaveBeenCalledWith({ permissionMode: 'default' })
+    })
+
+    expect(useSessionRuntimeStore.getState().selections['draft-session']).toEqual({
+      providerId: 'provider-minimax',
+      modelId: 'MiniMax-M3[1m]',
+    })
+    expect(mocks.wsSend.mock.calls.slice(0, 3)).toEqual([
+      [
+        'draft-session',
+        {
+          type: 'set_runtime_config',
+          providerId: 'provider-minimax',
+          modelId: 'MiniMax-M3[1m]',
+        },
+      ],
+      ['draft-session', { type: 'prewarm_session' }],
+      [
+        'draft-session',
+        {
+          type: 'user_message',
+          content: 'draft question',
+          attachments: [],
+        },
+      ],
     ])
   })
 

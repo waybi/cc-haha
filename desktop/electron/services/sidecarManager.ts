@@ -1,19 +1,38 @@
 import { spawn, spawnSync, type ChildProcessByStdio } from 'node:child_process'
-import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
+import {
+  closeSync,
+  existsSync,
+  fstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import type { Readable } from 'node:stream'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
+import { isBrowserSafePort } from '../../src/lib/browserSafePort'
 
 export const SERVER_BIND_HOST = '0.0.0.0'
 export const SERVER_CONTROL_HOST = '127.0.0.1'
+export const SERVER_STARTUP_TIMEOUT_MS = 30_000
 export const SERVER_STARTUP_LOG_LIMIT = 80
+export const HOST_DIAGNOSTICS_LINE_LIMIT = 80
+export const HOST_DIAGNOSTICS_BYTE_LIMIT = 256 * 1024
+export const ELECTRON_DIAGNOSTICS_FILE_ENV = 'CC_HAHA_ELECTRON_DIAGNOSTICS_FILE'
+export const RIPGREP_PATH_ENV = 'CC_HAHA_RIPGREP_PATH'
+const HOST_DIAGNOSTICS_LINE_BYTE_LIMIT = 4096
 // Shared with the Tauri shell (src-tauri/src/lib.rs) so both desktop builds
 // reuse the same sticky port across restarts (issue #767).
 export const SERVER_STATE_FILE = 'desktop-server-state.json'
 // Mirrors the server-side fixedPort range (h5AccessService MIN/MAX_FIXED_PORT).
 const MIN_FIXED_PORT = 1024
 const MAX_FIXED_PORT = 65535
+const MAX_PORT_RESERVATION_ATTEMPTS = 128
 
 export type SidecarChild = ChildProcessByStdio<null, Readable, Readable>
 
@@ -33,7 +52,12 @@ const PROXY_ENV_KEYS = [
   'HTTPS_PROXY',
   'http_proxy',
   'https_proxy',
+  'ALL_PROXY',
+  'all_proxy',
 ] as const
+export const SYSTEM_PROXY_BRIDGE_ENV = 'CC_HAHA_SYSTEM_PROXY_URL'
+export const SYSTEM_PROXY_ERROR_ENV = 'CC_HAHA_SYSTEM_PROXY_ERROR'
+const LOOPBACK_NO_PROXY_ENTRIES = ['localhost', '127.0.0.1', '::1'] as const
 
 export function resolveHostTriple(platform = process.platform, arch = process.arch): string {
   if (platform === 'darwin' && arch === 'arm64') return 'aarch64-apple-darwin'
@@ -50,13 +74,54 @@ export function resolveSidecarExecutable(desktopRoot: string, triple = resolveHo
   return process.platform === 'win32' ? `${base}.exe` : base
 }
 
+export function resolveBundledRipgrepExecutable(
+  desktopRoot: string,
+  triple = resolveHostTriple(),
+): string {
+  const extension = triple.includes('windows') ? '.exe' : ''
+  return path.join(desktopRoot, 'src-tauri', 'binaries', `rg${extension}`)
+}
+
+function withBundledRipgrepPath(
+  env: NodeJS.ProcessEnv,
+  desktopRoot: string,
+): NodeJS.ProcessEnv {
+  const bundledRipgrep = resolveBundledRipgrepExecutable(desktopRoot)
+  const explicitRipgrep = env[RIPGREP_PATH_ENV]?.trim()
+  const selectedRipgrep = explicitRipgrep && existsSync(explicitRipgrep)
+    ? explicitRipgrep
+    : existsSync(bundledRipgrep)
+      ? bundledRipgrep
+      : null
+  if (!selectedRipgrep) return env
+
+  const pathKey = process.platform === 'win32'
+    ? Object.keys(env).find(key => key.toLowerCase() === 'path') ?? 'Path'
+    : 'PATH'
+  const currentPath = env[pathKey] ?? ''
+  const ripgrepDirectory = path.dirname(selectedRipgrep)
+  const nextPath = currentPath
+    ? `${currentPath}${path.delimiter}${ripgrepDirectory}`
+    : ripgrepDirectory
+
+  return {
+    ...env,
+    [pathKey]: nextPath,
+    [RIPGREP_PATH_ENV]: explicitRipgrep || bundledRipgrep,
+  }
+}
+
 export function httpToWebSocketUrl(serverHttpUrl: string): string {
   if (serverHttpUrl.startsWith('http://')) return `ws://${serverHttpUrl.slice('http://'.length)}`
   if (serverHttpUrl.startsWith('https://')) return `wss://${serverHttpUrl.slice('https://'.length)}`
   return serverHttpUrl
 }
 
-export async function reserveLocalPort(bindHost = SERVER_BIND_HOST): Promise<number> {
+export type ReserveLocalPortDeps = {
+  reserveCandidate?: (bindHost: string) => Promise<number>
+}
+
+async function reserveLocalPortCandidate(bindHost: string): Promise<number> {
   return await new Promise((resolve, reject) => {
     const server = net.createServer()
     server.once('error', error => reject(error))
@@ -71,6 +136,19 @@ export async function reserveLocalPort(bindHost = SERVER_BIND_HOST): Promise<num
       })
     })
   })
+}
+
+export async function reserveLocalPort(
+  bindHost = SERVER_BIND_HOST,
+  deps: ReserveLocalPortDeps = {},
+): Promise<number> {
+  const reserveCandidate = deps.reserveCandidate ?? reserveLocalPortCandidate
+  for (let attempt = 0; attempt < MAX_PORT_RESERVATION_ATTEMPTS; attempt++) {
+    const port = await reserveCandidate(bindHost)
+    if (isBrowserSafePort(port)) return port
+    console.error(`[desktop] OS assigned browser-blocked server port ${port}; retrying`)
+  }
+  throw new Error('Could not reserve a browser-safe local port')
 }
 
 function canBindPort(bindHost: string, port: number): Promise<boolean> {
@@ -93,15 +171,32 @@ export async function reserveServerPort(
   preferred: number[],
 ): Promise<number> {
   for (const port of preferred) {
-    if (!Number.isInteger(port) || port <= 0 || port > 65535) continue
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+      console.error(`[desktop] preferred server port ${port} is invalid; skipping`)
+      continue
+    }
+    if (!isBrowserSafePort(port)) {
+      console.error(`[desktop] preferred server port ${port} is blocked by browser fetch; skipping`)
+      continue
+    }
     if (await canBindPort(bindHost, port)) return port
     console.error(`[desktop] preferred server port ${port} unavailable`)
   }
   return await reserveLocalPort(bindHost)
 }
 
-export function claudeConfigDir(env: NodeJS.ProcessEnv = process.env): string {
-  return env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude')
+export function claudeConfigDir(
+  env: NodeJS.ProcessEnv = process.env,
+  homeDir = os.homedir(),
+): string {
+  return env.CLAUDE_CONFIG_DIR || path.join(homeDir, '.claude')
+}
+
+export function electronHostDiagnosticsFile(
+  env: NodeJS.ProcessEnv = process.env,
+  homeDir = os.homedir(),
+): string {
+  return path.join(claudeConfigDir(env, homeDir), 'cc-haha', 'diagnostics', 'electron-host.log')
 }
 
 /** Parse h5Access.fixedPort out of cc-haha/settings.json contents. */
@@ -117,7 +212,7 @@ export function parseH5FixedPort(contents: string): number | null {
   if (!h5Access || typeof h5Access !== 'object') return null
   const port = (h5Access as Record<string, unknown>).fixedPort
   if (typeof port !== 'number' || !Number.isInteger(port)) return null
-  return port >= MIN_FIXED_PORT && port <= MAX_FIXED_PORT ? port : null
+  return port >= MIN_FIXED_PORT && port <= MAX_FIXED_PORT && isBrowserSafePort(port) ? port : null
 }
 
 export function readH5FixedPort(env: NodeJS.ProcessEnv = process.env): number | null {
@@ -136,7 +231,7 @@ export function readLastServerPort(env: NodeJS.ProcessEnv = process.env): number
     if (!state || typeof state !== 'object') return null
     const port = (state as Record<string, unknown>).lastPort
     if (typeof port !== 'number' || !Number.isInteger(port)) return null
-    return port > 0 && port <= 65535 ? port : null
+    return isBrowserSafePort(port) ? port : null
   } catch {
     return null
   }
@@ -162,28 +257,47 @@ export function preferredServerPorts(env: NodeJS.ProcessEnv = process.env): numb
   return ports
 }
 
-export async function waitForServer(host: string, port: number, timeoutMs = 10_000): Promise<void> {
+export async function waitForServer(host: string, port: number, timeoutMs = SERVER_STARTUP_TIMEOUT_MS): Promise<void> {
   const deadline = Date.now() + timeoutMs
+  const healthUrl = `http://${host}:${port}/health`
+  let lastError: Error | null = null
+
   while (Date.now() < deadline) {
-    if (await canConnect(host, port)) return
+    try {
+      await assertServerHealth(healthUrl, Math.min(500, Math.max(100, deadline - Date.now())))
+      return
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error))
+    }
     await sleep(150)
   }
-  throw new Error(`desktop server did not start listening on ${host}:${port} within ${Math.round(timeoutMs / 1000)} seconds`)
+
+  const reason = lastError ? `: ${lastError.message}` : ''
+  throw new Error(`desktop server did not report healthy at ${healthUrl} within ${Math.round(timeoutMs / 1000)} seconds${reason}`)
 }
 
-function canConnect(host: string, port: number): Promise<boolean> {
-  return new Promise(resolve => {
-    const socket = net.connect({ host, port, timeout: 200 })
-    socket.once('connect', () => {
-      socket.destroy()
-      resolve(true)
+async function assertServerHealth(healthUrl: string, timeoutMs: number): Promise<void> {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const response = await fetch(healthUrl, {
+      cache: 'no-store',
+      signal: controller.signal,
     })
-    socket.once('timeout', () => {
-      socket.destroy()
-      resolve(false)
-    })
-    socket.once('error', () => resolve(false))
-  })
+    if (!response.ok) throw new Error(`healthcheck returned ${response.status}`)
+
+    const contentType = response.headers.get('content-type') ?? ''
+    if (!contentType.toLowerCase().includes('application/json')) {
+      throw new Error(`healthcheck returned non-JSON response from ${healthUrl}`)
+    }
+
+    const body = await response.json().catch(() => null)
+    if (!body || typeof body !== 'object' || !('status' in body) || body.status !== 'ok') {
+      throw new Error(`healthcheck returned invalid response from ${healthUrl}`)
+    }
+  } finally {
+    clearTimeout(timeout)
+  }
 }
 
 function sleep(ms: number): Promise<void> {
@@ -191,10 +305,99 @@ function sleep(ms: number): Promise<void> {
 }
 
 export function pushStartupLog(logs: string[], line: string) {
-  const trimmed = line.trimEnd()
+  const trimmed = sanitizeHostDiagnostic(line, os.homedir())
   if (!trimmed) return
   if (logs.length >= SERVER_STARTUP_LOG_LIMIT) logs.shift()
   logs.push(trimmed)
+}
+
+export function appendHostDiagnostic(
+  filePath: string | undefined,
+  line: string,
+  { homeDir = os.homedir() }: { homeDir?: string } = {},
+): void {
+  if (!filePath) return
+  const tempPath = `${filePath}.${process.pid}.tmp`
+  try {
+    const sanitized = sanitizeHostDiagnostic(line, homeDir)
+    if (!sanitized) return
+    const existing = readHostDiagnosticsTail(filePath)
+    const lines = existing.trimEnd()
+      ? existing.trimEnd().split('\n').map(entry => sanitizeHostDiagnostic(entry, homeDir)).filter(Boolean)
+      : []
+    lines.push(sanitized)
+    const boundedLines: string[] = []
+    let retainedBytes = 0
+    for (const entry of lines.slice(-HOST_DIAGNOSTICS_LINE_LIMIT).reverse()) {
+      const entryBytes = Buffer.byteLength(entry, 'utf-8') + 1
+      if (retainedBytes + entryBytes > HOST_DIAGNOSTICS_BYTE_LIMIT) break
+      boundedLines.unshift(entry)
+      retainedBytes += entryBytes
+    }
+    mkdirSync(path.dirname(filePath), { recursive: true })
+    writeFileSync(tempPath, `${boundedLines.join('\n')}\n`, {
+      encoding: 'utf-8',
+      mode: 0o600,
+    })
+    renameSync(tempPath, filePath)
+  } catch {
+    try {
+      rmSync(tempPath, { force: true })
+    } catch {
+      // Best-effort cleanup must not mask the original diagnostics failure.
+    }
+    console.error('[desktop] failed to persist Electron host diagnostics')
+  }
+}
+
+function readHostDiagnosticsTail(filePath: string): string {
+  let descriptor: number | undefined
+  try {
+    descriptor = openSync(filePath, 'r')
+    const size = fstatSync(descriptor).size
+    const length = Math.min(size, HOST_DIAGNOSTICS_BYTE_LIMIT)
+    const buffer = Buffer.alloc(length)
+    const bytesRead = readSync(descriptor, buffer, 0, length, size - length)
+    const tail = buffer.subarray(0, bytesRead).toString('utf-8')
+    if (size <= length) return tail
+    const firstNewline = tail.indexOf('\n')
+    return firstNewline >= 0 ? tail.slice(firstNewline + 1) : ''
+  } catch {
+    return ''
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor)
+  }
+}
+
+export function sanitizeHostDiagnostic(line: string, homeDir = os.homedir()): string {
+  let sanitized = line
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/https?:\/\/[^\s<>"')\]}]+/gi, candidate => sanitizeUrlUserinfo(candidate))
+    .replace(/\bBearer\s+[^\s,;]+/gi, 'Bearer [REDACTED]')
+    .replace(
+      /\b((?:(?:[a-z0-9]+_)*(?:api[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token|session[_-]?token|password|secret))\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
+      '$1[REDACTED]',
+    )
+    .replace(/\b(?:sk-(?:ant-api03-|proj-)?|ghp_)[A-Za-z0-9_-]{8,}\b/g, '[REDACTED]')
+    .trimEnd()
+  if (homeDir) sanitized = sanitized.replaceAll(homeDir, '[HOME]')
+  return truncateUtf8(sanitized, HOST_DIAGNOSTICS_LINE_BYTE_LIMIT)
+}
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  const buffer = Buffer.from(value, 'utf-8')
+  if (buffer.byteLength <= maxBytes) return value
+  return buffer.subarray(0, maxBytes).toString('utf-8').replace(/\uFFFD$/, '')
+}
+
+function sanitizeUrlUserinfo(candidate: string): string {
+  try {
+    const url = new URL(candidate)
+    if (!url.username && !url.password) return candidate
+    return `${url.protocol}//[REDACTED]@${url.host}${url.pathname}${url.search}${url.hash}`
+  } catch {
+    return '[REDACTED_URL]'
+  }
 }
 
 export function formatStartupError(message: string, logs: string[]): string {
@@ -204,41 +407,66 @@ export function formatStartupError(message: string, logs: string[]): string {
   return `${message}\n\nRecent server logs:\n${logText}`
 }
 
-export function proxyUrlFromElectronProxyRules(rules: string | undefined): string | undefined {
-  if (!rules) return undefined
-
-  for (const rawRule of rules.split(';')) {
-    const rule = rawRule.trim()
-    if (!rule || /^DIRECT$/i.test(rule)) continue
-
-    const match = rule.match(/^(PROXY|HTTPS)\s+(.+)$/i)
-    if (!match) continue
-
-    const scheme = match[1]!.toUpperCase() === 'HTTPS' ? 'https' : 'http'
-    const hostPort = match[2]!.trim()
-    if (!hostPort) continue
-
-    return `${scheme}://${hostPort}`
-  }
-
-  return undefined
+export function clearProxyEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env = { ...baseEnv }
+  for (const key of PROXY_ENV_KEYS) delete env[key]
+  delete env[SYSTEM_PROXY_BRIDGE_ENV]
+  delete env[SYSTEM_PROXY_ERROR_ENV]
+  const noProxy = mergeLoopbackNoProxy(env.no_proxy || env.NO_PROXY)
+  return { ...env, NO_PROXY: noProxy, no_proxy: noProxy }
 }
 
-export function mergeProxyEnv(
+export function withSystemProxyBridgeEnv(
   baseEnv: NodeJS.ProcessEnv,
-  proxyUrl: string | undefined,
+  bridgeUrl: string,
 ): NodeJS.ProcessEnv {
-  if (!proxyUrl) return baseEnv
-  if (PROXY_ENV_KEYS.some(key => baseEnv[key])) return baseEnv
-
   return {
-    ...baseEnv,
-    HTTP_PROXY: proxyUrl,
-    HTTPS_PROXY: proxyUrl,
-    http_proxy: proxyUrl,
-    https_proxy: proxyUrl,
-    NO_PROXY: baseEnv.NO_PROXY || baseEnv.no_proxy || 'localhost,127.0.0.1,::1',
+    ...clearProxyEnv(baseEnv),
+    [SYSTEM_PROXY_BRIDGE_ENV]: bridgeUrl,
   }
+}
+
+export function withSystemProxyErrorEnv(
+  baseEnv: NodeJS.ProcessEnv,
+  error: unknown,
+): NodeJS.ProcessEnv {
+  const message = error instanceof Error ? error.message : String(error)
+  const sanitized = sanitizeHostDiagnostic(message).replace(/\s+/g, ' ').trim()
+    || 'unknown bridge startup error'
+  return {
+    ...clearProxyEnv(baseEnv),
+    [SYSTEM_PROXY_ERROR_ENV]: `System proxy bridge unavailable: ${sanitized}`,
+  }
+}
+
+export function withAdapterProxyBridgeEnv(
+  baseEnv: NodeJS.ProcessEnv,
+  bridgeUrl: string,
+): NodeJS.ProcessEnv {
+  const env = clearProxyEnv(baseEnv)
+  return {
+    ...env,
+    HTTP_PROXY: bridgeUrl,
+    HTTPS_PROXY: bridgeUrl,
+    http_proxy: bridgeUrl,
+    https_proxy: bridgeUrl,
+    ALL_PROXY: bridgeUrl,
+    all_proxy: bridgeUrl,
+  }
+}
+
+function mergeLoopbackNoProxy(existing: string | undefined): string {
+  const entries = (existing ?? '')
+    .split(/[,\s]+/)
+    .map(entry => entry.trim())
+    .filter(Boolean)
+  const lowerEntries = new Set(entries.map(entry => entry.toLowerCase()))
+
+  for (const entry of LOOPBACK_NO_PROXY_ENTRIES) {
+    if (!lowerEntries.has(entry.toLowerCase())) entries.push(entry)
+  }
+
+  return entries.join(',')
 }
 
 // The agent's PowerShellTool reads this env var to honor the user's chosen shell
@@ -297,7 +525,7 @@ export function createServerPlan({
   return {
     command: resolveSidecarExecutable(desktopRoot),
     args: ['server', '--app-root', appRoot, '--host', bindHost, '--port', String(port)],
-    env: buildSidecarEnv(env, h5DistDir),
+    env: buildSidecarEnv(withBundledRipgrepPath(env, desktopRoot), h5DistDir),
   }
 }
 
@@ -320,7 +548,7 @@ export function createAdapterPlan({
     command: resolveSidecarExecutable(desktopRoot),
     args: ['adapters', '--app-root', appRoot, flag],
     env: {
-      ...buildSidecarEnv(env, h5DistDir),
+      ...buildSidecarEnv(withBundledRipgrepPath(env, desktopRoot), h5DistDir),
       ADAPTER_SERVER_URL: httpToWebSocketUrl(serverUrl),
     },
   }

@@ -56,7 +56,7 @@ Claude Code Haha 的桌面端把会话、多项目、分支 / Worktree、右侧�
 
 1. 前往 [Releases](https://github.com/NanmiCoder/cc-haha/releases) 下载 macOS / Windows / Linux 桌面端安装包。
 2. 首次启动后，在桌面端设置里配置模型提供商、API Key 和默认模型。
-3. 当前版本暂未签名，首次安装需要手动放行一次（macOS 解除隔离、Windows 点"仍要运行"）。详见 [桌面端安装指南](docs/desktop/04-installation.md)。
+3. 正式 macOS Release 需要经过签名和公证；如果安装的是 draft/unsigned 临时包，首次打开可能仍需手动放行。Windows 未签名安装包可能出现 SmartScreen 提示，点「更多信息」→「仍要运行」即可。详见 [桌面端安装指南](docs/desktop/04-installation.md)。
 
 ## 从源码启动 CLI
 
@@ -80,6 +80,8 @@ cp .env.example .env
 - **代码修改可视化**：直接查看 AI 对文件的编辑、Diff 和执行过程。
 - **权限与确认流**：危险命令、工具调用和 AI 反问可以在桌面端集中审批。
 - **多模型提供商**：支持 Anthropic 兼容 API、第三方模型、WebSearch fallback 和本地配置。
+- **技能市场**：在桌面端发现、预览、安装和管理 ClawHub / SkillHub 第三方技能。
+- **会话活动面板**：集中查看任务、后台任务、SubAgent、团队活动和 sources。
 - **Computer Use**：让 Agent 在授权后截图、点击、输入并控制桌面应用。
 - **H5 远程访问**：用一次性令牌在手机或其他设备上接入当前桌面端会话。
 - **IM 接入**：通过 Telegram / 飞书 / 微信 / 钉钉远程对话、切换项目和审批权限。
@@ -140,6 +142,16 @@ cp .env.example .env
         感谢 <a href="https://www.shengsuanyun.com/?from=CH_LEJ88KWR">胜算云</a> 赞助本项目！胜算云是面向 AI Native Teams 的工业级 AI 任务并行执行平台，聚合 Claude、ChatGPT、Gemini 等海内外 LLM 及图片、视频多媒体模型算力；官方直连、非逆向，平台 SLA 可用性达 99.7%，可查看 <a href="https://watch.shengsuanyun.com/status/shengsuanyun">服务状态</a>。平台支持企业专属网关、成本与权限管控、智能路由、安全防护和 BYOK，按量与 tokens plan（即将上线）计费并可开票；使用 <a href="https://www.shengsuanyun.com/?from=CH_LEJ88KWR">专属链接</a> 注册可获 10 元模力及首充 10% 赠送。
       </td>
     </tr>
+    <tr>
+      <td align="center" valign="middle">
+        <a href="https://teamorouter.com/?utm_source=cc_haha&utm_medium=referral&utm_campaign=ai_directory">
+          <img src="docs/images/sponsors/teamorouter-logo.svg" width="180" alt="TeamoRouter">
+        </a>
+      </td>
+      <td valign="middle">
+        感谢 <a href="https://teamorouter.com/?utm_source=cc_haha&utm_medium=referral&utm_campaign=ai_directory">TeamoRouter</a> 赞助本项目！TeamoRouter 是面向开发者、AI 团队与企业的企业级 Agentic LLM 网关，无需任何订阅即可通过统一 API 使用 Claude Code、Codex、Gemini CLI 等热门 AI Agent，API 价格最高可享 90% 折扣。平台聚合 OpenAI、Anthropic、Vertex、Azure、AWS Bedrock 等数百家官方模型提供商与可信基础设施，全部经过 100% Agent 协议兼容、缓存性能与请求可追踪性验证，官方直连、非逆向，提供接近官方的 TTFT、99.6% SLA、最高 5,000 QPM 吞吐与行业领先的缓存命中率；同时支持集中账单、团队管理、BYOK、智能路由、用量分析与专属支持，并可通过 Teamo Desktop 一键使用各类 AI Agent。新用户通过 <a href="https://teamorouter.com/?utm_source=cc_haha&utm_medium=referral&utm_campaign=ai_directory">专属链接</a> 注册，首次充值可享 10% 折扣。
+      </td>
+    </tr>
   </tbody>
 </table>
 
@@ -193,19 +205,8 @@ cp .env.example .env
 - [Electron](https://github.com/electron/electron)：跨端桌面应用能力与工程实践。
 - [cc-switch](https://github.com/farion1231/cc-switch)：模型供应商配置能力参考。
 
----
 
-## ⭐ Star 趋势图
 
-如果这个项目对您有帮助，请给个 ⭐ Star 支持一下，让更多的人看到 Claude Code Haha！
-
-<a href="https://www.star-history.com/#NanmiCoder/cc-haha&Date">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=NanmiCoder/cc-haha&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=NanmiCoder/cc-haha&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=NanmiCoder/cc-haha&type=Date" />
-  </picture>
-</a>
 
 ---
 

@@ -13,7 +13,16 @@ import { ProviderService } from './providerService.js'
 import {
   OPENAI_CODEX_OAUTH_FILE_ENV_KEY,
   OPENAI_OAUTH_PROVIDER_ENV_KEY,
+  isOpenAIOfficialProviderId,
 } from './openaiOfficialProvider.js'
+import {
+  GROK_OAUTH_FILE_ENV_KEY,
+  GROK_OAUTH_PROVIDER_ENV_KEY,
+} from './grokOfficialProvider.js'
+import {
+  OPENAI_CODEX_REASONING_EFFORT_ENV_KEY,
+  isOpenAIReasoningEffort,
+} from '../../services/openaiAuth/models.js'
 import { sessionService } from './sessionService.js'
 import { diagnosticsService } from './diagnosticsService.js'
 import {
@@ -31,7 +40,12 @@ import { findCanonicalGitRoot } from '../../utils/git.js'
 import { sanitizePath } from '../../utils/path.js'
 import { getProcessEnvWithTerminalShellEnvironment } from '../../utils/terminalShellEnvironment.js'
 import { attributionHeaderEnvForModel } from './attributionHeaderPolicy.js'
-import { buildNetworkEnvironment, loadNetworkSettings } from './networkSettings.js'
+import {
+  buildNetworkEnvironment,
+  loadNetworkSettings,
+  SYSTEM_PROXY_URL_ENV,
+  type NetworkSettings,
+} from './networkSettings.js'
 import { readTraceCaptureSettings } from './traceCaptureService.js'
 import { logError } from '../../utils/log.js'
 import {
@@ -42,6 +56,9 @@ import {
 const MAX_CAPTURED_PROCESS_LINES = 80
 const MAX_CAPTURED_SDK_MESSAGES = 40
 const MAX_CAPTURED_SDK_SUMMARY = 20
+export const MAX_CAPTURED_SDK_MESSAGE_BYTES = 64 * 1024
+export const MAX_CAPTURED_SDK_TOTAL_BYTES = 512 * 1024
+const MAX_CAPTURED_SDK_DIAGNOSTIC_TEXT_BYTES = 4 * 1024
 const CONTROL_READY_POLL_MS = 50
 const AUTO_MEMORY_DIRNAME = 'memory'
 export const DESKTOP_CLI_GRACEFUL_SHUTDOWN_TIMEOUT_MS = 6_000
@@ -93,13 +110,35 @@ type MaterializedAttachments = {
   imageMetadataTexts: string[]
 }
 
+type SessionOutputCallback = (msg: any) => void
+
+function networkRoutingFingerprint(
+  settings: NetworkSettings,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return JSON.stringify({
+    timeoutMs: settings.aiRequestTimeoutMs,
+    proxyMode: settings.proxy.mode,
+    manualProxyUrl: settings.proxy.mode === 'manual' ? settings.proxy.url.trim() : '',
+    systemProxyUrl:
+      settings.proxy.mode === 'system'
+        ? env[SYSTEM_PROXY_URL_ENV]?.trim() || ''
+        : '',
+    noProxy: env.no_proxy || env.NO_PROXY || '',
+  })
+}
+
 type SessionProcess = {
   proc: ReturnType<typeof Bun.spawn>
-  outputCallbacks: Array<(msg: any) => void>
+  outputCallbacks: SessionOutputCallback[]
   workDir: string
   permissionMode: string
+  networkRoutingFingerprint: string
+  networkDerivedFirstTokenTimeout: boolean
   sdkToken: string
   sdkSocket: { send(data: string): void } | null
+  sdkAttached: Promise<void>
+  resolveSdkAttached: (() => void) | null
   pendingOutbound: string[]
   startupPending: boolean
   startupExitCode: number | null
@@ -107,6 +146,7 @@ type SessionProcess = {
   stderrLines: string[]
   outputDrain: Promise<void>
   sdkMessages: any[]
+  sdkMessageBytes?: number
   initMessage: any | null
   usesOfficialOAuth: boolean
   officialOAuthToken: string | null
@@ -160,6 +200,25 @@ export class ConversationService {
   private sessions = new Map<string, SessionProcess>()
   private deletedSessions = new Set<string>()
   private providerService = new ProviderService()
+  private pendingPermissionModeChanges = new Map<string, Map<string, number>>()
+
+  private trackPendingPermissionModeChange(sessionId: string, mode: string, delta: 1 | -1): void {
+    const sessionChanges = this.pendingPermissionModeChanges.get(sessionId) ?? new Map<string, number>()
+    const nextCount = (sessionChanges.get(mode) ?? 0) + delta
+    if (nextCount > 0) {
+      sessionChanges.set(mode, nextCount)
+      this.pendingPermissionModeChanges.set(sessionId, sessionChanges)
+      return
+    }
+    sessionChanges.delete(mode)
+    if (sessionChanges.size === 0) {
+      this.pendingPermissionModeChanges.delete(sessionId)
+    }
+  }
+
+  isPermissionModeChangePending(sessionId: string, mode: string): boolean {
+    return (this.pendingPermissionModeChanges.get(sessionId)?.get(mode) ?? 0) > 0
+  }
 
   private buildSessionCliArgs(
     sessionId: string,
@@ -294,7 +353,15 @@ export class ConversationService {
     // 工作目录就变成 `/`。把 CALLER_DIR / PWD 显式覆盖成 workDir，preload.ts
     // chdir 后落到正确目录。
     //
-    const childEnv = await this.buildChildEnv(launchWorkDir, sdkUrl, options)
+    const networkSettings = await loadNetworkSettings()
+    const networkRuntimeMetadata = { firstTokenTimeoutDerived: false }
+    const childEnv = await this.buildChildEnv(
+      launchWorkDir,
+      sdkUrl,
+      options,
+      networkSettings,
+      networkRuntimeMetadata,
+    )
     const usesOfficialOAuth = this.shouldMarkManagedOAuth(options?.providerId)
 
     let proc: ReturnType<typeof Bun.spawn>
@@ -322,13 +389,21 @@ export class ConversationService {
       )
     }
 
+    let resolveSdkAttached: (() => void) | null = null
+    const sdkAttached = new Promise<void>((resolve) => {
+      resolveSdkAttached = resolve
+    })
     const session: SessionProcess = {
       proc,
       outputCallbacks: [],
       workDir: launchWorkDir,
       permissionMode: options?.permissionMode || 'default',
+      networkRoutingFingerprint: networkRoutingFingerprint(networkSettings, childEnv),
+      networkDerivedFirstTokenTimeout: networkRuntimeMetadata.firstTokenTimeoutDerived,
       sdkToken: this.getSdkTokenFromUrl(sdkUrl),
       sdkSocket: null,
+      sdkAttached,
+      resolveSdkAttached,
       pendingOutbound: [],
       startupPending: true,
       startupExitCode: null,
@@ -336,6 +411,7 @@ export class ConversationService {
       stderrLines: [],
       outputDrain: Promise.resolve(),
       sdkMessages: [],
+      sdkMessageBytes: 0,
       initMessage: null,
       usesOfficialOAuth,
       officialOAuthToken: childEnv.CLAUDE_CODE_OAUTH_TOKEN ?? null,
@@ -353,12 +429,15 @@ export class ConversationService {
     })
 
     const STARTUP_GRACE_MS = 3000
+    let startupGraceTimer: ReturnType<typeof setTimeout> | undefined
     const earlyExitCode = await Promise.race([
       proc.exited,
+      session.sdkAttached.then(() => null),
       new Promise<null>((resolve) =>
-        setTimeout(() => resolve(null), STARTUP_GRACE_MS),
+        startupGraceTimer = setTimeout(() => resolve(null), STARTUP_GRACE_MS),
       ),
     ])
+    if (startupGraceTimer) clearTimeout(startupGraceTimer)
 
     const startupExitCode = earlyExitCode ?? session.startupExitCode
     if (startupExitCode !== null) {
@@ -452,11 +531,15 @@ export class ConversationService {
     content: string,
     attachments?: AttachmentRef[],
   ): Promise<boolean> {
-    const session = this.sessions.get(sessionId)
+    const userContent = await this.buildUserContent(content, sessionId, attachments)
+    let session = this.sessions.get(sessionId)
+    if (session && !await this.refreshNetworkEnvironmentBeforeTurn(sessionId, session)) {
+      return false
+    }
+    session = this.sessions.get(sessionId)
     if (session) {
       await this.refreshOfficialOAuthTokenBeforeTurn(sessionId, session)
     }
-    const userContent = await this.buildUserContent(content, sessionId, attachments)
     return this.sendSdkMessage(sessionId, {
       type: 'user',
       message: {
@@ -466,6 +549,45 @@ export class ConversationService {
       parent_tool_use_id: null,
       session_id: '',
     })
+  }
+
+  private async refreshNetworkEnvironmentBeforeTurn(
+    sessionId: string,
+    session: SessionProcess,
+  ): Promise<boolean> {
+    const settings = await loadNetworkSettings()
+    const baseEnv = await getProcessEnvWithTerminalShellEnvironment()
+    const networkEnv = buildNetworkEnvironment(settings, baseEnv)
+    const fingerprint = networkRoutingFingerprint(settings, {
+      ...baseEnv,
+      ...networkEnv,
+    })
+
+    if (this.sessions.get(sessionId) !== session) return false
+    if (!session.networkRoutingFingerprint) {
+      session.networkRoutingFingerprint = fingerprint
+      return true
+    }
+    if (session.networkRoutingFingerprint === fingerprint) return true
+
+    const noProxy = networkEnv.no_proxy || networkEnv.NO_PROXY || ''
+    const variables: Record<string, string> = {
+      ...networkEnv,
+      NO_PROXY: noProxy,
+      no_proxy: noProxy,
+    }
+    if (session.networkDerivedFirstTokenTimeout) {
+      variables.CLAUDE_STREAM_FIRST_TOKEN_TIMEOUT_MS = networkEnv.API_TIMEOUT_MS
+    }
+
+    const sent = this.sendSdkMessage(sessionId, {
+      type: 'update_environment_variables',
+      variables,
+    })
+    if (sent && this.sessions.get(sessionId) === session) {
+      session.networkRoutingFingerprint = fingerprint
+    }
+    return sent
   }
 
   respondToPermission(
@@ -505,25 +627,77 @@ export class ConversationService {
                   }
                 : {}),
             }
-          : { behavior: 'deny', message: denyMessage || 'User denied via UI' },
+          : {
+              behavior: 'deny',
+              message: denyMessage || 'User denied via UI',
+              // Rejecting ExitPlanMode means "keep planning"; other desktop
+              // denials stop the current agent turn and wait for user input.
+              ...(pendingRequest?.toolName !== 'ExitPlanMode'
+                ? { interrupt: true }
+                : {}),
+            },
       },
     })
   }
 
-  setPermissionMode(sessionId: string, mode: string): boolean {
-    const sent = this.sendSdkMessage(sessionId, {
-      type: 'control_request',
-      request_id: crypto.randomUUID(),
-      request: {
+  async setPermissionMode(sessionId: string, mode: string, timeoutMs = 10_000): Promise<boolean> {
+    if (!this.sessions.has(sessionId)) return false
+    this.trackPendingPermissionModeChange(sessionId, mode, 1)
+
+    let confirmationSettled = false
+    let confirmationTimeout: ReturnType<typeof setTimeout>
+    let handleOutput: (msg: any) => void
+    const cleanupConfirmation = () => {
+      clearTimeout(confirmationTimeout)
+      this.removeOutputCallback(sessionId, handleOutput)
+    }
+    const confirmation = new Promise<void>((resolve, reject) => {
+      handleOutput = (msg: any) => {
+        if (
+          msg?.type !== 'system' ||
+          msg.subtype !== 'status' ||
+          msg.permissionMode !== mode
+        ) {
+          return
+        }
+
+        confirmationSettled = true
+        cleanupConfirmation()
+        resolve()
+      }
+
+      confirmationTimeout = setTimeout(() => {
+        confirmationSettled = true
+        cleanupConfirmation()
+        reject(new Error(`Timed out waiting for permission mode confirmation: ${mode}`))
+      }, timeoutMs)
+      this.onOutput(sessionId, handleOutput)
+    })
+    // requestControl can reject before the confirmation promise is awaited.
+    // Attach a handler immediately so a later confirmation timeout is never unhandled.
+    void confirmation.catch(() => undefined)
+
+    try {
+      await this.requestControl(sessionId, {
         subtype: 'set_permission_mode',
         mode,
-      },
-    })
-    if (sent) {
-      const session = this.sessions.get(sessionId)
-      if (session) session.permissionMode = mode
+      }, timeoutMs)
+      await confirmation
+
+      return this.sessions.has(sessionId)
+    } catch (err) {
+      if (!confirmationSettled) cleanupConfirmation()
+      throw err
+    } finally {
+      this.trackPendingPermissionModeChange(sessionId, mode, -1)
     }
-    return sent
+  }
+
+  recordSessionPermissionMode(sessionId: string, mode: string): boolean {
+    const session = this.sessions.get(sessionId)
+    if (!session) return false
+    session.permissionMode = mode
+    return true
   }
 
   setMaxThinkingTokens(sessionId: string, maxThinkingTokens: number | null): boolean {
@@ -685,6 +859,8 @@ export class ConversationService {
     if (!session) return false
 
     session.sdkSocket = socket
+    session.resolveSdkAttached?.()
+    session.resolveSdkAttached = null
     while (session.pendingOutbound.length > 0) {
       const line = session.pendingOutbound.shift()
       if (line) {
@@ -694,9 +870,12 @@ export class ConversationService {
     return true
   }
 
-  detachSdkConnection(sessionId: string): void {
+  detachSdkConnection(
+    sessionId: string,
+    socket: { send(data: string): void },
+  ): void {
     const session = this.sessions.get(sessionId)
-    if (session) {
+    if (session?.sdkSocket === socket) {
       session.sdkSocket = null
     }
   }
@@ -713,10 +892,7 @@ export class ConversationService {
     for (const line of lines) {
       try {
         const msg = JSON.parse(line)
-        session.sdkMessages.push(msg)
-        if (session.sdkMessages.length > MAX_CAPTURED_SDK_MESSAGES) {
-          session.sdkMessages.splice(0, session.sdkMessages.length - MAX_CAPTURED_SDK_MESSAGES)
-        }
+        this.retainSdkMessage(session, msg, Buffer.byteLength(line, 'utf-8'))
         const sdkError = this.extractSdkErrorEvent(msg)
         if (sdkError) {
           void diagnosticsService.recordEvent({
@@ -769,15 +945,120 @@ export class ConversationService {
         ) {
           session.pendingPermissionRequests.delete(msg.response.request_id)
         }
-        for (const cb of session.outputCallbacks) {
-          cb(msg)
-        }
+        this.notifyOutputCallbacks(sessionId, session.outputCallbacks, msg)
       } catch {
         console.warn(
           `[ConversationService] Ignoring malformed SDK payload for ${sessionId}`,
         )
       }
     }
+  }
+
+  private notifyOutputCallbacks(
+    sessionId: string,
+    callbacks: Array<(msg: any) => void>,
+    message: any,
+  ): void {
+    for (const callback of [...callbacks]) {
+      try {
+        callback(message)
+      } catch (error) {
+        console.warn(
+          `[ConversationService] Output callback failed for ${sessionId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        )
+      }
+    }
+  }
+
+  private retainSdkMessage(
+    session: SessionProcess,
+    message: any,
+    rawBytes: number,
+  ): void {
+    const retainedMessage = rawBytes <= MAX_CAPTURED_SDK_MESSAGE_BYTES
+      ? message
+      : this.compactSdkMessageForRetention(message, rawBytes)
+    const retainedBytes = this.capturedSdkMessageBytes(retainedMessage)
+    let totalBytes = session.sdkMessageBytes
+      ?? session.sdkMessages.reduce(
+        (total, existing) => total + this.capturedSdkMessageBytes(existing),
+        0,
+      )
+
+    session.sdkMessages.push(retainedMessage)
+    totalBytes += retainedBytes
+    while (
+      session.sdkMessages.length > MAX_CAPTURED_SDK_MESSAGES
+      || totalBytes > MAX_CAPTURED_SDK_TOTAL_BYTES
+    ) {
+      const removed = session.sdkMessages.shift()
+      if (removed === undefined) break
+      totalBytes -= this.capturedSdkMessageBytes(removed)
+    }
+    session.sdkMessageBytes = Math.max(0, totalBytes)
+  }
+
+  private capturedSdkMessageBytes(message: any): number {
+    return Buffer.byteLength(JSON.stringify(message), 'utf-8')
+  }
+
+  private compactSdkMessageForRetention(message: any, originalBytes: number): Record<string, unknown> {
+    if (!message || typeof message !== 'object') {
+      return { type: 'unknown', truncated: true, originalBytes }
+    }
+
+    const compact: Record<string, unknown> = {
+      type: typeof message.type === 'string' ? message.type : 'unknown',
+      truncated: true,
+      originalBytes,
+    }
+    if (typeof message.subtype === 'string') compact.subtype = message.subtype
+    if (typeof message.is_error === 'boolean') compact.is_error = message.is_error
+    if (typeof message.isApiErrorMessage === 'boolean') {
+      compact.isApiErrorMessage = message.isApiErrorMessage
+    }
+    for (const field of ['status', 'error', 'result'] as const) {
+      const value = this.truncateSdkDiagnosticText(message[field])
+      if (value !== undefined) compact[field] = value
+    }
+    if (Array.isArray(message.errors)) {
+      compact.errors = message.errors
+        .slice(0, 5)
+        .map((value: unknown) => this.truncateSdkDiagnosticText(value))
+        .filter((value: string | undefined): value is string => value !== undefined)
+    }
+
+    const assistantText = this.extractAssistantText(message)
+    if (assistantText) {
+      compact.message = {
+        content: [{
+          type: 'text',
+          text: this.truncateSdkDiagnosticText(assistantText),
+        }],
+      }
+    } else {
+      const messageText = this.truncateSdkDiagnosticText(message.message)
+      if (messageText !== undefined) compact.message = messageText
+    }
+    return compact
+  }
+
+  private truncateSdkDiagnosticText(value: unknown): string | undefined {
+    if (typeof value !== 'string') return undefined
+    if (Buffer.byteLength(value, 'utf-8') <= MAX_CAPTURED_SDK_DIAGNOSTIC_TEXT_BYTES) {
+      return value
+    }
+    const prefixBytes = Buffer.from(
+      value.slice(0, MAX_CAPTURED_SDK_DIAGNOSTIC_TEXT_BYTES),
+      'utf-8',
+    )
+    const truncated = prefixBytes
+      .subarray(0, MAX_CAPTURED_SDK_DIAGNOSTIC_TEXT_BYTES)
+      .toString('utf-8')
+      .replace(/\uFFFD$/, '')
+    return `${truncated}\n[truncated]`
   }
 
   stopSession(sessionId: string): void {
@@ -983,17 +1264,16 @@ export class ConversationService {
           sdkMessages: this.summarizeSdkMessages(activeSession.sdkMessages),
         },
       })
-      for (const cb of activeSession.outputCallbacks) {
-        cb({
-          type: 'result',
-          subtype: 'error',
-          is_error: true,
-          result: exitError,
-          usage: { input_tokens: 0, output_tokens: 0 },
-          session_id: sessionId,
-        })
-      }
+      const callbacks = [...activeSession.outputCallbacks]
       this.sessions.delete(sessionId)
+      this.notifyOutputCallbacks(sessionId, callbacks, {
+        type: 'result',
+        subtype: 'error',
+        is_error: true,
+        result: exitError,
+        usage: { input_tokens: 0, output_tokens: 0 },
+        session_id: sessionId,
+      })
     }
   }
 
@@ -1010,7 +1290,11 @@ export class ConversationService {
       return ['--dangerously-skip-permissions']
     }
 
-    const args = ['--permission-mode', resolvedMode]
+    const args = [
+      '--allow-dangerously-skip-permissions',
+      '--permission-mode',
+      resolvedMode,
+    ]
     return args
   }
 
@@ -1021,11 +1305,11 @@ export class ConversationService {
       args.push('--model', options.model)
     }
 
-    if (options?.effort) {
+    if (options?.effort && !isOpenAIOfficialProviderId(options.providerId)) {
       args.push('--effort', options.effort)
     }
 
-    if (options?.thinking) {
+    if (options?.thinking && !isOpenAIOfficialProviderId(options.providerId)) {
       args.push('--thinking', options.thinking)
     }
 
@@ -1036,6 +1320,8 @@ export class ConversationService {
     workDir: string,
     sdkUrl?: string,
     options?: SessionStartOptions,
+    networkSettingsOverride?: NetworkSettings,
+    networkRuntimeMetadata?: { firstTokenTimeoutDerived: boolean },
   ): Promise<Record<string, string>> {
     // Provider isolation: when Desktop has its own provider config/index,
     // strip inherited provider env vars so the child CLI reads fresh values
@@ -1057,14 +1343,22 @@ export class ConversationService {
       'ANTHROPIC_DEFAULT_OPUS_MODEL',
       'ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES',
       'CC_HAHA_SEND_DISABLED_THINKING',
+      'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS',
       'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
       'CLAUDE_CODE_ATTRIBUTION_HEADER',
       'CLAUDE_CODE_MODEL_CONTEXT_WINDOWS',
       OPENAI_OAUTH_PROVIDER_ENV_KEY,
       OPENAI_CODEX_OAUTH_FILE_ENV_KEY,
+      OPENAI_CODEX_REASONING_EFFORT_ENV_KEY,
+      GROK_OAUTH_PROVIDER_ENV_KEY,
+      GROK_OAUTH_FILE_ENV_KEY,
     ] as const
 
     const cleanEnv = await getProcessEnvWithTerminalShellEnvironment()
+    if (networkRuntimeMetadata) {
+      networkRuntimeMetadata.firstTokenTimeoutDerived =
+        !cleanEnv.CLAUDE_STREAM_FIRST_TOKEN_TIMEOUT_MS
+    }
     delete cleanEnv.CLAUDE_CODE_OAUTH_TOKEN
     if (options?.resumeInterruptedTurn === false) {
       delete cleanEnv.CLAUDE_CODE_RESUME_INTERRUPTED_TURN
@@ -1095,7 +1389,10 @@ export class ConversationService {
     const explicitProviderEnv = explicitProvider
       ? await this.providerService.getProviderRuntimeEnv(explicitProvider.id)
       : null
-    const networkEnv = buildNetworkEnvironment(await loadNetworkSettings())
+    const networkEnv = buildNetworkEnvironment(
+      networkSettingsOverride ?? await loadNetworkSettings(),
+      cleanEnv,
+    )
     const traceCaptureEnabled = (await readTraceCaptureSettings()).enabled
     if (explicitProviderEnv && options?.model?.trim()) {
       explicitProviderEnv.ANTHROPIC_MODEL = options.model.trim()
@@ -1152,7 +1449,13 @@ export class ConversationService {
       CALLER_DIR: workDir,
       PWD: workDir,
       ...(sdkUrl
-        ? { CC_HAHA_COMPUTER_USE_HOST_BUNDLE_ID: 'com.claude-code-haha.desktop' }
+        ? {
+            // Runtime config changes restart the SDK child as soon as its result
+            // arrives. Flush the completed turn first so the replacement can
+            // reliably choose --resume and load the context (#1033).
+            CLAUDE_CODE_EAGER_FLUSH: cleanEnv.CLAUDE_CODE_EAGER_FLUSH || '1',
+            CC_HAHA_COMPUTER_USE_HOST_BUNDLE_ID: 'com.claude-code-haha.desktop',
+          }
         : {}),
       ...(sdkUrl && traceCaptureEnabled
         ? { CC_HAHA_TRACE_API_CALLS: '1' }
@@ -1177,6 +1480,9 @@ export class ConversationService {
       // should come from Desktop-managed config or inherited launch env, not
       // be reintroduced from the repo's .env file.
       CC_HAHA_SKIP_DOTENV: '1',
+      // Keep the SDK runtime identity for auth and client behavior, but stamp
+      // desktop-owned transcripts with an entrypoint visible to Claude /resume.
+      CC_HAHA_TRANSCRIPT_ENTRYPOINT: 'claude-desktop',
       ...(explicitProviderEnv
         ? { CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST: '1' }
         : {}),
@@ -1186,6 +1492,12 @@ export class ConversationService {
       // 否则 CLI 会忽略 provider 的 AUTH_TOKEN、错误地走 OAuth 打到第三方
       // endpoint。详见 src/utils/auth.ts isManagedOAuthContext()。
       ...(explicitProviderEnv ?? {}),
+      ...(
+        isOpenAIOfficialProviderId(options?.providerId) &&
+        isOpenAIReasoningEffort(options?.effort)
+          ? { [OPENAI_CODEX_REASONING_EFFORT_ENV_KEY]: options.effort }
+          : {}
+      ),
       ...networkEnv,
       ...(this.shouldMarkManagedOAuth(options?.providerId)
         ? await this.buildOfficialOAuthEnv()
@@ -1300,6 +1612,8 @@ export class ConversationService {
         'CLAUDE_CODE_MODEL_CONTEXT_WINDOWS',
         OPENAI_OAUTH_PROVIDER_ENV_KEY,
         OPENAI_CODEX_OAUTH_FILE_ENV_KEY,
+        GROK_OAUTH_PROVIDER_ENV_KEY,
+        GROK_OAUTH_FILE_ENV_KEY,
       ].some((key) => typeof env[key] === 'string' && env[key]!.trim().length > 0)
     } catch {
       return false
@@ -1331,6 +1645,9 @@ export class ConversationService {
       const parsed = JSON.parse(raw) as { env?: Record<string, string> }
       const env = parsed.env ?? {}
       if (env[OPENAI_OAUTH_PROVIDER_ENV_KEY] === '1') {
+        return false
+      }
+      if (env[GROK_OAUTH_PROVIDER_ENV_KEY] === '1') {
         return false
       }
       const hasProviderEnv = [
@@ -1586,36 +1903,29 @@ export class ConversationService {
   private summarizeSdkMessages(messages: any[]): unknown[] {
     return messages.slice(-MAX_CAPTURED_SDK_SUMMARY).map((message) => {
       if (!message || typeof message !== 'object') {
-        return message
+        return { type: 'unknown' }
       }
-      const content = Array.isArray(message.message?.content)
-        ? message.message.content.map((block: unknown) => {
-            if (!block || typeof block !== 'object') return block
-            const typedBlock = block as Record<string, unknown>
-            return {
-              type: typedBlock.type,
-              text:
-                typeof typedBlock.text === 'string'
-                  ? this.redactProcessOutput(typedBlock.text)
-                  : undefined,
-            }
-          })
-        : undefined
       return {
-        type: message.type,
-        subtype: message.subtype,
-        is_error: message.is_error,
-        status: typeof message.status === 'string' ? message.status : undefined,
-        result: typeof message.result === 'string' ? this.redactProcessOutput(message.result) : undefined,
-        error: typeof message.error === 'string' ? this.redactProcessOutput(message.error) : undefined,
-        errorDetails:
-          typeof message.errorDetails === 'string'
-            ? this.redactProcessOutput(message.errorDetails)
-            : undefined,
-        message: typeof message.message === 'string' ? this.redactProcessOutput(message.message) : undefined,
-        content,
+        type: typeof message.type === 'string' ? message.type : 'unknown',
+        ...(typeof message.subtype === 'string' ? { subtype: message.subtype } : {}),
+        ...(typeof message.is_error === 'boolean' ? { is_error: message.is_error } : {}),
+        ...(this.isSafeSdkStatus(message.status) ? { status: message.status } : {}),
+        ...(this.sdkErrorCategory(message) ? { errorCategory: this.sdkErrorCategory(message) } : {}),
       }
     })
+  }
+
+  private isSafeSdkStatus(value: unknown): value is string {
+    return typeof value === 'string' && /^(?:failed|error|success|completed|cancelled|canceled|pending|running)$/i.test(value)
+  }
+
+  private sdkErrorCategory(message: any): string | undefined {
+    if (message?.type === 'assistant' && (message.isApiErrorMessage === true || message.error !== undefined)) {
+      return 'api_error'
+    }
+    if (message?.type === 'result' && message.is_error === true) return 'result_error'
+    if (message?.type === 'auth_status') return 'authentication'
+    return undefined
   }
 
   private async buildUserContent(

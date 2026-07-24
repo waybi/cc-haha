@@ -15,7 +15,7 @@ import {
 import { sessionsApi, type SessionGitInfo } from '../../api/sessions'
 import { agentsApi } from '../../api/agents'
 import { PermissionModeSelector } from '../controls/PermissionModeSelector'
-import { ModelSelector } from '../controls/ModelSelector'
+import { ModelSelector, type ModelSelectorHandle } from '../controls/ModelSelector'
 import type { AttachmentRef } from '../../types/chat'
 import { AttachmentGallery } from './AttachmentGallery'
 import { ComposerDropOverlay } from './ComposerDropOverlay'
@@ -43,6 +43,8 @@ import {
 } from '../../lib/composerAttachments'
 import { useComposerFileDrop } from './useComposerFileDrop'
 import { shouldSubmitOnEnter } from './sendShortcut'
+import type { PermissionMode } from '../../types/settings'
+import { getSessionWorkspaceState } from '../../lib/sessionWorkspace'
 
 type GitInfo = SessionGitInfo
 
@@ -64,6 +66,8 @@ function workspaceReferenceToAttachment(reference: WorkspaceChatReference): Atta
     isDirectory: reference.isDirectory,
     lineStart: reference.lineStart,
     lineEnd: reference.lineEnd,
+    diffSide: reference.diffSide,
+    hunkId: reference.hunkId,
     note: reference.note,
     quote: reference.quote,
   }
@@ -109,6 +113,7 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const panelRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const modelSelectorRef = useRef<ModelSelectorHandle>(null)
   const plusMenuRef = useRef<HTMLDivElement>(null)
   const slashMenuRef = useRef<HTMLDivElement>(null)
   const fileSearchRef = useRef<FileSearchMenuHandle>(null)
@@ -116,6 +121,7 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
   const previousActiveTabIdRef = useRef<string | null>(null)
   const inputRef = useRef(input)
   const attachmentsRef = useRef(attachments)
+  const pasteGenerationRef = useRef(0)
   const setComposerInput = useCallback((value: string) => {
     inputRef.current = value
     setInput(value)
@@ -176,10 +182,14 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
     }
     chatStore.setComposerDraft(sessionId, draft)
   }, [])
+  const invalidatePendingPastes = useCallback(() => {
+    pasteGenerationRef.current += 1
+  }, [])
 
   const isMemberSession = !!memberInfo
   const isActive = chatState !== 'idle'
-  const isWorkspaceMissing = activeSession?.workDirExists === false
+  const workspaceState = getSessionWorkspaceState(activeSession)
+  const isWorkspaceMissing = workspaceState !== 'available'
   const hasWorkspaceReferences = !isMemberSession && workspaceReferences.length > 0
   const isHeroComposer = variant === 'hero' && !isMemberSession && !compact
   const resolvedWorkDir = activeSession?.workDir || gitInfo?.workDir || undefined
@@ -222,6 +232,7 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
     }
 
     const nextDraft = activeTabId ? useChatStore.getState().sessions[activeTabId]?.composerDraft : undefined
+    invalidatePendingPastes()
     setComposerInput(nextDraft?.input ?? '')
     setComposerAttachments(nextDraft?.attachments ?? [])
     setPlusMenuOpen(false)
@@ -234,7 +245,7 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
     setEditingQueuedMessageId(null)
     setEditingQueuedMessageText('')
     previousActiveTabIdRef.current = activeTabId
-  }, [activeTabId, saveComposerDraft, setComposerAttachments, setComposerInput])
+  }, [activeTabId, invalidatePendingPastes, saveComposerDraft, setComposerAttachments, setComposerInput])
 
   useEffect(() => {
     return () => {
@@ -559,13 +570,28 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
   ) => {
     if (!activeTabId) return null
     const oldId = activeTabId
-    const { createSession, deleteSession } = useSessionStore.getState()
+    const sessionStore = useSessionStore.getState()
+    const { createSession, deleteSession } = sessionStore
     const { replaceTabSession } = useTabStore.getState()
-    const { disconnectSession, connectToSession } = useChatStore.getState()
+    const { disconnectSession, connectToSession, setComposerDraft } = useChatStore.getState()
+    const permissionMode = sessionStore.sessions.find((session) => session.id === oldId)
+      ?.permissionMode as PermissionMode | undefined
+    const createOptions = repository || permissionMode
+      ? {
+          ...(repository ? { repository } : {}),
+          ...(permissionMode ? { permissionMode } : {}),
+        }
+      : undefined
     const newId = await createSession(
       workDir || undefined,
-      repository ? { repository } : undefined,
+      createOptions,
     )
+    if (inputRef.current.length > 0 || attachmentsRef.current.length > 0) {
+      setComposerDraft(newId, {
+        input: inputRef.current,
+        attachments: attachmentsRef.current,
+      })
+    }
     useSessionRuntimeStore.getState().moveSelection(oldId, newId)
     disconnectSession(oldId)
     replaceTabSession(oldId, newId)
@@ -617,6 +643,15 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
       return
     }
 
+    if (pendingSlashUiAction?.type === 'model') {
+      modelSelectorRef.current?.open()
+      setComposerInput('')
+      setSlashMenuOpen(false)
+      setFileSearchOpen(false)
+      setPlusMenuOpen(false)
+      return
+    }
+
     if (showLaunchControls && (!launchReady || launchTransitioning)) return
 
     const workspaceReferencePrompt = !isMemberSession
@@ -660,6 +695,8 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
         isDirectory: reference.isDirectory,
         lineStart: reference.lineStart,
         lineEnd: reference.lineEnd,
+        diffSide: reference.diffSide,
+        hunkId: reference.hunkId,
         note: reference.note,
         quote: reference.quote,
       })),
@@ -705,6 +742,7 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
         displayAttachments: visibleAttachmentPayload,
       })
     }
+    invalidatePendingPastes()
     setComposerInput('')
     setComposerAttachments([])
     useChatStore.getState().clearComposerDraft(activeTabId!)
@@ -811,8 +849,12 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
       if (!file) continue
 
       const id = `att-${Date.now()}-${Math.random().toString(36).slice(2)}`
+      const pasteGeneration = pasteGenerationRef.current
+      const pastedSessionId = activeTabId
       const reader = new FileReader()
       reader.onload = () => {
+        if (pasteGeneration !== pasteGenerationRef.current) return
+        if (pastedSessionId !== useTabStore.getState().activeTabId) return
         setComposerAttachments((prev) => [
           ...prev,
           {
@@ -927,7 +969,9 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
     isHeroComposer
       ? t('empty.placeholder')
       : isWorkspaceMissing
-        ? t('chat.placeholderMissing')
+        ? workspaceState === 'worktree_removed'
+          ? t('chat.placeholderWorktreeRemoved')
+          : t('chat.placeholderMissing')
         : isMemberSession
           ? t('teams.memberPlaceholder')
           : t('chat.placeholder')
@@ -938,6 +982,7 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
   return (
     <div
       data-testid="chat-input-shell"
+      data-session-id={activeTabId ?? undefined}
       className={
         isHeroComposer
           ? `bg-[var(--color-surface)] ${isMobileComposer ? 'px-4 pb-3' : 'px-8 pb-4'}`
@@ -1228,9 +1273,12 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
           <div data-testid="chat-input-toolbar" className={isHeroComposer
             ? 'flex items-center justify-between border-t border-[var(--color-border-separator)] pt-3'
             : `mt-2 flex items-center justify-between border-t border-[var(--color-border-separator)] ${
-              useCompactControls ? '-mx-3 -mb-3 gap-2 px-2.5 py-2' : '-mx-4 -mb-4 px-3 py-3'
+              useCompactControls ? `-mx-3 -mb-3 px-2.5 py-2 ${isMobileComposer ? 'gap-1' : 'gap-2'}` : '-mx-4 -mb-4 px-3 py-3'
             }`}>
-            <div className="flex min-w-0 items-center gap-2">
+            <div
+              data-testid="chat-input-toolbar-leading"
+              className={`flex min-w-0 items-center ${isMobileComposer ? 'shrink-0 gap-1' : 'gap-2'}`}
+            >
               {!isMemberSession && (
                 <>
                   <div ref={plusMenuRef} className="relative">
@@ -1267,7 +1315,10 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
               )}
             </div>
 
-            <div className="flex min-w-0 items-center gap-2">
+            <div
+              data-testid="chat-input-toolbar-trailing"
+              className={`flex min-w-0 items-center ${isMobileComposer ? 'flex-1 justify-end gap-1' : 'gap-2'}`}
+            >
               {!isMemberSession && activeTabId && (
                 <ContextUsageIndicator
                   sessionId={activeTabId}
@@ -1280,7 +1331,13 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
                 />
               )}
               {!isMemberSession && activeTabId && (
-                <ModelSelector runtimeKey={activeTabId} disabled={isActive} compact={useCompactControls} />
+                <ModelSelector
+                  ref={modelSelectorRef}
+                  runtimeKey={activeTabId}
+                  disabled={isActive}
+                  compact={useCompactControls}
+                  fluid={isMobileComposer}
+                />
               )}
               <button
                 onClick={!isMemberSession && isActive ? () => stopGeneration(activeTabId!) : handleSubmit}

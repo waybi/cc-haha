@@ -1,25 +1,38 @@
 import { describe, expect, it, vi } from 'vitest'
 import net from 'node:net'
+import http from 'node:http'
 import path from 'node:path'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
 import {
+  appendHostDiagnostic,
   buildSidecarEnv,
+  clearProxyEnv,
   createAdapterPlan,
   createServerPlan,
+  electronHostDiagnosticsFile,
   httpToWebSocketUrl,
+  HOST_DIAGNOSTICS_BYTE_LIMIT,
+  HOST_DIAGNOSTICS_LINE_LIMIT,
   killSidecar,
-  mergeProxyEnv,
   parseH5FixedPort,
   preferredServerPorts,
-  proxyUrlFromElectronProxyRules,
   pushStartupLog,
   readH5FixedPort,
   readLastServerPort,
   reserveLocalPort,
   reserveServerPort,
+  resolveBundledRipgrepExecutable,
   resolveHostTriple,
+  RIPGREP_PATH_ENV,
+  SERVER_STATE_FILE,
+  SYSTEM_PROXY_BRIDGE_ENV,
+  SYSTEM_PROXY_ERROR_ENV,
   spawnSidecar,
+  waitForServer,
+  withAdapterProxyBridgeEnv,
+  withSystemProxyBridgeEnv,
+  withSystemProxyErrorEnv,
   windowsPowerShellOverride,
   writeLastServerPort,
   type SidecarChild,
@@ -29,11 +42,48 @@ function fakeChild(pid = 4321) {
   return { pid, kill: vi.fn() } as unknown as SidecarChild & { kill: ReturnType<typeof vi.fn> }
 }
 
+function listen(server: http.Server, host = '127.0.0.1'): Promise<number> {
+  return new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, host, () => {
+      const address = server.address()
+      if (!address || typeof address === 'string') {
+        reject(new Error('Could not resolve HTTP test port'))
+        return
+      }
+      resolve(address.port)
+    })
+  })
+}
+
+function close(server: http.Server): Promise<void> {
+  return new Promise(resolve => server.close(() => resolve()))
+}
+
 describe('Electron sidecar manager', () => {
+  it('places the Electron host log in the active server diagnostics directory', () => {
+    const portableDir = path.join(tmpdir(), 'cc-haha-portable-diagnostics')
+
+    expect(electronHostDiagnosticsFile(
+      { CLAUDE_CONFIG_DIR: portableDir },
+      path.join(tmpdir(), 'unused-home'),
+    )).toBe(path.join(portableDir, 'cc-haha', 'diagnostics', 'electron-host.log'))
+  })
+
+  it('resolves the default Electron host log without consulting real user state', () => {
+    const isolatedHome = path.resolve(path.sep, '__cc_haha_injected_test_home__')
+
+    expect(electronHostDiagnosticsFile({}, isolatedHome)).toBe(
+      path.join(isolatedHome, '.claude', 'cc-haha', 'diagnostics', 'electron-host.log'),
+    )
+  })
+
   it('maps host platform to existing sidecar target triples', () => {
     expect(resolveHostTriple('darwin', 'arm64')).toBe('aarch64-apple-darwin')
     expect(resolveHostTriple('darwin', 'x64')).toBe('x86_64-apple-darwin')
     expect(resolveHostTriple('win32', 'x64')).toBe('x86_64-pc-windows-msvc')
+    expect(resolveHostTriple('win32', 'arm64')).toBe('aarch64-pc-windows-msvc')
+    expect(resolveHostTriple('linux', 'x64')).toBe('x86_64-unknown-linux-gnu')
     expect(resolveHostTriple('linux', 'arm64')).toBe('aarch64-unknown-linux-gnu')
   })
 
@@ -72,6 +122,57 @@ describe('Electron sidecar manager', () => {
     expect(plan.env.CLAUDE_H5_DIST_DIR).toBe('/Applications/App.app/Contents/Resources/app.asar.unpacked/dist')
   })
 
+  it('passes the packaged ripgrep path to the server and its CLI children', () => {
+    const desktopRoot = mkdtempSync(path.join(tmpdir(), 'cc-haha-ripgrep-plan-'))
+    try {
+      const bundledRipgrep = resolveBundledRipgrepExecutable(desktopRoot)
+      mkdirSync(path.dirname(bundledRipgrep), { recursive: true })
+      writeFileSync(bundledRipgrep, 'fixture')
+
+      const plan = createServerPlan({
+        desktopRoot,
+        appRoot: '/app',
+        port: 49321,
+        env: {},
+      })
+
+      expect(plan.env[RIPGREP_PATH_ENV]).toBe(bundledRipgrep)
+      expect(plan.env.PATH?.split(path.delimiter)).toContain(
+        path.dirname(bundledRipgrep),
+      )
+
+      const adapter = createAdapterPlan({
+        desktopRoot,
+        appRoot: '/app',
+        serverUrl: 'http://127.0.0.1:49321',
+        flag: '--telegram',
+        env: {},
+      })
+      expect(adapter.env[RIPGREP_PATH_ENV]).toBe(bundledRipgrep)
+    } finally {
+      rmSync(desktopRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('preserves an explicit ripgrep override', () => {
+    const customDir = mkdtempSync(path.join(tmpdir(), 'cc-haha-custom-ripgrep-'))
+    try {
+      const customRipgrep = path.join(customDir, 'rg')
+      writeFileSync(customRipgrep, 'fixture')
+      const plan = createServerPlan({
+        desktopRoot: '/app/desktop',
+        appRoot: '/app',
+        port: 49321,
+        env: { PATH: '/usr/bin', [RIPGREP_PATH_ENV]: customRipgrep },
+      })
+
+      expect(plan.env[RIPGREP_PATH_ENV]).toBe(customRipgrep)
+      expect(plan.env.PATH?.split(path.delimiter)).toContain(customDir)
+    } finally {
+      rmSync(customDir, { recursive: true, force: true })
+    }
+  })
+
   it('passes portable config and adapter server URL through the sidecar env', () => {
     const configDir = mkdtempSync(path.join(tmpdir(), 'cc-haha-config-'))
     try {
@@ -102,27 +203,63 @@ describe('Electron sidecar manager', () => {
     }
   })
 
-  it('converts Electron system proxy rules into sidecar proxy env', () => {
-    expect(proxyUrlFromElectronProxyRules('DIRECT')).toBeUndefined()
-    expect(proxyUrlFromElectronProxyRules('SOCKS5 127.0.0.1:7891; DIRECT')).toBeUndefined()
-    expect(proxyUrlFromElectronProxyRules('PROXY 127.0.0.1:7897; DIRECT')).toBe('http://127.0.0.1:7897')
-    expect(proxyUrlFromElectronProxyRules('HTTPS proxy.example:8443; DIRECT')).toBe('https://proxy.example:8443')
+  it('isolates the server from inherited proxy env and exposes only the dynamic bridge URL', () => {
+    const baseEnv = {
+      HTTP_PROXY: 'http://stale.example:8080',
+      HTTPS_PROXY: 'http://stale.example:8080',
+      http_proxy: 'http://stale.example:8080',
+      https_proxy: 'http://stale.example:8080',
+      ALL_PROXY: 'socks5://stale.example:1080',
+      all_proxy: 'socks5://stale.example:1080',
+      NO_PROXY: '.corp.local',
+    }
+    const bridgeUrl = 'http://127.0.0.1:49123'
+    const serverEnv = withSystemProxyBridgeEnv(baseEnv, bridgeUrl)
 
-    const env = mergeProxyEnv({}, 'http://127.0.0.1:7897')
-    expect(env.HTTP_PROXY).toBe('http://127.0.0.1:7897')
-    expect(env.HTTPS_PROXY).toBe('http://127.0.0.1:7897')
-    expect(env.http_proxy).toBe('http://127.0.0.1:7897')
-    expect(env.https_proxy).toBe('http://127.0.0.1:7897')
-    expect(env.NO_PROXY).toContain('127.0.0.1')
+    expect(serverEnv[SYSTEM_PROXY_BRIDGE_ENV]).toBe(bridgeUrl)
+    expect(serverEnv.HTTP_PROXY).toBeUndefined()
+    expect(serverEnv.HTTPS_PROXY).toBeUndefined()
+    expect(serverEnv.http_proxy).toBeUndefined()
+    expect(serverEnv.https_proxy).toBeUndefined()
+    expect(serverEnv.ALL_PROXY).toBeUndefined()
+    expect(serverEnv.all_proxy).toBeUndefined()
+    expect(serverEnv.NO_PROXY).toBe('.corp.local,localhost,127.0.0.1,::1')
+    expect(clearProxyEnv(baseEnv).HTTP_PROXY).toBeUndefined()
   })
 
-  it('does not override explicit sidecar proxy environment', () => {
-    const env = mergeProxyEnv(
-      { HTTPS_PROXY: 'http://manual.example:8080' },
-      'http://system.example:8080',
-    )
+  it('exposes a sanitized system proxy failure without leaving a direct-fallback proxy env', () => {
+    const env = withSystemProxyErrorEnv({
+      HTTP_PROXY: 'http://stale.example:8080',
+      HTTPS_PROXY: 'http://stale.example:8080',
+      ALL_PROXY: 'socks5://stale.example:1080',
+      [SYSTEM_PROXY_BRIDGE_ENV]: 'http://127.0.0.1:49123',
+    }, new Error('bridge failed for https://user:password@proxy.example/path with sk-secret12345678'))
 
-    expect(env).toEqual({ HTTPS_PROXY: 'http://manual.example:8080' })
+    expect(env.HTTP_PROXY).toBeUndefined()
+    expect(env.HTTPS_PROXY).toBeUndefined()
+    expect(env.ALL_PROXY).toBeUndefined()
+    expect(env[SYSTEM_PROXY_BRIDGE_ENV]).toBeUndefined()
+    expect(env[SYSTEM_PROXY_ERROR_ENV]).toContain('System proxy bridge unavailable: bridge failed')
+    expect(env[SYSTEM_PROXY_ERROR_ENV]).toContain('https://[REDACTED]@proxy.example/path')
+    expect(env[SYSTEM_PROXY_ERROR_ENV]).not.toContain('password')
+    expect(env[SYSTEM_PROXY_ERROR_ENV]).not.toContain('sk-secret')
+  })
+
+  it('routes adapter sidecars explicitly through the dynamic bridge', () => {
+    const bridgeUrl = 'http://127.0.0.1:49123'
+    const env = withAdapterProxyBridgeEnv({
+      HTTPS_PROXY: 'http://stale.example:8080',
+      ALL_PROXY: 'socks5://stale.example:1080',
+      [SYSTEM_PROXY_BRIDGE_ENV]: bridgeUrl,
+    }, bridgeUrl)
+
+    expect(env.HTTP_PROXY).toBe(bridgeUrl)
+    expect(env.HTTPS_PROXY).toBe(bridgeUrl)
+    expect(env.http_proxy).toBe(bridgeUrl)
+    expect(env.https_proxy).toBe(bridgeUrl)
+    expect(env.ALL_PROXY).toBe(bridgeUrl)
+    expect(env.all_proxy).toBe(bridgeUrl)
+    expect(env.NO_PROXY).toContain('127.0.0.1')
   })
 
   it('keeps startup logs bounded', () => {
@@ -132,6 +269,95 @@ describe('Electron sidecar manager', () => {
     }
     expect(logs).toHaveLength(80)
     expect(logs[0]).toBe('line 5')
+  })
+
+  it('sanitizes the bounded startup tail before it reaches an error surface', () => {
+    const logs: string[] = []
+    pushStartupLog(
+      logs,
+      `Bearer startup.secret sk-proj-STARTUPSECRETVALUE https://alice:password@example.com ${homedir()}/project`,
+    )
+
+    expect(logs[0]).toContain('Bearer [REDACTED]')
+    expect(logs[0]).toContain('https://[REDACTED]@example.com/')
+    expect(logs[0]).toContain('[HOME]/project')
+    expect(logs[0]).not.toContain('startup.secret')
+    expect(logs[0]).not.toContain('sk-proj-STARTUPSECRETVALUE')
+    expect(logs[0]).not.toContain(homedir())
+  })
+
+  it('appends only a bounded sanitized Electron host-log tail', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'cc-haha-electron-host-'))
+    const logPath = path.join(dir, 'electron-host.log')
+    const homeDir = path.join(dir, 'private-home')
+    try {
+      for (let index = 0; index < HOST_DIAGNOSTICS_LINE_LIMIT + 5; index++) {
+        appendHostDiagnostic(logPath, `line ${index}`, { homeDir })
+      }
+      appendHostDiagnostic(
+        logPath,
+        `Authorization: Bearer bearer.secret api_key=sk-ant-api03-PRIVATE ANTHROPIC_API_KEY=anthropic-secret OPENAI_API_KEY="openai-secret" MINIMAX_AUTH_TOKEN='minimax-secret' https://alice:password@example.com/private ${homeDir}/project`,
+        { homeDir },
+      )
+
+      const contents = readFileSync(logPath, 'utf-8')
+      const lines = contents.trimEnd().split('\n')
+      expect(contents).toContain('Bearer [REDACTED]')
+      expect(contents).toContain('api_key=[REDACTED]')
+      expect(contents).toContain('ANTHROPIC_API_KEY=[REDACTED]')
+      expect(contents).toContain('OPENAI_API_KEY=[REDACTED]')
+      expect(contents).toContain('MINIMAX_AUTH_TOKEN=[REDACTED]')
+      expect(contents).toContain('https://[REDACTED]@example.com/private')
+      expect(contents).toContain('[HOME]/project')
+      expect(contents).not.toContain('bearer.secret')
+      expect(contents).not.toContain('sk-ant-api03-PRIVATE')
+      expect(contents).not.toContain('anthropic-secret')
+      expect(contents).not.toContain('openai-secret')
+      expect(contents).not.toContain('minimax-secret')
+      expect(contents).not.toContain('alice:password')
+      expect(contents).not.toContain(homeDir)
+      expect(lines).toHaveLength(HOST_DIAGNOSTICS_LINE_LIMIT)
+      expect(lines[0]).toBe('line 6')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('bounds and re-sanitizes an oversized pre-existing host diagnostics file', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'cc-haha-electron-host-existing-'))
+    const logPath = path.join(dir, 'electron-host.log')
+    const homeDir = path.join(dir, 'private-home')
+    try {
+      writeFileSync(
+        logPath,
+        `${'oversized-old-data '.repeat(HOST_DIAGNOSTICS_BYTE_LIMIT)}\nOPENAI_API_KEY=old-secret ${homeDir}/private\n`,
+        'utf-8',
+      )
+
+      appendHostDiagnostic(logPath, 'latest safe diagnostic', { homeDir })
+
+      const contents = readFileSync(logPath, 'utf-8')
+      expect(statSync(logPath).size).toBeLessThanOrEqual(HOST_DIAGNOSTICS_BYTE_LIMIT)
+      expect(contents.trimEnd().split('\n').length).toBeLessThanOrEqual(HOST_DIAGNOSTICS_LINE_LIMIT)
+      expect(contents).toContain('latest safe diagnostic')
+      expect(contents).toContain('OPENAI_API_KEY=[REDACTED]')
+      expect(contents).not.toContain('old-secret')
+      expect(contents).not.toContain(homeDir)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('does not crash Electron when the host diagnostics destination cannot be written', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'cc-haha-electron-host-failure-'))
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    try {
+      expect(() => appendHostDiagnostic(dir, 'sidecar failed')).not.toThrow()
+      expect(errorSpy).toHaveBeenCalledWith('[desktop] failed to persist Electron host diagnostics')
+    } finally {
+      errorSpy.mockRestore()
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 
   it('maps http urls to adapter websocket urls', () => {
@@ -200,8 +426,15 @@ describe('Electron sidecar manager', () => {
     expect(windowsPowerShellOverride('powershell.exe', 'linux')).toBeNull()
   })
 
-  it('parses only in-range integer h5Access.fixedPort values', () => {
+  it('parses only browser-safe in-range integer h5Access.fixedPort values', () => {
     expect(parseH5FixedPort('{"h5Access":{"fixedPort":28670}}')).toBe(28670)
+    for (const port of [
+      1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000,
+      6566, 6665, 6666, 6667, 6668, 6669, 6679, 6697, 10080,
+    ]) {
+      expect(parseH5FixedPort(`{"h5Access":{"fixedPort":${port}}}`)).toBeNull()
+    }
+    expect(parseH5FixedPort('{"h5Access":{"fixedPort":5062}}')).toBe(5062)
     expect(parseH5FixedPort('{"h5Access":{"fixedPort":80}}')).toBeNull()
     expect(parseH5FixedPort('{"h5Access":{"fixedPort":70000}}')).toBeNull()
     expect(parseH5FixedPort('{"h5Access":{"fixedPort":"3456"}}')).toBeNull()
@@ -216,6 +449,15 @@ describe('Electron sidecar manager', () => {
     const env = { CLAUDE_CONFIG_DIR: configDir } as NodeJS.ProcessEnv
     try {
       // Nothing stored yet: no preferred ports.
+      expect(preferredServerPorts(env)).toEqual([])
+
+      // A browser-blocked port persisted by an older build is ignored.
+      writeFileSync(
+        path.join(configDir, SERVER_STATE_FILE),
+        JSON.stringify({ lastPort: 5061 }),
+        'utf-8',
+      )
+      expect(readLastServerPort(env)).toBeNull()
       expect(preferredServerPorts(env)).toEqual([])
 
       // Sticky port from the previous run.
@@ -261,5 +503,56 @@ describe('Electron sidecar manager', () => {
 
     // Invalid entries are skipped without throwing.
     await expect(reserveServerPort('127.0.0.1', [0, -1, 1.5, 70000])).resolves.toBeGreaterThan(0)
+  })
+
+  it('skips preferred ports blocked by browser fetch', async () => {
+    const port = await reserveServerPort('127.0.0.1', [5061])
+    expect(port).not.toBe(5061)
+  })
+
+  it('retries when the OS assigns a browser-blocked random port', async () => {
+    const reserveCandidate = vi.fn()
+      .mockResolvedValueOnce(5061)
+      .mockResolvedValueOnce(5062)
+
+    await expect(reserveLocalPort('127.0.0.1', { reserveCandidate })).resolves.toBe(5062)
+    expect(reserveCandidate).toHaveBeenCalledTimes(2)
+  })
+
+  it('stops retrying after repeated browser-blocked random ports', async () => {
+    const reserveCandidate = vi.fn().mockResolvedValue(5061)
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+    try {
+      await expect(reserveLocalPort('127.0.0.1', { reserveCandidate }))
+        .rejects.toThrow('Could not reserve a browser-safe local port')
+      expect(reserveCandidate).toHaveBeenCalledTimes(128)
+    } finally {
+      errorSpy.mockRestore()
+    }
+  })
+
+  it('propagates random port reservation errors', async () => {
+    const reserveCandidate = vi.fn().mockRejectedValue(new Error('bind failed'))
+
+    await expect(reserveLocalPort('127.0.0.1', { reserveCandidate }))
+      .rejects.toThrow('bind failed')
+    expect(reserveCandidate).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not treat a raw TCP accept as server readiness without healthy /health', async () => {
+    const server = http.createServer((_request, response) => {
+      response.writeHead(503, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ status: 'starting' }))
+    })
+    const port = await listen(server)
+
+    try {
+      await expect(waitForServer('127.0.0.1', port, 300)).rejects.toThrow(
+        /desktop server did not report healthy at http:\/\/127\.0\.0\.1:\d+\/health/,
+      )
+    } finally {
+      await close(server)
+    }
   })
 })

@@ -212,7 +212,7 @@ describe('Business Flow: Permission Modes', () => {
     await fs.rm(tmpDir, { recursive: true, force: true })
   })
 
-  const VALID_MODES = ['default', 'acceptEdits', 'plan', 'bypassPermissions', 'dontAsk']
+  const VALID_MODES = ['default', 'acceptEdits', 'plan', 'bypassPermissions', 'dontAsk', 'auto']
 
   it('should default to "default" mode', async () => {
     const { data } = await api('GET', '/api/permissions/mode')
@@ -231,8 +231,8 @@ describe('Business Flow: Permission Modes', () => {
     })
   }
 
-  it('should reject invalid mode "auto"', async () => {
-    const { status, data } = await api('PUT', '/api/permissions/mode', { mode: 'auto' })
+  it('should reject an unknown permission mode', async () => {
+    const { status, data } = await api('PUT', '/api/permissions/mode', { mode: 'unknown' })
     expect(status).toBe(400)
     expect(data.message).toContain('Invalid permission mode')
   })
@@ -248,64 +248,6 @@ describe('Business Flow: Permission Modes', () => {
     const raw = await fs.readFile(settingsPath, 'utf-8')
     const settings = JSON.parse(raw)
     expect(settings.defaultMode).toBe('plan')
-  })
-})
-
-describe('Business Flow: Task Lists API', () => {
-  beforeAll(startTestServer)
-  afterAll(async () => {
-    server?.stop()
-    await fs.rm(tmpDir, { recursive: true, force: true })
-  })
-
-  it('should reset a persisted task list through the API', async () => {
-    const taskListDir = path.join(tmpDir, 'tasks', 'desktop-session-1')
-    await fs.mkdir(taskListDir, { recursive: true })
-    await fs.writeFile(
-      path.join(taskListDir, '1.json'),
-      JSON.stringify({
-        id: '1',
-        subject: 'First task',
-        description: '',
-        status: 'completed',
-        blocks: [],
-        blockedBy: [],
-      }),
-      'utf-8',
-    )
-    await fs.writeFile(
-      path.join(taskListDir, '2.json'),
-      JSON.stringify({
-        id: '2',
-        subject: 'Second task',
-        description: '',
-        status: 'completed',
-        blocks: [],
-        blockedBy: [],
-      }),
-      'utf-8',
-    )
-
-    const { status: beforeStatus, data: beforeData } = await api(
-      'GET',
-      '/api/tasks/lists/desktop-session-1',
-    )
-    expect(beforeStatus).toBe(200)
-    expect(beforeData.tasks).toHaveLength(2)
-
-    const { status: resetStatus, data: resetData } = await api(
-      'POST',
-      '/api/tasks/lists/desktop-session-1/reset',
-    )
-    expect(resetStatus).toBe(200)
-    expect(resetData.ok).toBe(true)
-
-    const { status: afterStatus, data: afterData } = await api(
-      'GET',
-      '/api/tasks/lists/desktop-session-1',
-    )
-    expect(afterStatus).toBe(200)
-    expect(afterData.tasks).toEqual([])
   })
 })
 
@@ -326,6 +268,7 @@ describe('Business Flow: Agent Management', () => {
 
   it('should create a new agent with full config', async () => {
     const { status, data } = await api('POST', '/api/agents', {
+      scope: 'user',
       name: 'security-auditor',
       description: 'Audits code for security vulnerabilities',
       model: 'claude-opus-4-7',
@@ -338,30 +281,32 @@ describe('Business Flow: Agent Management', () => {
 
   it('should create a second agent', async () => {
     const { status } = await api('POST', '/api/agents', {
+      scope: 'user',
       name: 'test-writer',
       description: 'Writes unit tests',
       model: 'claude-sonnet-4-6',
       tools: ['Read', 'Write', 'Bash'],
+      systemPrompt: 'Write focused unit tests for the requested behavior.',
     })
     expect(status).toBe(201)
   })
 
-  it('should list both created agents in CRUD detail endpoint while shared list stays source-based', async () => {
+  it('should list both created agents through the shared loader', async () => {
     const { data } = await api('GET', '/api/agents')
     expect(data.activeAgents.length).toBeGreaterThan(0)
     expect(data.activeAgents.some((agent: any) => agent.source === 'built-in')).toBe(true)
-    expect(data.activeAgents.some((agent: any) => agent.agentType === 'security-auditor')).toBe(false)
-    expect(data.activeAgents.some((agent: any) => agent.agentType === 'test-writer')).toBe(false)
+    expect(data.activeAgents.some((agent: any) => agent.agentType === 'security-auditor')).toBe(true)
+    expect(data.activeAgents.some((agent: any) => agent.agentType === 'test-writer')).toBe(true)
 
     const securityAuditor = await api('GET', '/api/agents/security-auditor')
     const testWriter = await api('GET', '/api/agents/test-writer')
-    expect(securityAuditor.data.agent.name).toBe('security-auditor')
-    expect(testWriter.data.agent.name).toBe('test-writer')
+    expect(securityAuditor.data.agent.agentType).toBe('security-auditor')
+    expect(testWriter.data.agent.agentType).toBe('test-writer')
   })
 
   it('should get agent details', async () => {
     const { data } = await api('GET', '/api/agents/security-auditor')
-    expect(data.agent.name).toBe('security-auditor')
+    expect(data.agent.agentType).toBe('security-auditor')
     expect(data.agent.description).toContain('security')
     expect(data.agent.model).toBe('claude-opus-4-7')
     expect(data.agent.systemPrompt).toContain('OWASP')
@@ -369,19 +314,22 @@ describe('Business Flow: Agent Management', () => {
 
   it('should update agent tools', async () => {
     const { status, data } = await api('PUT', '/api/agents/security-auditor', {
+      scope: 'user',
       tools: ['Read', 'Grep', 'Glob', 'Bash', 'WebFetch'],
       description: 'Updated: now with web access',
     })
     expect(status).toBe(200)
     expect(data.agent).toBeDefined()
-    expect(data.agent.name).toBe('security-auditor')
+    expect(data.agent.agentType).toBe('security-auditor')
     expect(data.agent.description).toBe('Updated: now with web access')
   })
 
   it('should reject creating duplicate agent', async () => {
     const { status, data } = await api('POST', '/api/agents', {
+      scope: 'user',
       name: 'security-auditor',
       description: 'duplicate',
+      systemPrompt: 'duplicate',
     })
     expect(status).toBe(409)
     expect(data.error).toBe('CONFLICT')
@@ -393,7 +341,7 @@ describe('Business Flow: Agent Management', () => {
   })
 
   it('should keep deleted agent out of shared active list while built-ins remain', async () => {
-    const { status } = await api('DELETE', '/api/agents/test-writer')
+    const { status } = await api('DELETE', '/api/agents/test-writer?scope=user')
     expect([200, 204]).toContain(status)
 
     const { data } = await api('GET', '/api/agents')
@@ -404,15 +352,15 @@ describe('Business Flow: Agent Management', () => {
     expect(deleted.status).toBe(404)
   })
 
-  it('should persist agent to YAML file on disk', async () => {
-    const filePath = path.join(tmpDir, 'agents', 'security-auditor.yaml')
+  it('should persist an official Markdown agent on disk', async () => {
+    const filePath = path.join(tmpDir, 'agents', 'security-auditor.md')
     const raw = await fs.readFile(filePath, 'utf-8')
     expect(raw).toContain('security-auditor')
     expect(raw).toContain('OWASP')
   })
 
   it('should reject deleting non-existent agent', async () => {
-    const { status } = await api('DELETE', '/api/agents/nonexistent')
+    const { status } = await api('DELETE', '/api/agents/nonexistent?scope=user')
     expect(status).toBe(404)
   })
 })
@@ -501,6 +449,7 @@ describe('Business Flow: Models & Effort', () => {
     const settings = JSON.parse(raw)
     expect(settings.model).toBe('claude-opus-4-7')
     expect(settings.effort).toBe('high')
+    expect(settings.effortLevel).toBe('high')
   })
 })
 

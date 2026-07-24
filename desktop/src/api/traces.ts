@@ -1,5 +1,13 @@
 import { api } from './client'
-import type { TraceCaptureSettings, TraceSessionList } from '../types/trace'
+import type { TraceCaptureSettings, TraceSessionDeleteResult, TraceSessionList } from '../types/trace'
+
+export type TraceSessionRevision = {
+  sessionId: string
+  revision: number
+  revisionToken?: string
+  changed: boolean
+  reset: boolean
+}
 
 export const tracesApi = {
   list(options?: { limit?: number; offset?: number; query?: string }) {
@@ -11,11 +19,25 @@ export const tracesApi = {
     return api.get<TraceSessionList>(`/api/traces${suffix}`)
   },
 
+  getRevision(sessionId: string, sinceRevision?: number, sinceRevisionToken?: string) {
+    const params = new URLSearchParams()
+    if (sinceRevision !== undefined) params.set('sinceRevision', String(sinceRevision))
+    if (sinceRevisionToken !== undefined) params.set('sinceRevisionToken', sinceRevisionToken)
+    const suffix = params.toString() ? `?${params}` : ''
+    return api.get<TraceSessionRevision>(
+      `/api/traces/${encodeURIComponent(sessionId)}/revision${suffix}`,
+    )
+  },
+
   getSettings() {
     return api.get<TraceCaptureSettings>('/api/traces/settings')
   },
 
   updateSettings(settings: Partial<Pick<TraceCaptureSettings, 'enabled'>>) {
     return api.put<TraceCaptureSettings>('/api/traces/settings', settings)
+  },
+
+  deleteSession(sessionId: string) {
+    return api.delete<TraceSessionDeleteResult>(`/api/traces/${encodeURIComponent(sessionId)}`)
   },
 }

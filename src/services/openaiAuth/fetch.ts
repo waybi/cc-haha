@@ -1,8 +1,17 @@
 import type { ClientOptions } from '@anthropic-ai/sdk'
 import { randomUUID } from 'crypto'
-import { OPENAI_CODEX_API_ENDPOINT } from './client.js'
+import {
+  OPENAI_CODEX_API_ENDPOINT,
+  OPENAI_CODEX_ORIGINATOR,
+  OPENAI_CODEX_TOKEN_USER_AGENT,
+} from './client.js'
 import { ensureFreshOpenAITokens } from './index.js'
-import { resolveOpenAICodexModel } from './models.js'
+import {
+  OPENAI_CODEX_REASONING_EFFORT_ENV_KEY,
+  isOpenAIReasoningEffort,
+  resolveOpenAICodexModel,
+  resolveOpenAIReasoningEffortWithPriority,
+} from './models.js'
 import { getOpenAIOAuthTokens } from './storage.js'
 import { anthropicToOpenaiResponses } from '../../server/proxy/transform/anthropicToOpenaiResponses.js'
 import { openaiResponsesToAnthropic } from '../../server/proxy/transform/openaiResponsesToAnthropic.js'
@@ -37,8 +46,29 @@ export function buildOpenAICodexFetch(
       ...originalBody,
       model: mappedModel,
     })
+    // The generic Anthropic -> OpenAI transformer intentionally narrows effort
+    // to the common low/medium/high subset. Codex models additionally support
+    // xhigh/max, so preserve a valid native request-scoped value before falling
+    // back to the transformed value, the session env, then the model default.
+    const nativeRequestEffort = isOpenAIReasoningEffort(
+      originalBody.output_config?.effort,
+    )
+      ? originalBody.output_config.effort
+      : undefined
+    const reasoningEffort = resolveOpenAIReasoningEffortWithPriority(
+      mappedModel,
+      [
+        nativeRequestEffort,
+        transformedBody.reasoning?.effort,
+        process.env[OPENAI_CODEX_REASONING_EFFORT_ENV_KEY],
+      ],
+    )
     const upstreamBody = {
       ...transformedBody,
+      reasoning: {
+        ...(transformedBody.reasoning ?? {}),
+        effort: reasoningEffort,
+      },
       stream: true,
     }
 
@@ -52,6 +82,8 @@ export function buildOpenAICodexFetch(
     const headers = new Headers()
     headers.set('Content-Type', 'application/json')
     headers.set('Authorization', `Bearer ${tokens.accessToken}`)
+    headers.set('originator', OPENAI_CODEX_ORIGINATOR)
+    headers.set('User-Agent', OPENAI_CODEX_TOKEN_USER_AGENT)
     if (tokens.accountId) {
       headers.set('ChatGPT-Account-Id', tokens.accountId)
     }
@@ -61,6 +93,7 @@ export function buildOpenAICodexFetch(
     )
 
     const upstream = await inner(OPENAI_CODEX_API_ENDPOINT, {
+      ...init,
       method: 'POST',
       headers,
       body: JSON.stringify(upstreamBody),

@@ -1,5 +1,6 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
+import '@xterm/xterm/css/xterm.css'
 import './theme/globals.css'
 import { initializeAppZoom } from './lib/appZoom'
 import { initializeTouchH5 } from './lib/touchH5'
@@ -19,13 +20,24 @@ type DesktopBootstrapModules = [
   { initializeTheme: () => void },
 ]
 
+export function isPetWindowLocation(search = window.location.search): boolean {
+  return new URLSearchParams(search).get('petWindow') === '1'
+}
+
 function loadDesktopBootstrapModules() {
+  const appModule = isPetWindowLocation()
+    ? import('./features/pets/PetApp').then(({ PetApp }) => ({ App: PetApp }))
+    : import('./App')
   return Promise.all([
-    import('./App'),
+    appModule,
     import('./components/ErrorBoundary'),
     import('./lib/diagnosticsCapture'),
     import('./stores/uiStore'),
   ])
+}
+
+if (isPetWindowLocation()) {
+  document.documentElement.dataset.windowKind = 'pet'
 }
 
 export async function bootstrapDesktopApp(

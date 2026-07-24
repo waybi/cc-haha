@@ -11,6 +11,11 @@ import {
   OPENAI_OFFICIAL_DEFAULT_MODEL_ID,
   OPENAI_OFFICIAL_PROVIDER_ID,
 } from '../constants/openaiOfficialProvider'
+import {
+  GROK_OFFICIAL_DEFAULT_MODEL_ID,
+  GROK_OFFICIAL_PROVIDER_ID,
+} from '../constants/grokOfficialProvider'
+import { BUNDLED_PROVIDER_PRESETS } from '../config/providerPresets'
 import type {
   SavedProvider,
   CreateProviderInput,
@@ -28,11 +33,9 @@ type ProviderStore = {
   hasLoadedProviders: boolean
   presets: ProviderPreset[]
   isLoading: boolean
-  isPresetsLoading: boolean
   error: string | null
 
   fetchProviders: () => Promise<void>
-  fetchPresets: () => Promise<void>
   createProvider: (input: CreateProviderInput) => Promise<SavedProvider>
   updateProvider: (id: string, input: UpdateProviderInput) => Promise<SavedProvider>
   deleteProvider: (id: string) => Promise<void>
@@ -160,9 +163,8 @@ export const useProviderStore = create<ProviderStore>((set, get) => ({
   providerOrder: [...BUILT_IN_PROVIDER_IDS],
   activeId: null,
   hasLoadedProviders: false,
-  presets: [],
+  presets: BUNDLED_PROVIDER_PRESETS,
   isLoading: false,
-  isPresetsLoading: false,
   error: null,
 
   fetchProviders: async () => {
@@ -181,16 +183,6 @@ export const useProviderStore = create<ProviderStore>((set, get) => ({
         isLoading: false,
         error: err instanceof Error ? err.message : String(err),
       })
-    }
-  },
-
-  fetchPresets: async () => {
-    set({ isPresetsLoading: true, error: null })
-    try {
-      const { presets } = await providersApi.presets()
-      set({ presets, isPresetsLoading: false })
-    } catch (err) {
-      set({ isPresetsLoading: false, error: err instanceof Error ? err.message : String(err) })
     }
   },
 
@@ -265,6 +257,11 @@ export const useProviderStore = create<ProviderStore>((set, get) => ({
     const settings = useSettingsStore.getState()
     if (id === OPENAI_OFFICIAL_PROVIDER_ID) {
       await settings.setModel(OPENAI_OFFICIAL_DEFAULT_MODEL_ID)
+      await settings.fetchAll()
+      return
+    }
+    if (id === GROK_OFFICIAL_PROVIDER_ID) {
+      await settings.setModel(GROK_OFFICIAL_DEFAULT_MODEL_ID)
       await settings.fetchAll()
       return
     }

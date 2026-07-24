@@ -8,7 +8,7 @@ import { useUIStore } from '../stores/uiStore'
 import { useUpdateStore } from '../stores/updateStore'
 import type { SavedProvider } from '../types/provider'
 import type { ProviderPreset } from '../types/providerPreset'
-import type { AppMode, ChatSendBehavior, ThemeMode, UpdateProxySettings } from '../types/settings'
+import type { AppMode, ChatSendBehavior, PermissionMode, ThemeMode, UpdateProxySettings } from '../types/settings'
 import { browserHost } from '../lib/desktopHost/browserHost'
 
 const MOCK_DELETE_PROVIDER = vi.fn()
@@ -40,9 +40,7 @@ const providerStoreState = {
   hasLoadedProviders: true,
   presets: [] as ProviderPreset[],
   isLoading: false,
-  isPresetsLoading: false,
   fetchProviders: vi.fn(),
-  fetchPresets: vi.fn(),
   deleteProvider: MOCK_DELETE_PROVIDER,
   activateProvider: vi.fn(),
   activateOfficial: vi.fn(),
@@ -86,6 +84,10 @@ vi.mock('../components/settings/ClaudeOfficialLogin', () => ({
 
 vi.mock('../components/settings/ChatGPTOfficialLogin', () => ({
   ChatGPTOfficialLogin: () => <div data-testid="chatgpt-official-login" />,
+}))
+
+vi.mock('../components/settings/GrokOfficialLogin', () => ({
+  GrokOfficialLogin: () => <div data-testid="grok-official-login" />,
 }))
 
 vi.mock('../pages/AdapterSettings', () => ({
@@ -195,9 +197,7 @@ describe('Settings > General tab', () => {
     providerStoreState.hasLoadedProviders = true
     providerStoreState.presets = []
     providerStoreState.isLoading = false
-    providerStoreState.isPresetsLoading = false
     providerStoreState.fetchProviders = vi.fn()
-    providerStoreState.fetchPresets = vi.fn()
     providerStoreState.activateProvider = vi.fn()
     providerStoreState.activateOfficial = vi.fn()
     providerStoreState.testProvider = vi.fn()
@@ -208,6 +208,8 @@ describe('Settings > General tab', () => {
     useSettingsStore.setState({
       locale: 'en',
       theme: 'light',
+      permissionMode: 'default',
+      autoModeOptInAccepted: false,
       thinkingEnabled: true,
       autoDreamEnabled: false,
       skipWebFetchPreflight: true,
@@ -219,7 +221,7 @@ describe('Settings > General tab', () => {
       webSearch: { mode: 'auto', tavilyApiKey: '', braveApiKey: '' },
       network: {
         aiRequestTimeoutMs: 120_000,
-        proxy: { mode: 'system', url: '' },
+        proxy: { mode: 'direct', url: '' },
       },
       h5Access: {
         enabled: false,
@@ -258,6 +260,12 @@ describe('Settings > General tab', () => {
       setTheme: vi.fn().mockImplementation(async (theme: ThemeMode) => {
         useSettingsStore.setState({ theme })
       }),
+      setPermissionMode: vi.fn().mockImplementation(async (permissionMode: PermissionMode) => {
+        useSettingsStore.setState({ permissionMode })
+      }),
+      acceptAutoModeOptIn: vi.fn().mockImplementation(async () => {
+        useSettingsStore.setState({ autoModeOptInAccepted: true } as never)
+      }),
       setSkipWebFetchPreflight: vi.fn().mockImplementation(async (enabled: boolean) => {
         useSettingsStore.setState({ skipWebFetchPreflight: enabled })
       }),
@@ -286,8 +294,7 @@ describe('Settings > General tab', () => {
       appMode: {
         mode: 'default',
         portableDir: null,
-        defaultPortableDir: '/Applications/Claude Code Haha/CLAUDE_CONFIG_DIR',
-        activeConfigDir: null,
+        activeConfigDir: '/Users/test/.claude',
         configDirSource: 'system',
       },
       appModeRequiresRestart: false,
@@ -296,9 +303,8 @@ describe('Settings > General tab', () => {
         useSettingsStore.setState({
           appMode: {
             mode,
-            portableDir: mode === 'portable' ? portableDir ?? '/Applications/Claude Code Haha/CLAUDE_CONFIG_DIR' : null,
-            defaultPortableDir: '/Applications/Claude Code Haha/CLAUDE_CONFIG_DIR',
-            activeConfigDir: mode === 'portable' ? portableDir ?? '/Applications/Claude Code Haha/CLAUDE_CONFIG_DIR' : null,
+            portableDir: mode === 'portable' ? portableDir ?? null : null,
+            activeConfigDir: mode === 'portable' ? portableDir ?? null : '/Users/test/.claude',
             configDirSource: mode === 'portable' ? 'portable' : 'system',
           },
           appModeRequiresRestart: true,
@@ -342,7 +348,7 @@ describe('Settings > General tab', () => {
       updateH5AccessSettings: vi.fn(),
     })
 
-    useUIStore.setState({ pendingSettingsTab: null, toasts: [] })
+    useUIStore.setState({ activeSettingsTab: 'providers', pendingSettingsTab: null, toasts: [] })
     useUpdateStore.setState({
       status: 'idle',
       availableVersion: null,
@@ -367,6 +373,18 @@ describe('Settings > General tab', () => {
 
     const toggle = screen.getByLabelText('Skip WebFetch domain preflight')
     expect(toggle).toBeChecked()
+  })
+
+  it('keeps the selected settings tab when returning to Settings', () => {
+    const { unmount } = render(<Settings />)
+
+    fireEvent.click(screen.getByText('General'))
+    expect(screen.getByLabelText('Skip WebFetch domain preflight')).toBeInTheDocument()
+
+    unmount()
+    render(<Settings />)
+
+    expect(screen.getByLabelText('Skip WebFetch domain preflight')).toBeInTheDocument()
   })
 
   it('offers the pure white appearance theme', () => {
@@ -425,9 +443,10 @@ describe('Settings > General tab', () => {
     render(<Settings />)
 
     fireEvent.click(screen.getByText('General'))
-    expect(screen.getByRole('button', { name: /System proxy/i })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('button', { name: /Direct connection/i })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('button', { name: /System proxy/i })).toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole('button', { name: /Manual proxy/i }))
+    fireEvent.click(screen.getByRole('button', { name: /^Manual proxy/i }))
     const proxyInput = screen.getByLabelText('Proxy URL')
     const saveButton = screen.getAllByRole('button', { name: 'Save' })[0]!
 
@@ -493,17 +512,17 @@ describe('Settings > General tab', () => {
     const storageHeading = screen.getByRole('heading', { name: 'Data Storage Location' })
 
     expect((webSearchHeading.compareDocumentPosition(storageHeading) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0).toBe(true)
-    expect(screen.getByText(/Switching directories does not migrate existing data/)).toBeInTheDocument()
+    expect(screen.getByText(/Windows, upgrades recover verified legacy app-adjacent data/)).toBeInTheDocument()
   })
 
-  it('lets desktop users choose a portable data directory and relaunch immediately', async () => {
+  it('lets desktop users choose a custom data directory and relaunch immediately', async () => {
     render(<Settings />)
 
     fireEvent.click(screen.getByText('General'))
     fireEvent.click(screen.getByRole('button', { name: 'Choose Folder' }))
 
     await waitFor(() => {
-      expect(screen.getByLabelText('Portable data directory')).toHaveValue('/Users/test/cc-haha-data')
+      expect(screen.getByLabelText('Custom data directory')).toHaveValue('/Users/test/cc-haha-data')
     })
 
     fireEvent.click(screen.getByRole('button', { name: 'Use This Folder and Restart' }))
@@ -517,12 +536,11 @@ describe('Settings > General tab', () => {
     })
   })
 
-  it('switches back to the system directory without deleting portable data', async () => {
+  it('switches back to ~/.claude without deleting custom data', async () => {
     useSettingsStore.setState({
       appMode: {
         mode: 'portable',
         portableDir: '/Users/test/cc-haha-data',
-        defaultPortableDir: '/Applications/Claude Code Haha/CLAUDE_CONFIG_DIR',
         activeConfigDir: '/Users/test/cc-haha-data',
         configDirSource: 'portable',
       },
@@ -533,7 +551,7 @@ describe('Settings > General tab', () => {
     fireEvent.click(screen.getByText('General'))
     fireEvent.click(screen.getByRole('button', { name: /Use system directory/ }))
 
-    expect(screen.getByText(/Data in the portable directory is not deleted/)).toBeInTheDocument()
+    expect(screen.getByText(/Data in the custom directory is not deleted/)).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Save and Restart' }))
 
     await waitFor(() => {
@@ -543,19 +561,20 @@ describe('Settings > General tab', () => {
     })
   })
 
-  it('validates portable directory input and lets users reset to the app-side folder', async () => {
+  it('requires an explicit custom directory and exposes no third default-custom choice', async () => {
     render(<Settings />)
 
     fireEvent.click(screen.getByText('General'))
-    const input = screen.getByLabelText('Portable data directory')
+    const input = screen.getByLabelText('Custom data directory')
 
     fireEvent.change(input, { target: { value: '' } })
     fireEvent.click(screen.getByRole('button', { name: 'Use This Folder and Restart' }))
-    expect(screen.getByText('Choose or enter a portable data directory first.')).toBeInTheDocument()
+    expect(screen.getByText('Choose or enter a custom data directory first.')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /default.*data folder/i })).not.toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Use the default portable folder beside the app' }))
-    expect(input).toHaveValue('/Applications/Claude Code Haha/CLAUDE_CONFIG_DIR')
-    expect(screen.queryByText('Choose or enter a portable data directory first.')).not.toBeInTheDocument()
+    fireEvent.change(input, { target: { value: '/Users/test/custom-data' } })
+    expect(input).toHaveValue('/Users/test/custom-data')
+    expect(screen.queryByText('Choose or enter a custom data directory first.')).not.toBeInTheDocument()
   })
 
   it('shows folder picker failures as an inline storage error', async () => {
@@ -574,7 +593,6 @@ describe('Settings > General tab', () => {
       appMode: {
         mode: 'portable',
         portableDir: '/env/claude-data',
-        defaultPortableDir: '/Applications/Claude Code Haha/CLAUDE_CONFIG_DIR',
         activeConfigDir: '/env/claude-data',
         configDirSource: 'environment',
       },
@@ -588,7 +606,7 @@ describe('Settings > General tab', () => {
     fireEvent.click(screen.getByRole('button', { name: /Use system directory/ }))
     expect(screen.getByText(/Remove it from the launch environment before switching back/)).toBeInTheDocument()
 
-    fireEvent.change(screen.getByLabelText('Portable data directory'), { target: { value: '/other/data' } })
+    fireEvent.change(screen.getByLabelText('Custom data directory'), { target: { value: '/other/data' } })
     fireEvent.click(screen.getByRole('button', { name: 'Use This Folder and Restart' }))
     expect(screen.queryByText('Switch data storage location?')).not.toBeInTheDocument()
     expect(screen.getByText(/Remove it from the launch environment before switching back/)).toBeInTheDocument()
@@ -598,6 +616,7 @@ describe('Settings > General tab', () => {
     render(<Settings />)
 
     fireEvent.click(screen.getByText('General'))
+    fireEvent.change(screen.getByLabelText('Custom data directory'), { target: { value: '/Users/test/custom-data' } })
     fireEvent.click(screen.getByRole('button', { name: 'Use This Folder and Restart' }))
     expect(screen.getByText('Switch data storage location?')).toBeInTheDocument()
 
@@ -615,6 +634,7 @@ describe('Settings > General tab', () => {
     render(<Settings />)
 
     fireEvent.click(screen.getByText('General'))
+    fireEvent.change(screen.getByLabelText('Custom data directory'), { target: { value: '/Users/test/custom-data' } })
     fireEvent.click(screen.getByRole('button', { name: 'Use This Folder and Restart' }))
     fireEvent.click(screen.getByRole('button', { name: 'Save and Restart' }))
 
@@ -736,6 +756,48 @@ describe('Settings > General tab', () => {
     fireEvent.click(toggle)
 
     expect(useSettingsStore.getState().setThinkingEnabled).toHaveBeenCalledWith(false)
+  })
+
+  it('lets the user choose a default permission mode for new sessions', async () => {
+    render(<Settings />)
+
+    fireEvent.click(screen.getByText('General'))
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Ask permissions' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: /Bypass permissions/ }))
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Enable bypass' }))
+      await Promise.resolve()
+    })
+
+    expect(useSettingsStore.getState().setPermissionMode).toHaveBeenCalledWith('bypassPermissions')
+    expect(useSettingsStore.getState().permissionMode).toBe('bypassPermissions')
+  })
+
+  it('confirms first use before saving Auto as the new-session default', async () => {
+    render(<Settings />)
+
+    fireEvent.click(screen.getByText('General'))
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Ask permissions' }))
+    fireEvent.click(screen.getByRole('menuitem', { name: /Auto mode/ }))
+
+    expect(useSettingsStore.getState().setPermissionMode).not.toHaveBeenCalledWith('auto')
+    const dialog = screen.getByRole('dialog', { name: 'Enable Auto mode?' })
+
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Enable Auto mode' }))
+    })
+
+    expect(useSettingsStore.getState().acceptAutoModeOptIn).toHaveBeenCalledOnce()
+    expect(useSettingsStore.getState().setPermissionMode).toHaveBeenCalledWith('auto')
+    expect(useSettingsStore.getState().permissionMode).toBe('auto')
   })
 
   it('keeps Auto-dream disabled by default and confirms before enabling it', async () => {
@@ -1089,7 +1151,31 @@ describe('Settings > General tab', () => {
       target: { value: '99' },
     })
 
-    expect(within(section).getByText('Port must be an integer between 1024 and 65535.')).toBeInTheDocument()
+    expect(within(section).getByText('Port must be a browser-safe integer between 1024 and 65535.')).toBeInTheDocument()
+    expect(within(section).getByRole('button', { name: 'Save H5 settings' })).toBeDisabled()
+    expect(useSettingsStore.getState().updateH5AccessSettings).not.toHaveBeenCalled()
+  })
+
+  it('rejects a browser-blocked fixed port before saving', () => {
+    useSettingsStore.setState({
+      h5Access: {
+        enabled: true,
+        token: 'h5_persisted_token',
+        tokenPreview: 'h5_pers...oken',
+        allowedOrigins: [],
+        publicBaseUrl: 'http://192.168.0.102:54064',
+        fixedPort: null,
+        disconnectGraceSeconds: null,
+      },
+    })
+    render(<Settings />)
+
+    fireEvent.click(screen.getByText('H5 Access'))
+    const section = screen.getByRole('region', { name: 'H5 Access' })
+    fireEvent.change(within(section).getByLabelText('Fixed port'), {
+      target: { value: '5061' },
+    })
+
     expect(within(section).getByRole('button', { name: 'Save H5 settings' })).toBeDisabled()
     expect(useSettingsStore.getState().updateH5AccessSettings).not.toHaveBeenCalled()
   })
@@ -1463,6 +1549,7 @@ describe('Settings > Providers tab', () => {
     MOCK_DELETE_PROVIDER.mockReset()
     MOCK_GET_SETTINGS.mockResolvedValue({})
     MOCK_UPDATE_SETTINGS.mockResolvedValue({})
+    useUIStore.setState({ activeSettingsTab: 'providers', pendingSettingsTab: null, toasts: [] })
     useSettingsStore.setState({
       locale: 'en',
       fetchAll: vi.fn().mockResolvedValue(undefined),
@@ -1484,7 +1571,7 @@ describe('Settings > Providers tab', () => {
         notes: '',
       },
     ]
-    providerStoreState.providerOrder = ['provider-1', 'claude-official', 'openai-official']
+    providerStoreState.providerOrder = ['provider-1', 'claude-official', 'openai-official', 'grok-official']
     providerStoreState.activeId = null
     providerStoreState.hasLoadedProviders = true
   })
@@ -1533,6 +1620,18 @@ describe('Settings > Providers tab', () => {
     expect(screen.queryByTestId('claude-official-login')).not.toBeInTheDocument()
   })
 
+  it('shows Grok Official as the active built-in provider', () => {
+    providerStoreState.providers = []
+    providerStoreState.activeId = 'grok-official'
+
+    render(<Settings />)
+
+    const provider = screen.getByTestId('grok-official-provider')
+    expect(within(provider).getByText('Grok Official')).toBeInTheDocument()
+    expect(within(provider).getByText('Default')).toBeInTheDocument()
+    expect(screen.getByTestId('grok-official-login')).toBeInTheDocument()
+  })
+
   it('renders saved and official providers in the stored sortable order', () => {
     providerStoreState.providerOrder = ['provider-1', 'openai-official', 'claude-official']
 
@@ -1544,6 +1643,7 @@ describe('Settings > Providers tab', () => {
       'provider-provider-1',
       'openai-official-provider',
       'claude-official-provider',
+      'grok-official-provider',
     ])
   })
 
@@ -1558,6 +1658,7 @@ describe('Settings > Providers tab', () => {
       'provider-provider-1',
       'claude-official-provider',
       'openai-official-provider',
+      'grok-official-provider',
     ])
   })
 
@@ -1580,6 +1681,21 @@ describe('Settings > Providers tab', () => {
     })
 
     expect(MOCK_DELETE_PROVIDER).toHaveBeenCalledWith('provider-1')
+  })
+
+  it('keeps custom provider creation available when presets are unavailable', () => {
+    providerStoreState.presets = []
+
+    render(<Settings />)
+
+    const addButton = screen.getByRole('button', { name: /Add Provider/i })
+    expect(addButton).toBeEnabled()
+
+    fireEvent.click(addButton)
+
+    const dialog = screen.getByRole('dialog')
+    expect(within(dialog).getByLabelText(/Name/i)).toHaveValue('Custom')
+    expect(within(dialog).getByLabelText(/Base URL/i)).toBeEnabled()
   })
 
   it('uses the shared dropdown for API format in the provider form', () => {
@@ -1612,6 +1728,34 @@ describe('Settings > Providers tab', () => {
 
     expect(within(dialog).getByRole('button', { name: /OpenAI Responses API \(proxy\)/i })).toBeInTheDocument()
     expect(within(dialog).getByText('Requests will be translated via the local proxy')).toBeInTheDocument()
+  })
+
+  it('localizes the main model placeholder in the provider form', () => {
+    useSettingsStore.setState({ locale: 'zh' })
+    providerStoreState.presets = [
+      {
+        id: 'custom',
+        name: 'Custom',
+        baseUrl: 'https://api.example.com/anthropic',
+        apiFormat: 'anthropic',
+        defaultModels: {
+          main: '',
+          haiku: '',
+          sonnet: '',
+          opus: '',
+        },
+        needsApiKey: true,
+        websiteUrl: '',
+      },
+    ]
+
+    render(<Settings />)
+
+    fireEvent.click(screen.getByRole('button', { name: /添加服务商/i }))
+
+    const dialog = screen.getByRole('dialog')
+    expect(within(dialog).getByPlaceholderText('模型 ID')).toBeInTheDocument()
+    expect(within(dialog).queryByPlaceholderText('Model ID')).not.toBeInTheDocument()
   })
 
   it('normalizes blank model mappings to the main model when saving a provider', async () => {
@@ -1667,6 +1811,170 @@ describe('Settings > Providers tab', () => {
           opus: 'gpt-5.5',
         },
       }))
+    })
+  })
+
+  it('uses request model env instead of cc-switch display model names when testing pasted settings JSON', async () => {
+    providerStoreState.testConfig = vi.fn().mockResolvedValue({
+      connectivity: {
+        success: false,
+        latencyMs: 3,
+        error: '未配置供应商',
+        modelUsed: 'claude-sonnet-4-6',
+        httpStatus: 503,
+      },
+    })
+    providerStoreState.presets = [
+      {
+        id: 'deepseek',
+        name: 'DeepSeek',
+        baseUrl: 'https://api.deepseek.com/anthropic',
+        apiFormat: 'anthropic',
+        defaultModels: {
+          main: 'deepseek-v4-pro',
+          haiku: 'deepseek-v4-flash',
+          sonnet: 'deepseek-v4-pro',
+          opus: 'deepseek-v4-pro',
+        },
+        needsApiKey: true,
+        websiteUrl: '',
+      },
+      {
+        id: 'custom',
+        name: 'Custom',
+        baseUrl: '',
+        apiFormat: 'anthropic',
+        defaultModels: {
+          main: '',
+          haiku: '',
+          sonnet: '',
+          opus: '',
+        },
+        needsApiKey: true,
+        websiteUrl: '',
+      },
+    ]
+
+    render(<Settings />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Add Provider|添加服务商/i }))
+    const dialog = screen.getByRole('dialog')
+    const settingsTextarea = await waitFor(() => {
+      const textarea = dialog.querySelector('textarea')
+      expect(textarea?.value).toContain('"ANTHROPIC_MODEL"')
+      return textarea as HTMLTextAreaElement
+    })
+
+    fireEvent.change(settingsTextarea, {
+      target: {
+        value: JSON.stringify({
+          env: {
+            ANTHROPIC_API_KEY: 'PROXY_MANAGED',
+            ANTHROPIC_BASE_URL: 'http://127.0.0.1:15721',
+            ANTHROPIC_DEFAULT_FABLE_MODEL: 'Qwen3Coder',
+            ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-4-5',
+            ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME: 'Qwen3Coder',
+            ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-4-8',
+            ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: 'Qwen3Coder',
+            ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-4-6',
+            ANTHROPIC_DEFAULT_SONNET_MODEL_NAME: 'Qwen3Coder',
+          },
+        }, null, 2),
+      },
+    })
+
+    await waitFor(() => {
+      expect(within(dialog).getByLabelText(/Main Model|主模型/i)).toHaveValue('claude-sonnet-4-6')
+      expect(within(dialog).getByLabelText(/Haiku Model/i)).toHaveValue('claude-haiku-4-5')
+      expect(within(dialog).getByLabelText(/Opus Model/i)).toHaveValue('claude-opus-4-8')
+    })
+
+    fireEvent.click(within(dialog).getByRole('button', { name: /Test Connection/i }))
+
+    await waitFor(() => {
+      expect(providerStoreState.testConfig).toHaveBeenCalledWith(expect.objectContaining({
+        baseUrl: 'http://127.0.0.1:15721',
+        apiKey: 'PROXY_MANAGED',
+        modelId: 'claude-sonnet-4-6',
+        authStrategy: 'api_key',
+        apiFormat: 'anthropic',
+      }))
+    })
+    expect(providerStoreState.testConfig).not.toHaveBeenCalledWith(expect.objectContaining({
+      modelId: 'Qwen3Coder',
+    }))
+    expect(providerStoreState.testConfig).not.toHaveBeenCalledWith(expect.objectContaining({
+      modelId: 'deepseek-v4-pro',
+    }))
+  })
+
+  it('keeps the provider form locked while save is in flight', async () => {
+    let resolveCreate!: (provider: SavedProvider) => void
+    providerStoreState.createProvider = vi.fn().mockImplementation(() => new Promise<SavedProvider>((resolve) => {
+      resolveCreate = resolve
+    }))
+    providerStoreState.presets = [
+      {
+        id: 'custom',
+        name: 'Custom',
+        baseUrl: 'https://api.example.com/anthropic',
+        apiFormat: 'anthropic',
+        defaultModels: {
+          main: 'custom-main',
+          haiku: '',
+          sonnet: '',
+          opus: '',
+        },
+        needsApiKey: true,
+        websiteUrl: '',
+      },
+    ]
+
+    render(<Settings />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Add Provider|添加服务商/i }))
+    const dialog = screen.getByRole('dialog')
+    await waitFor(() => {
+      const settingsTextarea = dialog.querySelector('textarea')
+      expect(settingsTextarea?.value).toContain('"ANTHROPIC_MODEL"')
+    })
+
+    fireEvent.change(within(dialog).getByPlaceholderText('sk-...'), { target: { value: 'sk-test' } })
+    fireEvent.click(within(dialog).getByRole('button', { name: /Save|Add|保存|添加/i }))
+
+    await waitFor(() => {
+      expect(providerStoreState.createProvider).toHaveBeenCalledTimes(1)
+    })
+
+    const cancelButton = within(dialog).getByRole('button', { name: /Cancel|取消/i })
+    expect(cancelButton).toBeDisabled()
+
+    fireEvent.click(cancelButton)
+    fireEvent.click(within(dialog).getByRole('button', { name: /Save|Add|保存|添加/i }))
+
+    expect(screen.getByRole('dialog')).toBeInTheDocument()
+    expect(providerStoreState.createProvider).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      resolveCreate({
+        id: 'provider-new',
+        presetId: 'custom',
+        name: 'Custom',
+        apiKey: 'sk-test',
+        baseUrl: 'https://api.example.com/anthropic',
+        apiFormat: 'anthropic',
+        models: {
+          main: 'custom-main',
+          haiku: 'custom-main',
+          sonnet: 'custom-main',
+          opus: 'custom-main',
+        },
+      })
+      await Promise.resolve()
+    })
+
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
     })
   })
 
@@ -1737,6 +2045,76 @@ describe('Settings > Providers tab', () => {
       env: expect.objectContaining({
         EXISTING_ENV: '1',
         ENABLE_TOOL_SEARCH: 'false',
+      }),
+    }))
+  })
+
+  it('defaults experimental beta headers on and persists a provider disable', async () => {
+    MOCK_GET_SETTINGS.mockResolvedValue({ env: { EXISTING_ENV: '1' } })
+    providerStoreState.createProvider = vi.fn().mockResolvedValue({
+      id: 'provider-new',
+      presetId: 'custom',
+      name: 'Custom',
+      apiKey: 'sk-test',
+      baseUrl: 'https://api.example.com/anthropic',
+      apiFormat: 'anthropic',
+      disableExperimentalBetas: true,
+      models: {
+        main: 'custom-main',
+        haiku: 'custom-main',
+        sonnet: 'custom-main',
+        opus: 'custom-main',
+      },
+    })
+    providerStoreState.presets = [
+      {
+        id: 'custom',
+        name: 'Custom',
+        baseUrl: 'https://api.example.com/anthropic',
+        apiFormat: 'anthropic',
+        defaultModels: {
+          main: 'custom-main',
+          haiku: '',
+          sonnet: '',
+          opus: '',
+        },
+        needsApiKey: true,
+        websiteUrl: '',
+      },
+    ]
+
+    render(<Settings />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Add Provider/i }))
+    const dialog = screen.getByRole('dialog')
+    const disableBetasCheckbox = within(dialog).getByRole('checkbox', { name: 'Disable experimental beta headers' })
+    const settingsTextarea = await waitFor(() => {
+      const textarea = dialog.querySelector('textarea')
+      expect(textarea?.value).toContain('"ANTHROPIC_MODEL"')
+      return textarea as HTMLTextAreaElement
+    })
+
+    expect(disableBetasCheckbox).not.toBeChecked()
+    expect(settingsTextarea.value).not.toContain('CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS')
+
+    fireEvent.click(disableBetasCheckbox)
+    expect(disableBetasCheckbox).toBeChecked()
+    await waitFor(() => {
+      expect(settingsTextarea.value).toContain('"CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1"')
+    })
+
+    fireEvent.change(within(dialog).getByPlaceholderText('sk-...'), { target: { value: 'sk-test' } })
+    fireEvent.click(within(dialog).getByRole('button', { name: /Save|Add/i }))
+
+    await waitFor(() => {
+      expect(providerStoreState.createProvider).toHaveBeenCalledWith(expect.objectContaining({
+        disableExperimentalBetas: true,
+      }))
+    })
+    expect(MOCK_UPDATE_SETTINGS).toHaveBeenCalledWith(expect.objectContaining({
+      env: expect.objectContaining({
+        EXISTING_ENV: '1',
+        CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: '1',
       }),
     }))
   })
@@ -1859,7 +2237,7 @@ describe('Settings > Providers tab', () => {
 
 describe('Settings > About tab', () => {
   beforeEach(() => {
-    useUIStore.setState({ pendingSettingsTab: 'about' })
+    useUIStore.setState({ activeSettingsTab: 'providers', pendingSettingsTab: 'about' })
     useSettingsStore.setState({
       locale: 'en',
       updateProxy: { mode: 'system', url: '' },

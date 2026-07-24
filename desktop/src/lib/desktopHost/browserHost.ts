@@ -31,7 +31,6 @@ function noopUnlisten(): void {
 const defaultAppMode: AppModeConfig = {
   mode: 'default',
   portableDir: null,
-  defaultPortableDir: null,
 }
 
 const defaultPermissionState: NotificationPermissionState = 'default'
@@ -43,6 +42,9 @@ export const browserHost: DesktopHost = {
   runtime: {
     async getServerUrl() {
       unsupported('Resolving the bundled server URL')
+    },
+    async getLocalAccessToken() {
+      unsupported('Resolving the bundled server access token')
     },
   },
   app: {
@@ -99,6 +101,47 @@ export const browserHost: DesktopHost = {
         return
       }
       unsupported('Opening trace windows')
+    },
+  },
+  pets: {
+    async list() {
+      unsupported('Custom pets')
+    },
+    async createFromImage() {
+      unsupported('Creating custom pets')
+    },
+    async createFromAtlas() {
+      unsupported('Creating custom pets')
+    },
+    async openFolder() {
+      unsupported('Opening the custom pets folder')
+    },
+    async show() {
+      unsupported('Showing the companion pet')
+    },
+    async hide() {
+      unsupported('Hiding the companion pet')
+    },
+    async showContextMenu() {
+      unsupported('Showing the companion pet context menu')
+    },
+    async dragWindow() {
+      unsupported('Dragging the companion pet window')
+    },
+    async setIgnoreMouseEvents() {
+      unsupported('Changing companion pet mouse passthrough')
+    },
+    async setInteractiveRegions() {
+      unsupported('Changing companion pet interaction regions')
+    },
+    async focusSession() {
+      unsupported('Focusing a pet session')
+    },
+    async onNavigateSession() {
+      return noopUnlisten
+    },
+    async onVisibilityChanged() {
+      return noopUnlisten
     },
   },
   dialogs: {
@@ -220,6 +263,9 @@ export const browserHost: DesktopHost = {
     async setVisible() {
       unsupported('Native preview webview')
     },
+    async setZoom() {
+      unsupported('Native preview webview')
+    },
     async close() {
       unsupported('Native preview webview')
     },
@@ -236,9 +282,6 @@ export const browserHost: DesktopHost = {
     },
     async set() {
       unsupported('Desktop app mode')
-    },
-    async detectPortableDir() {
-      return null
     },
     async prepareRestart() {
       unsupported('Desktop app restart')

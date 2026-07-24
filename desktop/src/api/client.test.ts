@@ -115,6 +115,24 @@ describe('api diagnostics reporting', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
+  it('propagates caller cancellation without reporting an API failure', async () => {
+    const controller = new AbortController()
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockImplementation((_url, init) => new Promise<Response>((_, reject) => {
+      init?.signal?.addEventListener('abort', () => {
+        reject(new DOMException('The operation was aborted.', 'AbortError'))
+      })
+    }))
+
+    const request = api.get('/api/scheduled-tasks/runs/run-1', {
+      signal: controller.signal,
+    })
+    controller.abort()
+
+    await expect(request).rejects.toMatchObject({ name: 'AbortError' })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
   it('defaults local API requests to a 120 second timeout', async () => {
     vi.useFakeTimers()
     const fetchMock = vi.spyOn(globalThis, 'fetch')
@@ -165,5 +183,32 @@ describe('api diagnostics reporting', () => {
     const [, init] = call!
     const body = JSON.parse(String((init as RequestInit).body))
     expect(body.type).toBe('client_window_error')
+  })
+
+  it('bounds raw diagnostics requests when the local server is unresponsive', async () => {
+    vi.useFakeTimers()
+    let signal: AbortSignal | undefined
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    fetchMock.mockImplementation((_url, init) => {
+      signal = init?.signal ?? undefined
+      expect(signal).toBeInstanceOf(AbortSignal)
+      return new Promise<Response>((resolve) => {
+        signal?.addEventListener('abort', () => {
+          resolve(new Response(null, { status: 503 }))
+        })
+      })
+    })
+
+    const request = rawRecordDiagnosticEvent({
+      type: 'client_api_request_failed',
+      severity: 'warn',
+      summary: 'server stalled',
+    })
+
+    await vi.advanceTimersByTimeAsync(5_000)
+    await request
+
+    expect(signal?.aborted).toBe(true)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 })

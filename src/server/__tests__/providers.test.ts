@@ -9,18 +9,25 @@ import * as os from 'os'
 import { ProviderService } from '../services/providerService.js'
 import { handleProvidersApi } from '../api/providers.js'
 import { handleProxyRequest } from '../proxy/handler.js'
-import { clearTraceCaptureStateForTests, traceCaptureService } from '../services/traceCaptureService.js'
+import {
+  clearTraceCaptureStateForTests,
+  setTraceAppendBeforeWriteHookForTests,
+  traceCaptureService,
+} from '../services/traceCaptureService.js'
 import type { CreateProviderInput } from '../types/provider.js'
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
 let tmpDir: string
 let originalConfigDir: string | undefined
+let originalHome: string | undefined
 
 async function setup() {
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'provider-test-'))
   originalConfigDir = process.env.CLAUDE_CONFIG_DIR
+  originalHome = process.env.HOME
   process.env.CLAUDE_CONFIG_DIR = tmpDir
+  process.env.HOME = tmpDir
   clearTraceCaptureStateForTests()
 }
 
@@ -30,6 +37,11 @@ async function teardown() {
     process.env.CLAUDE_CONFIG_DIR = originalConfigDir
   } else {
     delete process.env.CLAUDE_CONFIG_DIR
+  }
+  if (originalHome !== undefined) {
+    process.env.HOME = originalHome
+  } else {
+    delete process.env.HOME
   }
   await fs.rm(tmpDir, { recursive: true, force: true })
 }
@@ -81,6 +93,49 @@ async function readProvidersConfig(): Promise<Record<string, unknown>> {
   return JSON.parse(raw) as Record<string, unknown>
 }
 
+async function waitForCompletedProxyTrace(sessionId: string) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const trace = await traceCaptureService.getSessionTrace(sessionId)
+    if (
+      trace.calls.some((call) => call.response) &&
+      trace.events.some((event) => event.phase === 'upstream_fetch_completed')
+    ) {
+      return trace
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  return traceCaptureService.getSessionTrace(sessionId)
+}
+
+function blockNextTraceAppend() {
+  let releaseWrite: () => void = () => {}
+  const blockedWrite = new Promise<void>((resolve) => {
+    releaseWrite = resolve
+  })
+  let signalBlocked: () => void = () => {}
+  const writeBlocked = new Promise<void>((resolve) => {
+    signalBlocked = resolve
+  })
+
+  setTraceAppendBeforeWriteHookForTests(async () => {
+    setTraceAppendBeforeWriteHookForTests(null)
+    signalBlocked()
+    await blockedWrite
+  })
+
+  return { releaseWrite, writeBlocked }
+}
+
+async function settlesBeforeBlockedTraceWrite<T>(promise: Promise<T>): Promise<T | null> {
+  return Promise.race([
+    promise,
+    // The trace hook is already blocked, so this timeout is only a failure
+    // bound. Keep it generous enough that a busy CI worker cannot masquerade
+    // as response/trace coupling.
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), 1_000)),
+  ])
+}
+
 // =============================================================================
 // ProviderService
 // =============================================================================
@@ -98,7 +153,7 @@ describe('ProviderService', () => {
       expect(result).toEqual({
         providers: [],
         activeId: null,
-        providerOrder: ['claude-official', 'openai-official'],
+        providerOrder: ['claude-official', 'openai-official', 'grok-official'],
       })
     })
 
@@ -113,7 +168,7 @@ describe('ProviderService', () => {
       expect(result).toEqual({
         providers: [],
         activeId: null,
-        providerOrder: ['claude-official', 'openai-official'],
+        providerOrder: ['claude-official', 'openai-official', 'grok-official'],
       })
       expect(files.some((name) => name.startsWith('providers.json.invalid-'))).toBe(true)
     })
@@ -220,13 +275,13 @@ describe('ProviderService', () => {
       const env = settings.env as Record<string, string>
       expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('deepseek-ai/DeepSeek-V4-Pro')
       expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES).toBe(
-        'thinking,effort,adaptive_thinking,max_effort',
+        'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
       )
       expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES).toBe(
-        'thinking,effort,adaptive_thinking,max_effort',
+        'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
       )
       expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES).toBe(
-        'thinking,effort,adaptive_thinking,max_effort',
+        'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
       )
     })
 
@@ -395,10 +450,10 @@ describe('ProviderService', () => {
           apiFormat: 'openai_responses',
           runtimeKind: 'openai_oauth',
           models: {
-            main: 'gpt-5.3-codex',
-            haiku: 'gpt-5.4-mini',
-            sonnet: 'gpt-5.4',
-            opus: 'gpt-5.3-codex',
+            main: 'gpt-5.6-sol',
+            haiku: 'gpt-5.6-luna',
+            sonnet: 'gpt-5.6-terra',
+            opus: 'gpt-5.6-sol',
           },
         })
       })
@@ -416,12 +471,15 @@ describe('ProviderService', () => {
         expect(env.OPENAI_CODEX_OAUTH_FILE).toBe(
           path.join(tmpDir, 'cc-haha', 'openai-oauth.json'),
         )
-        expect(env.ANTHROPIC_MODEL).toBe('gpt-5.3-codex')
-        expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('gpt-5.4-mini')
-        expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('gpt-5.4')
-        expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('gpt-5.3-codex')
+        expect(env.ANTHROPIC_MODEL).toBe('gpt-5.6-sol')
+        expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('gpt-5.6-luna')
+        expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('gpt-5.6-terra')
+        expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('gpt-5.6-sol')
         expect(typeof env.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS).toBe('string')
         expect(JSON.parse(env.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS)).toEqual({
+          'gpt-5.6-sol': 353_400,
+          'gpt-5.6-terra': 353_400,
+          'gpt-5.6-luna': 353_400,
           'gpt-5.3-codex': 258_400,
           'gpt-5.4': 950_000,
           'gpt-5.5': 258_400,
@@ -507,6 +565,104 @@ describe('ProviderService', () => {
         expect(env.OPENAI_CODEX_OAUTH_FILE).toBeUndefined()
         expect(env.ANTHROPIC_BASE_URL).toBe('https://api.example.com')
         expect(env.ANTHROPIC_AUTH_TOKEN).toBe('sk-test-key-123')
+      })
+    })
+
+    describe('Grok Official provider metadata', () => {
+      test('normalizes the built-in Grok provider and appends it to legacy provider order', async () => {
+        await fs.mkdir(path.join(tmpDir, 'cc-haha'), { recursive: true })
+        await fs.writeFile(
+          path.join(tmpDir, 'cc-haha', 'providers.json'),
+          JSON.stringify({
+            activeId: 'grok-official',
+            providers: [],
+            providerOrder: ['claude-official', 'openai-official'],
+          }),
+          'utf-8',
+        )
+
+        const svc = new ProviderService()
+        const result = await svc.listProviders()
+
+        expect(result.activeId).toBe('grok-official')
+        expect(result.providers).toEqual([])
+        expect(result.providerOrder).toEqual([
+          'claude-official',
+          'openai-official',
+          'grok-official',
+        ])
+      })
+
+      test('returns and activates built-in Grok metadata while clearing OpenAI OAuth runtime env', async () => {
+        const svc = new ProviderService()
+        const provider = await svc.getProvider('grok-official')
+
+        expect(provider).toMatchObject({
+          id: 'grok-official',
+          presetId: 'grok-official',
+          name: 'Grok Official',
+          apiKey: '',
+          apiFormat: 'openai_chat',
+          runtimeKind: 'grok_oauth',
+          models: {
+            main: 'grok-4.5',
+            haiku: 'grok-4.5',
+            sonnet: 'grok-4.5',
+            opus: 'grok-4.5',
+          },
+        })
+
+        await svc.activateProvider('openai-official')
+        await svc.activateProvider('grok-official')
+
+        const config = await readProvidersConfig()
+        const env = (await readSettings()).env as Record<string, string>
+        expect(config.activeId).toBe('grok-official')
+        expect(env.CC_HAHA_GROK_OAUTH_PROVIDER).toBe('1')
+        expect(env.GROK_OAUTH_FILE).toBe(
+          path.join(tmpDir, 'cc-haha', 'grok-oauth.json'),
+        )
+        expect(env.ANTHROPIC_MODEL).toBe('grok-4.5')
+        expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('grok-4.5')
+        expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('grok-4.5')
+        expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('grok-4.5')
+        expect(env.CC_HAHA_OPENAI_OAUTH_PROVIDER).toBeUndefined()
+        expect(env.OPENAI_CODEX_OAUTH_FILE).toBeUndefined()
+      })
+
+      test('auth status reports Grok Official from the isolated Grok token file', async () => {
+        await fs.mkdir(path.join(tmpDir, 'cc-haha'), { recursive: true })
+        await fs.writeFile(
+          path.join(tmpDir, 'cc-haha', 'grok-oauth.json'),
+          JSON.stringify({
+            accessToken: 'grok-access',
+            refreshToken: 'grok-refresh',
+            expiresAt: Date.now() + 60 * 60_000,
+            email: 'grok@example.com',
+            clientId: 'grok-client',
+          }),
+          'utf-8',
+        )
+
+        const svc = new ProviderService()
+        await svc.activateProvider('grok-official')
+
+        await expect(svc.checkAuthStatus()).resolves.toMatchObject({
+          hasAuth: true,
+          source: 'grok-oauth',
+          activeProvider: 'Grok Official',
+        })
+      })
+
+      test('auth status reports Grok Official as unauthenticated without an isolated token file', async () => {
+        const svc = new ProviderService()
+        await svc.activateProvider('grok-official')
+
+        await expect(svc.checkAuthStatus()).resolves.toMatchObject({
+          hasAuth: false,
+          source: 'none',
+          activeProvider: 'Grok Official',
+        })
       })
     })
 
@@ -713,16 +869,40 @@ describe('ProviderService', () => {
       const a = await svc.addProvider(sampleInput({ name: 'A' }))
       const b = await svc.addProvider(sampleInput({ name: 'B' }))
 
-      const result = await svc.reorderProviders(['openai-official', b.id, 'claude-official', a.id])
+      const result = await svc.reorderProviders([
+        'openai-official',
+        b.id,
+        'claude-official',
+        a.id,
+        'grok-official',
+      ])
 
-      expect(result.providerOrder).toEqual(['openai-official', b.id, 'claude-official', a.id])
+      expect(result.providerOrder).toEqual([
+        'openai-official',
+        b.id,
+        'claude-official',
+        a.id,
+        'grok-official',
+      ])
       expect(result.providers.map((p) => p.id)).toEqual([b.id, a.id])
 
       const listed = await svc.listProviders()
-      expect(listed.providerOrder).toEqual(['openai-official', b.id, 'claude-official', a.id])
+      expect(listed.providerOrder).toEqual([
+        'openai-official',
+        b.id,
+        'claude-official',
+        a.id,
+        'grok-official',
+      ])
 
       const config = await readProvidersConfig()
-      expect(config.providerOrder).toEqual(['openai-official', b.id, 'claude-official', a.id])
+      expect(config.providerOrder).toEqual([
+        'openai-official',
+        b.id,
+        'claude-official',
+        a.id,
+        'grok-official',
+      ])
     })
 
     test('should not change activeId when reordering', async () => {
@@ -846,6 +1026,36 @@ describe('ProviderService', () => {
       expect(runtimeEnv.ENABLE_TOOL_SEARCH).toBe('false')
     })
 
+    test('should persist disabled experimental betas on activation and runtime env', async () => {
+      const svc = new ProviderService()
+      const provider = await svc.addProvider(sampleInput({
+        disableExperimentalBetas: true,
+      }))
+
+      expect(provider.disableExperimentalBetas).toBe(true)
+      const config = await readProvidersConfig()
+      expect((config.providers as Array<Record<string, unknown>>)[0]?.disableExperimentalBetas).toBe(true)
+
+      await svc.activateProvider(provider.id)
+
+      const settings = await readSettings()
+      const env = settings.env as Record<string, string>
+      expect(env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS).toBe('1')
+
+      const runtimeEnv = await svc.getProviderRuntimeEnv(provider.id)
+      expect(runtimeEnv.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS).toBe('1')
+
+      const updated = await svc.updateProvider(provider.id, { disableExperimentalBetas: false })
+      expect(updated.disableExperimentalBetas).toBeUndefined()
+
+      const clearedSettings = await readSettings()
+      const clearedEnv = clearedSettings.env as Record<string, string>
+      expect(clearedEnv.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS).toBeUndefined()
+
+      const clearedRuntimeEnv = await svc.getProviderRuntimeEnv(provider.id)
+      expect(clearedRuntimeEnv.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS).toBeUndefined()
+    })
+
     test('should preserve attribution header for Claude-prefixed provider models', async () => {
       const svc = new ProviderService()
       const provider = await svc.addProvider(sampleInput({
@@ -905,20 +1115,34 @@ describe('ProviderService', () => {
       expect(dummyRuntimeEnv.ANTHROPIC_AUTH_TOKEN).toBe('dummy')
     })
 
-    test('proxy providers keep proxy-managed auth regardless of auth strategy', async () => {
-      const svc = new ProviderService()
-      const provider = await svc.addProvider(sampleInput({
-        apiFormat: 'openai_chat',
-        authStrategy: 'auth_token',
-      }))
+    test('proxy providers keep transient desktop auth out of persisted settings', async () => {
+      const originalLocalAccessToken = process.env.CC_HAHA_LOCAL_ACCESS_TOKEN
+      process.env.CC_HAHA_LOCAL_ACCESS_TOKEN = 'desktop-local-secret'
 
-      await svc.activateProvider(provider.id)
+      try {
+        const svc = new ProviderService()
+        for (const apiFormat of ['openai_chat', 'openai_responses'] as const) {
+          const provider = await svc.addProvider(sampleInput({
+            apiFormat,
+            authStrategy: 'auth_token',
+          }))
 
-      const settings = await readSettings()
-      const env = settings.env as Record<string, string>
-      expect(env.ANTHROPIC_API_KEY).toBe('proxy-managed')
-      expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
-      expect(env.ENABLE_TOOL_SEARCH).toBeUndefined()
+          await svc.activateProvider(provider.id)
+
+          const settings = await readSettings()
+          const env = settings.env as Record<string, string>
+          expect(env.ANTHROPIC_API_KEY).toBe('proxy-managed')
+          expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
+          expect(env.ENABLE_TOOL_SEARCH).toBeUndefined()
+          expect(JSON.stringify(settings)).not.toContain('desktop-local-secret')
+        }
+      } finally {
+        if (originalLocalAccessToken === undefined) {
+          delete process.env.CC_HAHA_LOCAL_ACCESS_TOKEN
+        } else {
+          process.env.CC_HAHA_LOCAL_ACCESS_TOKEN = originalLocalAccessToken
+        }
+      }
     })
 
     test('should include preset default env on activation and runtime env', async () => {
@@ -1097,6 +1321,14 @@ describe('ProviderService', () => {
       expect(active).toBeNull()
     })
 
+    test('should return null for explicit Grok Official proxy lookup', async () => {
+      const svc = new ProviderService()
+
+      const active = await svc.getProviderForProxy('grok-official')
+
+      expect(active).toBeNull()
+    })
+
     test('should return the active provider proxy config', async () => {
       const svc = new ProviderService()
       const provider = await svc.addProvider(sampleInput())
@@ -1117,12 +1349,23 @@ describe('ProviderService', () => {
 
       expect(active).toBeNull()
     })
+
+    test('should return null when Grok Official is the active provider', async () => {
+      const svc = new ProviderService()
+      await svc.activateProvider('grok-official')
+
+      const active = await svc.getProviderForProxy()
+
+      expect(active).toBeNull()
+    })
   })
 
   describe('handleProxyRequest', () => {
     test('records a session trace for proxied OpenAI Chat calls', async () => {
       const originalFetch = globalThis.fetch
-      globalThis.fetch = mock(async () => {
+      const upstreamHeaders: Headers[] = []
+      globalThis.fetch = mock(async (_input: string | URL | Request, init?: RequestInit) => {
+        upstreamHeaders.push(new Headers(init?.headers))
         return new Response(JSON.stringify({
           id: 'chatcmpl-trace',
           object: 'chat.completion',
@@ -1145,6 +1388,7 @@ describe('ProviderService', () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
+            Authorization: 'Bearer desktop-local-secret',
             'X-Claude-Code-Session-Id': 'session-proxy-trace',
           },
           body: JSON.stringify({
@@ -1155,7 +1399,7 @@ describe('ProviderService', () => {
         })
 
         const res = await handleProxyRequest(req, new URL(req.url))
-        const trace = await traceCaptureService.getSessionTrace('session-proxy-trace')
+        const trace = await waitForCompletedProxyTrace('session-proxy-trace')
 
         expect(res.status).toBe(200)
         expect(trace.summary.apiCalls).toBe(1)
@@ -1170,7 +1414,126 @@ describe('ProviderService', () => {
         })
         expect(trace.calls[0].request.body.preview).toContain('capture this call')
         expect(trace.calls[0].response.body.preview).toContain('chatcmpl-trace')
+        expect(upstreamHeaders[0].get('Authorization')).toBe('Bearer sk-test-key-123')
+        expect(upstreamHeaders[0].get('Authorization')).not.toContain('desktop-local-secret')
       } finally {
+        globalThis.fetch = originalFetch
+      }
+    })
+
+    test('returns a non-streaming proxy response before trace persistence finishes', async () => {
+      const originalFetch = globalThis.fetch
+      globalThis.fetch = mock(async () => new Response(JSON.stringify({
+        id: 'chatcmpl-trace-background',
+        object: 'chat.completion',
+        created: 0,
+        model: 'gpt-4',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'background trace ok' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })) as typeof fetch
+
+      const svc = new ProviderService()
+      const provider = await svc.addProvider(sampleInput({ apiFormat: 'openai_chat' }))
+      await svc.activateProvider(provider.id)
+      const { releaseWrite, writeBlocked } = blockNextTraceAppend()
+      let released = false
+      let responsePromise: Promise<Response> | undefined
+
+      try {
+        const req = new Request('http://localhost:3456/proxy/v1/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Claude-Code-Session-Id': 'session-non-stream-background-trace',
+          },
+          body: JSON.stringify({
+            model: 'gpt-4',
+            max_tokens: 64,
+            messages: [{ role: 'user', content: 'return before trace persistence' }],
+          }),
+        })
+
+        responsePromise = handleProxyRequest(req, new URL(req.url))
+        await writeBlocked
+        const response = await settlesBeforeBlockedTraceWrite(responsePromise)
+        expect(response).not.toBeNull()
+        expect(response?.status).toBe(200)
+        await expect(response?.json()).resolves.toMatchObject({
+          content: [{ text: 'background trace ok' }],
+        })
+
+        releaseWrite()
+        released = true
+        const trace = await waitForCompletedProxyTrace('session-non-stream-background-trace')
+        expect(trace.calls[0]?.response?.body.preview).toContain('chatcmpl-trace-background')
+        expect(trace.events.at(-1)?.phase).toBe('upstream_fetch_completed')
+      } finally {
+        if (!released) releaseWrite()
+        await responsePromise?.catch(() => undefined)
+        globalThis.fetch = originalFetch
+      }
+    })
+
+    test('delivers streaming EOF before trace persistence finishes', async () => {
+      const originalFetch = globalThis.fetch
+      const encoder = new TextEncoder()
+      globalThis.fetch = mock(async () => new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode([
+            'data: {"id":"chatcmpl-stream-trace","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{"role":"assistant","content":"streamed"},"finish_reason":null}]}',
+            '',
+            'data: {"id":"chatcmpl-stream-trace","object":"chat.completion.chunk","model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}',
+            '',
+            'data: [DONE]',
+            '',
+          ].join('\n')))
+          controller.close()
+        },
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' },
+      })) as typeof fetch
+
+      const svc = new ProviderService()
+      const provider = await svc.addProvider(sampleInput({ apiFormat: 'openai_chat' }))
+      await svc.activateProvider(provider.id)
+      const { releaseWrite, writeBlocked } = blockNextTraceAppend()
+      let released = false
+      let bodyPromise: Promise<string> | undefined
+
+      try {
+        const req = new Request('http://localhost:3456/proxy/v1/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Claude-Code-Session-Id': 'session-stream-background-trace',
+          },
+          body: JSON.stringify({
+            model: 'gpt-4',
+            max_tokens: 64,
+            stream: true,
+            messages: [{ role: 'user', content: 'finish before trace persistence' }],
+          }),
+        })
+
+        const response = await handleProxyRequest(req, new URL(req.url))
+        bodyPromise = response.text()
+        await writeBlocked
+        const body = await settlesBeforeBlockedTraceWrite(bodyPromise)
+        expect(body).not.toBeNull()
+        expect(body).toContain('message_stop')
+
+        releaseWrite()
+        released = true
+        const trace = await waitForCompletedProxyTrace('session-stream-background-trace')
+        expect(trace.calls[0]?.response?.body.preview).toContain('message_stop')
+        expect(trace.events.at(-1)?.phase).toBe('upstream_fetch_completed')
+      } finally {
+        if (!released) releaseWrite()
+        await bodyPromise?.catch(() => undefined)
         globalThis.fetch = originalFetch
       }
     })
@@ -1228,9 +1591,12 @@ describe('ProviderService', () => {
 
     test('forwards a stable prompt_cache_key from client session metadata for OpenAI Responses upstreams', async () => {
       const originalFetch = globalThis.fetch
-      const calls: Array<{ body: Record<string, unknown> }> = []
+      const calls: Array<{ body: Record<string, unknown>; headers: Headers }> = []
       globalThis.fetch = mock(async (_url: string | URL | Request, init?: RequestInit) => {
-        calls.push({ body: JSON.parse(String(init?.body)) as Record<string, unknown> })
+        calls.push({
+          body: JSON.parse(String(init?.body)) as Record<string, unknown>,
+          headers: new Headers(init?.headers),
+        })
         return new Response(JSON.stringify({
           id: 'resp-1',
           object: 'response',
@@ -1252,7 +1618,10 @@ describe('ProviderService', () => {
 
         const req = new Request('http://localhost:3456/proxy/v1/messages', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: 'Bearer desktop-local-secret',
+          },
           body: JSON.stringify({
             model: 'gpt-5.4',
             max_tokens: 64,
@@ -1264,6 +1633,8 @@ describe('ProviderService', () => {
         const res = await handleProxyRequest(req, new URL(req.url))
         expect(res.status).toBe(200)
         expect(calls[0].body.prompt_cache_key).toBe('sess-42aa')
+        expect(calls[0].headers.get('Authorization')).toBe('Bearer sk-test-key-123')
+        expect(calls[0].headers.get('Authorization')).not.toContain('desktop-local-secret')
       } finally {
         globalThis.fetch = originalFetch
       }
@@ -1574,6 +1945,126 @@ describe('ProviderService', () => {
       }
     })
 
+    test('bypasses manual proxy options when testing loopback provider endpoints', async () => {
+      await fs.writeFile(
+        path.join(tmpDir, 'settings.json'),
+        JSON.stringify({
+          network: {
+            proxy: { mode: 'manual', url: 'http://127.0.0.1:1181' },
+          },
+        }),
+        'utf-8',
+      )
+      const originalFetch = globalThis.fetch
+      const calls: Array<{ url: string; proxy?: string }> = []
+      globalThis.fetch = mock(async (url: string | URL | Request, init?: RequestInit) => {
+        calls.push({
+          url: String(url),
+          proxy: (init as RequestInit & { proxy?: string } | undefined)?.proxy,
+        })
+        return new Response(JSON.stringify({
+          id: 'chatcmpl-1',
+          object: 'chat.completion',
+          created: 0,
+          model: 'local-model',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }) as typeof fetch
+
+      try {
+        const svc = new ProviderService()
+        const result = await svc.testProviderConfig({
+          baseUrl: 'http://127.0.0.1:11434',
+          apiKey: 'local-key',
+          modelId: 'local-model',
+          authStrategy: 'api_key',
+          apiFormat: 'openai_chat',
+        })
+
+        expect(result.connectivity.success).toBe(true)
+        expect(result.proxy?.success).toBe(true)
+        expect(calls.map((call) => call.url)).toEqual([
+          'http://127.0.0.1:11434/v1/chat/completions',
+          'http://127.0.0.1:11434/v1/chat/completions',
+        ])
+        expect(calls.map((call) => call.proxy)).toEqual([undefined, undefined])
+      } finally {
+        globalThis.fetch = originalFetch
+      }
+    })
+
+    test('bypasses inherited system proxy when testing direct provider endpoints', async () => {
+      await fs.writeFile(
+        path.join(tmpDir, 'settings.json'),
+        JSON.stringify({
+          network: {
+            proxy: { mode: 'direct', url: '' },
+          },
+        }),
+        'utf-8',
+      )
+      const originalFetch = globalThis.fetch
+      const originalHttpProxy = process.env.HTTP_PROXY
+      const originalHttpsProxy = process.env.HTTPS_PROXY
+      const originalLowerHttpProxy = process.env.http_proxy
+      const originalLowerHttpsProxy = process.env.https_proxy
+      const calls: Array<{ url: string; proxy?: string }> = []
+      process.env.HTTP_PROXY = 'http://127.0.0.1:1181'
+      process.env.HTTPS_PROXY = 'http://127.0.0.1:1181'
+      delete process.env.http_proxy
+      delete process.env.https_proxy
+      globalThis.fetch = mock(async (url: string | URL | Request, init?: RequestInit) => {
+        calls.push({
+          url: String(url),
+          proxy: (init as RequestInit & { proxy?: string } | undefined)?.proxy,
+        })
+        return new Response(JSON.stringify({
+          id: 'chatcmpl-direct',
+          object: 'chat.completion',
+          created: 0,
+          model: 'remote-model',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }) as typeof fetch
+
+      try {
+        const svc = new ProviderService()
+        const result = await svc.testProviderConfig({
+          baseUrl: 'https://api.example.com',
+          apiKey: 'remote-key',
+          modelId: 'remote-model',
+          authStrategy: 'api_key',
+          apiFormat: 'openai_chat',
+        })
+
+        expect(result.connectivity.success).toBe(true)
+        expect(result.proxy?.success).toBe(true)
+        expect(calls.map((call) => call.url)).toEqual([
+          'https://api.example.com/v1/chat/completions',
+          'https://api.example.com/v1/chat/completions',
+        ])
+        expect(calls.map((call) => call.proxy)).toEqual([undefined, undefined])
+      } finally {
+        globalThis.fetch = originalFetch
+        if (originalHttpProxy === undefined) delete process.env.HTTP_PROXY
+        else process.env.HTTP_PROXY = originalHttpProxy
+        if (originalHttpsProxy === undefined) delete process.env.HTTPS_PROXY
+        else process.env.HTTPS_PROXY = originalHttpsProxy
+        if (originalLowerHttpProxy === undefined) delete process.env.http_proxy
+        else process.env.http_proxy = originalLowerHttpProxy
+        if (originalLowerHttpsProxy === undefined) delete process.env.https_proxy
+        else process.env.https_proxy = originalLowerHttpsProxy
+      }
+    })
+
     test('should use configured network timeout for provider tests', async () => {
       await fs.writeFile(
         path.join(tmpDir, 'settings.json'),
@@ -1666,6 +2157,7 @@ describe('Providers API', () => {
       apiKey: 'sk-test',
       apiFormat: 'anthropic',
       autoCompactWindow: 64000,
+      disableExperimentalBetas: true,
       models: {
         main: 'gpt-4',
         haiku: 'gpt-4-haiku',
@@ -1676,10 +2168,11 @@ describe('Providers API', () => {
     const res = await handleProvidersApi(req, url, segments)
 
     expect(res.status).toBe(201)
-    const body = (await res.json()) as { provider: { name: string; models: { main: string }; autoCompactWindow: number } }
+    const body = (await res.json()) as { provider: { name: string; models: { main: string }; autoCompactWindow: number; disableExperimentalBetas?: boolean } }
     expect(body.provider.name).toBe('New Provider')
     expect(body.provider.models.main).toBe('gpt-4')
     expect(body.provider.autoCompactWindow).toBe(64000)
+    expect(body.provider.disableExperimentalBetas).toBe(true)
   })
 
   test('POST /api/providers should return 400 for invalid input', async () => {
@@ -1706,7 +2199,13 @@ describe('Providers API', () => {
     expect(res.status).toBe(200)
     const body = (await res.json()) as { providers: { name: string }[]; providerOrder: string[] }
     expect(body.providers.map((p) => p.name)).toEqual(['B', 'A'])
-    expect(body.providerOrder).toEqual([b.id, a.id, 'claude-official', 'openai-official'])
+    expect(body.providerOrder).toEqual([
+      b.id,
+      a.id,
+      'claude-official',
+      'openai-official',
+      'grok-official',
+    ])
   })
 
   test('PUT /api/providers/reorder should return 400 for a non-permutation', async () => {
@@ -1789,12 +2288,14 @@ describe('Providers API', () => {
 
     const { req, url, segments } = makeRequest('PUT', `/api/providers/${added.id}`, {
       name: 'Renamed Provider',
+      disableExperimentalBetas: true,
     })
     const res = await handleProvidersApi(req, url, segments)
 
     expect(res.status).toBe(200)
-    const body = (await res.json()) as { provider: { name: string } }
+    const body = (await res.json()) as { provider: { name: string; disableExperimentalBetas?: boolean } }
     expect(body.provider.name).toBe('Renamed Provider')
+    expect(body.provider.disableExperimentalBetas).toBe(true)
   })
 
   // ─── DELETE /api/providers/:id ───────────────────────────────────────────

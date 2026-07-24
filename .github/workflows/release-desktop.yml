@@ -40,10 +40,11 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           WIN_CSC_LINK: ${{ secrets.WINDOWS_CERTIFICATE }}
           WIN_CSC_KEY_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          RELEASE_DRAFT: ${{ github.event_name == 'workflow_dispatch' && inputs.draft == true }}
         run: |
           # macOS signing + notarization is preferred: Squirrel.Mac auto-update and
           # first-launch Gatekeeper approval work best with a notarized Developer ID build.
-          # A migration release may still ship unsigned while Apple Developer ID setup is pending.
+          # Drafts may still build unsigned while Apple Developer ID setup is being tested.
           missing=()
           [ -n "$CSC_LINK" ] || missing+=("MACOS_CERTIFICATE")
           [ -n "$CSC_KEY_PASSWORD" ] || missing+=("MACOS_CERTIFICATE_PASSWORD")
@@ -53,6 +54,10 @@ jobs:
           if [ "${#missing[@]}" -gt 0 ]; then
             printf '::warning::Missing macOS signing/notarization secrets (%s): macOS artifacts will be unsigned and users must use install-macos-unsigned.sh.\n' "${missing[*]}"
             echo "macos_signed=false" >> "$GITHUB_OUTPUT"
+            if [ "$RELEASE_DRAFT" != "true" ]; then
+              echo "::error::Refusing to publish a non-draft desktop release without macOS signing/notarization secrets."
+              exit 1
+            fi
           else
             echo "macos_signed=true" >> "$GITHUB_OUTPUT"
           fi
@@ -79,27 +84,38 @@ jobs:
             app_bundle_dir: mac-arm64
             label: macOS-ARM64
             smoke_platform: macos
+            arch: arm64
           - platform: macos-latest
             target_triple: x86_64-apple-darwin
             builder_args: --mac dmg zip --x64
             app_bundle_dir: mac
             label: macOS-x64
             smoke_platform: macos
+            arch: x64
           - platform: ubuntu-22.04
             target_triple: x86_64-unknown-linux-gnu
             builder_args: --linux AppImage deb --x64
             label: Linux-x64
             smoke_platform: linux
+            arch: x64
           - platform: ubuntu-22.04-arm
             target_triple: aarch64-unknown-linux-gnu
             builder_args: --linux AppImage deb --arm64
             label: Linux-ARM64
             smoke_platform: linux
+            arch: arm64
           - platform: windows-latest
             target_triple: x86_64-pc-windows-msvc
             builder_args: --win nsis --x64
             label: Windows-x64
             smoke_platform: windows
+            arch: x64
+          - platform: windows-latest
+            target_triple: aarch64-pc-windows-msvc
+            builder_args: --win nsis --arm64
+            label: Windows-ARM64
+            smoke_platform: windows
+            arch: arm64
 
     runs-on: ${{ matrix.platform }}
     name: Build (${{ matrix.label }})
@@ -134,7 +150,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: package.json
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -152,12 +168,30 @@ jobs:
         working-directory: adapters
         run: bun install
 
+      - name: Verify Windows legacy data recovery
+        if: matrix.smoke_platform == 'windows'
+        working-directory: desktop
+        run: bun run test:windows-storage-recovery
+
+      - name: Prepare bundled ripgrep
+        working-directory: desktop
+        env:
+          SIDECAR_TARGET_TRIPLE: ${{ matrix.target_triple }}
+        run: bun run prepare:ripgrep
+
       - name: Build sidecars
         working-directory: desktop
         env:
           BUN_INSTALL_CACHE_DIR: ${{ runner.temp }}/bun-install-cache
           SIDECAR_TARGET_TRIPLE: ${{ matrix.target_triple }}
         run: bun run build:sidecars
+
+      - name: Verify compiled Windows sidecar startup
+        if: matrix.smoke_platform == 'windows' && matrix.arch == 'x64'
+        working-directory: desktop
+        env:
+          CC_HAHA_COMPILED_SIDECAR_SMOKE_STARTS: '20'
+        run: bun run test:compiled-sidecar-smoke
 
       - name: Build renderer and Electron bundles
         working-directory: desktop
@@ -360,12 +394,18 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
         run: node ./node_modules/electron-builder/out/cli/cli.js ${{ matrix.builder_args }} --publish never
 
+      - name: Verify Windows installer execution
+        if: matrix.smoke_platform == 'windows' && matrix.arch == 'x64'
+        timeout-minutes: 10
+        working-directory: desktop
+        run: powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File ./scripts/windows-installer-smoke.ps1 -ArtifactsDir ./build-artifacts/electron -Arch x64
+
       - name: Verify packaged app structure
-        run: bun run test:package-smoke --platform ${{ matrix.smoke_platform }} --package-kind release --artifacts-dir desktop/build-artifacts/electron
+        run: bun run test:package-smoke --platform ${{ matrix.smoke_platform }} --arch ${{ matrix.arch }} --package-kind release --artifacts-dir desktop/build-artifacts/electron
 
       - name: Verify macOS launch policy
         if: matrix.smoke_platform == 'macos' && needs.signing-preflight.outputs.macos_signed == 'true' && (github.event_name != 'workflow_dispatch' || inputs.notarize_macos == true)
-        run: bun run test:package-smoke --platform macos --package-kind release --artifacts-dir desktop/build-artifacts/electron --require-macos-gatekeeper
+        run: bun run test:package-smoke --platform macos --arch ${{ matrix.arch }} --package-kind release --artifacts-dir desktop/build-artifacts/electron --require-macos-gatekeeper
 
       - name: Warn macOS notarization skipped
         if: matrix.smoke_platform == 'macos' && needs.signing-preflight.outputs.macos_signed == 'true' && github.event_name == 'workflow_dispatch' && inputs.notarize_macos == false
@@ -418,6 +458,13 @@ jobs:
               expected=(
                 "Claude-Code-Haha-${APP_VERSION}-win-x64.exe"
                 "Claude-Code-Haha-${APP_VERSION}-win-x64.exe.blockmap"
+                "latest.yml"
+              )
+              ;;
+            Windows-ARM64)
+              expected=(
+                "Claude-Code-Haha-${APP_VERSION}-win-arm64.exe"
+                "Claude-Code-Haha-${APP_VERSION}-win-arm64.exe.blockmap"
                 "latest.yml"
               )
               ;;
@@ -510,7 +557,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version-file: package.json
 
       - name: Install root dependencies
         run: bun install
@@ -542,6 +589,8 @@ jobs:
             "Claude-Code-Haha-${APP_VERSION}-linux-arm64.deb"
             "Claude-Code-Haha-${APP_VERSION}-win-x64.exe"
             "Claude-Code-Haha-${APP_VERSION}-win-x64.exe.blockmap"
+            "Claude-Code-Haha-${APP_VERSION}-win-arm64.exe"
+            "Claude-Code-Haha-${APP_VERSION}-win-arm64.exe.blockmap"
           )
 
           missing=()
@@ -587,7 +636,7 @@ jobs:
           tag_name: v${{ steps.version.outputs.value }}
           name: Claude Code Haha v${{ steps.version.outputs.value }}
           body: ${{ steps.release_notes.outputs.body }}
-          draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft == true }}
+          draft: true
           prerelease: false
           fail_on_unmatched_files: true
           files: |
@@ -600,8 +649,14 @@ jobs:
             artifacts/update-metadata-standard/*.yml
             desktop/scripts/install-macos-unsigned.sh
 
-      - name: Ensure workflow-dispatch release remains draft
+      - name: Publish GitHub release after complete upload
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.draft == false)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "v${{ steps.version.outputs.value }}" --draft=false --repo "${{ github.repository }}"
+
+      - name: Keep workflow-dispatch release as draft
         if: github.event_name == 'workflow_dispatch' && inputs.draft == true
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "v${{ steps.version.outputs.value }}" --draft --repo "${{ github.repository }}"
+        run: gh release view "v${{ steps.version.outputs.value }}" --json isDraft --jq 'if .isDraft then "release remains draft" else error("workflow-dispatch release was published unexpectedly") end' --repo "${{ github.repository }}"

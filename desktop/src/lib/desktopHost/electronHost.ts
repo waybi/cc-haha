@@ -75,6 +75,7 @@ export function createElectronHost(bridge: ElectronHostBridge): DesktopHost {
     },
     runtime: {
       getServerUrl: () => invoke(ELECTRON_IPC_CHANNELS.runtimeGetServerUrl),
+      getLocalAccessToken: () => invoke(ELECTRON_IPC_CHANNELS.runtimeGetLocalAccessToken),
     },
     app: {
       getVersion: () => invoke(ELECTRON_IPC_CHANNELS.appGetVersion),
@@ -98,6 +99,24 @@ export function createElectronHost(bridge: ElectronHostBridge): DesktopHost {
     },
     trace: {
       openWindow: sessionId => invoke(ELECTRON_IPC_CHANNELS.traceOpenWindow, sessionId),
+    },
+    pets: {
+      list: () => invoke(ELECTRON_IPC_CHANNELS.petsList),
+      createFromImage: input => invoke(ELECTRON_IPC_CHANNELS.petsCreateFromImage, input),
+      createFromAtlas: input => invoke(ELECTRON_IPC_CHANNELS.petsCreateFromAtlas, input),
+      openFolder: () => invoke(ELECTRON_IPC_CHANNELS.petsOpenFolder),
+      show: () => invoke(ELECTRON_IPC_CHANNELS.petsShow),
+      hide: () => invoke(ELECTRON_IPC_CHANNELS.petsHide),
+      showContextMenu: closeLabel => invoke(
+        ELECTRON_IPC_CHANNELS.petsShowContextMenu,
+        { closeLabel },
+      ),
+      dragWindow: payload => invoke(ELECTRON_IPC_CHANNELS.petsDragWindow, payload),
+      setIgnoreMouseEvents: ignore => invoke(ELECTRON_IPC_CHANNELS.petsSetIgnoreMouseEvents, ignore),
+      setInteractiveRegions: regions => invoke(ELECTRON_IPC_CHANNELS.petsSetInteractiveRegions, regions),
+      focusSession: sessionId => invoke(ELECTRON_IPC_CHANNELS.petsFocusSession, sessionId),
+      onNavigateSession: handler => subscribe(ELECTRON_EVENT_CHANNELS.petNavigateSession, handler),
+      onVisibilityChanged: handler => subscribe(ELECTRON_EVENT_CHANNELS.petVisibilityChanged, handler),
     },
     dialogs: {
       open: options => invoke(ELECTRON_IPC_CHANNELS.dialogOpen, options),
@@ -145,6 +164,7 @@ export function createElectronHost(bridge: ElectronHostBridge): DesktopHost {
       navigate: url => invoke(ELECTRON_IPC_CHANNELS.previewNavigate, url),
       setBounds: bounds => invoke(ELECTRON_IPC_CHANNELS.previewSetBounds, bounds),
       setVisible: visible => invoke(ELECTRON_IPC_CHANNELS.previewSetVisible, visible),
+      setZoom: level => invoke(ELECTRON_IPC_CHANNELS.previewSetZoom, level),
       close: () => invoke(ELECTRON_IPC_CHANNELS.previewClose),
       message: payload => invoke(ELECTRON_IPC_CHANNELS.previewMessage, payload),
       onEvent: handler => subscribe(ELECTRON_EVENT_CHANNELS.previewEvent, handler),
@@ -152,7 +172,6 @@ export function createElectronHost(bridge: ElectronHostBridge): DesktopHost {
     appMode: {
       get: () => invoke(ELECTRON_IPC_CHANNELS.appModeGet),
       set: config => invoke(ELECTRON_IPC_CHANNELS.appModeSet, config),
-      detectPortableDir: () => invoke(ELECTRON_IPC_CHANNELS.appModeDetectPortableDir),
       prepareRestart: () => invoke(ELECTRON_IPC_CHANNELS.appModePrepareRestart),
       restart: () => invoke(ELECTRON_IPC_CHANNELS.appModeRestart),
     },

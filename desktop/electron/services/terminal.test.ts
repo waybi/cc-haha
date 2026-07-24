@@ -71,11 +71,37 @@ afterEach(() => {
 })
 
 describe('Electron terminal service', () => {
-  it('uses the portable terminal config path before app userData', () => {
-    const app = { getPath: vi.fn(() => '/app/user-data') }
+  it('uses the custom terminal config path before the standard ~/.claude path', () => {
+    const app = { getPath: vi.fn(() => '/Users/test') }
 
     expect(terminalConfigPath(app, { CLAUDE_CONFIG_DIR: '/portable' })).toBe('/portable/terminal-config.json')
-    expect(terminalConfigPath(app, {})).toBe('/app/user-data/terminal-config.json')
+    expect(terminalConfigPath(app, {})).toBe('/Users/test/.claude/terminal-config.json')
+  })
+
+  it('reads an old userData terminal config but writes future changes to ~/.claude', () => {
+    const root = tempDir()
+    const home = path.join(root, 'home')
+    const userData = path.join(root, 'user-data')
+    const legacyBash = path.join(root, 'legacy-bash.exe')
+    const newBash = path.join(root, 'new-bash.exe')
+    fs.mkdirSync(userData, { recursive: true })
+    fs.writeFileSync(legacyBash, '')
+    fs.writeFileSync(newBash, '')
+    fs.writeFileSync(path.join(userData, 'terminal-config.json'), JSON.stringify({ bash_path: legacyBash }))
+    const service = new ElectronTerminalService({
+      app: { getPath: name => name === 'home' ? home : userData },
+      env: {},
+      isFile: filePath => filePath === legacyBash || filePath === newBash,
+    })
+
+    expect(service.getBashPath()).toBe(legacyBash)
+    service.setBashPath(newBash)
+    expect(JSON.parse(fs.readFileSync(path.join(home, '.claude', 'terminal-config.json'), 'utf8'))).toEqual({
+      bash_path: newBash,
+    })
+    expect(JSON.parse(fs.readFileSync(path.join(userData, 'terminal-config.json'), 'utf8'))).toEqual({
+      bash_path: legacyBash,
+    })
   })
 
   it('persists the legacy bash path config and validates saved paths', () => {
@@ -121,12 +147,16 @@ describe('Electron terminal service', () => {
       JSON.stringify({ desktopTerminal: { startupShell: 'cmd' } }),
     )
 
+    const ignoredHome = tempDir()
     const service = new ElectronTerminalService({
-      env: { HOME: dir, COMSPEC: 'powershell.exe' },
+      env: { HOME: ignoredHome, USERPROFILE: dir, COMSPEC: 'powershell.exe' },
       platform: 'win32',
     })
 
-    expect(desktopTerminalSettingsPath({ HOME: dir })).toBe(path.join(dir, '.claude', 'settings.json'))
+    expect(desktopTerminalSettingsPath({ HOME: ignoredHome, USERPROFILE: dir }, 'win32'))
+      .toBe(path.join(dir, '.claude', 'settings.json'))
+    expect(desktopTerminalSettingsPath({ HOME: dir }, 'darwin'))
+      .toBe(path.join(dir, '.claude', 'settings.json'))
     expect(service.resolveShell()).toBe('cmd.exe')
   })
 
@@ -252,5 +282,79 @@ describe('Electron terminal service', () => {
     service.kill(1)
 
     expect(fakePty.killed).toBe(true)
+  })
+
+  it('cleans up the PTY without sending events after the renderer is destroyed', async () => {
+    const dir = tempDir()
+    const fakePty = new FakePty()
+    const send = vi.fn()
+    const service = new ElectronTerminalService({
+      env: { HOME: dir, SHELL: '/bin/test-shell' },
+      platform: 'linux',
+      ptyFactory: { spawn: vi.fn(() => fakePty) },
+    })
+
+    await service.spawn({ cols: 80, rows: 24, cwd: dir }, {
+      isDestroyed: () => true,
+      send,
+    })
+
+    expect(() => fakePty.emitData('late output')).not.toThrow()
+    expect(() => fakePty.emitExit({ exitCode: 0 })).not.toThrow()
+    expect(send).not.toHaveBeenCalled()
+    expect(() => service.write(1, 'after exit')).toThrow('terminal session is not running')
+  })
+
+  it('ignores a renderer destroyed during send but rethrows unrelated send errors', async () => {
+    const dir = tempDir()
+    const destroyedPty = new FakePty()
+    const destroyedService = new ElectronTerminalService({
+      env: { HOME: dir, SHELL: '/bin/test-shell' },
+      platform: 'linux',
+      ptyFactory: { spawn: vi.fn(() => destroyedPty) },
+    })
+
+    await destroyedService.spawn({ cols: 80, rows: 24, cwd: dir }, {
+      isDestroyed: () => false,
+      send: () => {
+        throw new TypeError('Object has been destroyed')
+      },
+    })
+
+    expect(() => destroyedPty.emitData('late output')).not.toThrow()
+    expect(() => destroyedPty.emitExit({ exitCode: 0 })).not.toThrow()
+
+    const failingPty = new FakePty()
+    const failingService = new ElectronTerminalService({
+      env: { HOME: dir, SHELL: '/bin/test-shell' },
+      platform: 'linux',
+      ptyFactory: { spawn: vi.fn(() => failingPty) },
+    })
+    await failingService.spawn({ cols: 80, rows: 24, cwd: dir }, {
+      send: () => {
+        throw new Error('unexpected IPC failure')
+      },
+    })
+
+    expect(() => failingPty.emitData('output')).toThrow('unexpected IPC failure')
+  })
+
+  it('ignores PTY events that arrive after killAll', async () => {
+    const dir = tempDir()
+    const fakePty = new FakePty()
+    const send = vi.fn()
+    const service = new ElectronTerminalService({
+      env: { HOME: dir, SHELL: '/bin/test-shell' },
+      platform: 'linux',
+      ptyFactory: { spawn: vi.fn(() => fakePty) },
+    })
+
+    await service.spawn({ cols: 80, rows: 24, cwd: dir }, { send })
+    service.killAll()
+
+    expect(fakePty.killed).toBe(true)
+    expect(() => fakePty.emitData('late output')).not.toThrow()
+    expect(() => fakePty.emitExit({ exitCode: 0 })).not.toThrow()
+    expect(send).not.toHaveBeenCalled()
   })
 })

@@ -7,6 +7,12 @@
  */
 
 import { ProviderService } from './providerService.js'
+import { getPresetAuthStrategy } from './providerRuntimeEnv.js'
+import {
+  getNetworkProxyFetchOptions,
+  loadNetworkSettings,
+  type NetworkSettings,
+} from './networkSettings.js'
 import { sessionService } from './sessionService.js'
 import { hahaOpenAIOAuthService } from './hahaOpenAIOAuthService.js'
 import { isOpenAIOfficialProviderId } from './openaiOfficialProvider.js'
@@ -16,6 +22,7 @@ import { anthropicToOpenaiResponses } from '../proxy/transform/anthropicToOpenai
 import { openaiResponsesStreamToAnthropicResponse } from '../proxy/streaming/openaiResponsesStreamToAnthropicResponse.js'
 import { cleanSessionTitleSource, hasSessionTitleMarkup } from '../../utils/sessionTitleText.js'
 import { extractConversationText, SESSION_TITLE_PROMPT } from '../../utils/sessionTitle.js'
+import type { ProviderAuthStrategy } from '../types/provider.js'
 
 const TITLE_MAX_LEN = 50
 const TITLE_MAX_OUTPUT_TOKENS = 100
@@ -102,6 +109,36 @@ function buildTitleUserPrompt(
   ].join('\n')
 }
 
+function buildAnthropicTitleRequestHeaders(
+  apiKey: string,
+  authStrategy: ProviderAuthStrategy,
+): Record<string, string> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'anthropic-version': '2023-06-01',
+  }
+
+  switch (authStrategy) {
+    case 'api_key':
+      headers['x-api-key'] = apiKey
+      break
+    case 'auth_token':
+    case 'auth_token_empty_api_key':
+      headers.Authorization = `Bearer ${apiKey}`
+      break
+    case 'dual_same_token':
+      headers['x-api-key'] = apiKey
+      headers.Authorization = `Bearer ${apiKey}`
+      break
+    case 'dual_dummy':
+      headers['x-api-key'] = 'dummy'
+      headers.Authorization = 'Bearer dummy'
+      break
+  }
+
+  return headers
+}
+
 /**
  * Quick placeholder title derived from user message text.
  * Returns first sentence, collapsed to single line, max 50 chars.
@@ -130,6 +167,7 @@ export async function generateTitle(
 
   try {
     const providerService = new ProviderService()
+    const networkSettings = await loadNetworkSettings()
     if (providerId === null) return null
 
     let resolvedProvider = providerId
@@ -150,6 +188,7 @@ export async function generateTitle(
         trimmed,
         resolvedProvider.models.haiku || resolvedProvider.models.main,
         languagePreference,
+        networkSettings,
       )
     }
 
@@ -157,11 +196,8 @@ export async function generateTitle(
 
     const model = resolvedProvider.models.haiku || resolvedProvider.models.main
     const url = `${resolvedProvider.baseUrl.replace(/\/+$/, '')}/v1/messages`
-    const requestHeaders = {
-      'Content-Type': 'application/json',
-      'x-api-key': resolvedProvider.apiKey,
-      'anthropic-version': '2023-06-01',
-    }
+    const authStrategy = resolvedProvider.authStrategy ?? getPresetAuthStrategy(resolvedProvider.presetId)
+    const requestHeaders = buildAnthropicTitleRequestHeaders(resolvedProvider.apiKey, authStrategy)
     const requestBody = {
       model,
       max_tokens: TITLE_MAX_OUTPUT_TOKENS,
@@ -180,6 +216,7 @@ export async function generateTitle(
               content: buildTitleUserPrompt(trimmed, languagePreference, strictLanguage),
             }],
           },
+          networkSettings,
         )
         if (!response) return null
         return parseGeneratedTitleText(response)
@@ -195,6 +232,7 @@ async function generateOpenAIOfficialTitle(
   trimmed: string,
   model: string,
   languagePreference?: TitleLanguagePreference | null,
+  networkSettings?: NetworkSettings,
 ): Promise<string | null> {
   const tokens = await hahaOpenAIOAuthService.ensureFreshTokens()
   if (!tokens?.accessToken) return null
@@ -228,6 +266,9 @@ async function generateOpenAIOfficialTitle(
         headers,
         body: JSON.stringify(requestBody),
         signal: AbortSignal.timeout(15_000),
+        ...(networkSettings
+          ? getNetworkProxyFetchOptions(networkSettings, OPENAI_CODEX_API_ENDPOINT)
+          : {}),
       })
 
       if (!response.ok || !response.body) return null
@@ -249,6 +290,7 @@ async function fetchAnthropicTitleResponse(
   url: string,
   requestHeaders: Record<string, string>,
   requestBody: Record<string, unknown>,
+  networkSettings: NetworkSettings,
 ): Promise<string | null> {
   let response = await fetch(url, {
     method: 'POST',
@@ -258,6 +300,7 @@ async function fetchAnthropicTitleResponse(
       thinking: { type: 'disabled' },
     }),
     signal: AbortSignal.timeout(15_000),
+    ...getNetworkProxyFetchOptions(networkSettings, url),
   })
 
   if (!response.ok && response.status >= 400 && response.status < 500) {
@@ -266,6 +309,7 @@ async function fetchAnthropicTitleResponse(
       headers: requestHeaders,
       body: JSON.stringify(requestBody),
       signal: AbortSignal.timeout(15_000),
+      ...getNetworkProxyFetchOptions(networkSettings, url),
     })
   }
 

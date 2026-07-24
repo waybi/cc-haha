@@ -11,6 +11,7 @@
 | macOS (Apple Silicon / M 系列) | `Claude-Code-Haha-<版本>-mac-arm64.dmg` |
 | macOS (Intel) | `Claude-Code-Haha-<版本>-mac-x64.dmg` |
 | Windows (x64) | `Claude-Code-Haha-<版本>-win-x64.exe` |
+| Windows (ARM64) | `Claude-Code-Haha-<版本>-win-arm64.exe` |
 | Linux (x64) | `Claude-Code-Haha-<版本>-linux-x86_64.AppImage` 或 `...-linux-amd64.deb` |
 | Linux (ARM64) | `Claude-Code-Haha-<版本>-linux-arm64.AppImage` 或 `...-linux-arm64.deb` |
 
@@ -64,8 +65,34 @@ bun run dev --host 127.0.0.1 --port 2024
 
 启动后浏览器访问 `http://127.0.0.1:2024` 即可。
 
+本机通过 `127.0.0.1` 使用 Web UI 时，不需要开启 H5 访问，也不需要填写 H5 Token。服务端会把真正的本机回环请求视为可信本地访问；这个豁免不会扩展到局域网地址或反向代理。
+
+### 无界面 Linux 服务器
+
+如果服务器没有桌面环境，推荐先使用 SSH 同时转发前端和后端端口：
+
+```bash
+# 在服务器上分别启动后端与前端，仍只监听回环地址
+SERVER_PORT=3456 bun run src/server/index.ts
+cd desktop
+bun run dev --host 127.0.0.1 --port 2024
+
+# 在自己的电脑上执行
+ssh -L 2024:127.0.0.1:2024 -L 3456:127.0.0.1:3456 user@example.com
+```
+
+然后在自己的电脑上打开：
+
+```text
+http://127.0.0.1:2024/?serverUrl=http%3A%2F%2F127.0.0.1%3A3456
+```
+
+这条路径不把服务暴露到局域网，因此同样不需要 H5 Token。如果确实要从局域网或反向代理访问，请按 [H5 访问](./06-h5-access.md#无桌面界面时开启) 在服务器本机启用 Token、配置允许来源，再让服务监听外部接口。
+
 ## 常见问题
 
 **Q: 这个版本会自动更新吗？**
 
-`v0.4.3` 起的正式 Release 会通过 GitHub Releases 检查更新，并下载对应平台的更新包。首次迁移到 signed/notarized macOS 版本时，建议先手动下载安装 `v0.4.3`；后续版本可以走应用内更新。覆盖安装不会删除本地配置和会话数据（`~/.claude`）。
+`v0.4.3` 起的正式 Release 会通过 GitHub Releases 检查更新，并下载对应平台的更新包。覆盖安装或应用内更新不会删除本地配置和会话数据（`~/.claude`）。
+
+正式公开的 macOS Release 需要签名和公证；draft/unsigned 临时包仍可能需要手动放行。Windows 签名不是发布阻塞项，未签名安装包仍可更新，但可能出现 SmartScreen 提示。

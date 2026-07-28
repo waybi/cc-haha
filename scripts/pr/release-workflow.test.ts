@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 
 describe('release desktop workflow', () => {
   function readReleaseWorkflow() {
@@ -28,6 +28,18 @@ describe('release desktop workflow', () => {
     expect(workflow).not.toContain('quality-preflight')
     expect(workflow).not.toContain('bun run verify')
     expect(workflow).toContain('name: Build (${{ matrix.label }})')
+  })
+
+  test('version tags have exactly one desktop release publisher', () => {
+    const releasePublishers = readdirSync('.github/workflows')
+      .filter(fileName => fileName.endsWith('.yml'))
+      .filter((fileName) => {
+        const workflow = readFileSync(`.github/workflows/${fileName}`, 'utf8')
+        return workflow.includes("tags: ['v*.*.*']")
+          && workflow.includes('softprops/action-gh-release@v2')
+      })
+
+    expect(releasePublishers).toEqual(['release-desktop.yml'])
   })
 
   test('desktop build workflows keep Bun compile cache on the runner work drive', () => {
@@ -316,6 +328,8 @@ describe('release desktop workflow', () => {
     }
     expect(buildJob).toContain('target_triple: aarch64-pc-windows-msvc')
     expect(buildJob).toContain('builder_args: --win nsis --arm64')
+    expect(buildJob).toContain('builder_args: --linux AppImage deb rpm --x64')
+    expect(buildJob).toContain('builder_args: --linux AppImage deb rpm --arm64')
     expect(buildJob).toContain('Claude-Code-Haha-${APP_VERSION}-win-arm64.exe')
     expect(buildJob).toContain('Upload release artifacts for final publish')
     expect(buildJob).toContain('actions/upload-artifact@v4')
@@ -343,6 +357,7 @@ describe('release desktop workflow', () => {
     expect(publishJob).toContain('artifacts/release-assets/**/*.exe')
     expect(publishJob).toContain('artifacts/release-assets/**/*.AppImage')
     expect(publishJob).toContain('artifacts/release-assets/**/*.deb')
+    expect(publishJob).toContain('artifacts/release-assets/**/*.rpm')
     expect(publishJob).toContain('artifacts/release-assets/**/*.blockmap')
     expect(publishJob).toContain('artifacts/update-metadata-standard/*.yml')
     expect(publishJob).toContain('desktop/scripts/install-macos-unsigned.sh')
@@ -392,8 +407,10 @@ describe('release desktop workflow', () => {
       `Claude-Code-Haha-${version}-mac-x64.zip.blockmap`,
       `Claude-Code-Haha-${version}-linux-x86_64.AppImage`,
       `Claude-Code-Haha-${version}-linux-amd64.deb`,
+      `Claude-Code-Haha-${version}-linux-x86_64.rpm`,
       `Claude-Code-Haha-${version}-linux-arm64.AppImage`,
       `Claude-Code-Haha-${version}-linux-arm64.deb`,
+      `Claude-Code-Haha-${version}-linux-aarch64.rpm`,
       `Claude-Code-Haha-${version}-win-x64.exe`,
       `Claude-Code-Haha-${version}-win-x64.exe.blockmap`,
       `Claude-Code-Haha-${version}-win-arm64.exe`,
@@ -423,6 +440,7 @@ describe('release desktop workflow', () => {
     expect(expectedReleaseAssets.filter((name) => name.endsWith('.zip')).length).toBe(2)
     expect(expectedReleaseAssets.filter((name) => name.endsWith('.AppImage')).length).toBe(2)
     expect(expectedReleaseAssets.filter((name) => name.endsWith('.deb')).length).toBe(2)
+    expect(expectedReleaseAssets.filter((name) => name.endsWith('.rpm')).length).toBe(2)
     expect(expectedReleaseAssets.filter((name) => name.endsWith('.exe')).length).toBe(2)
     expect(expectedReleaseAssets.some((name) => name.includes('-linux-') && name.endsWith('.blockmap'))).toBe(false)
     for (const platform of ['mac', 'linux', 'win']) {
@@ -447,8 +465,10 @@ describe('release desktop workflow', () => {
       'Claude-Code-Haha-${APP_VERSION}-mac-x64.zip',
       'Claude-Code-Haha-${APP_VERSION}-linux-x86_64.AppImage',
       'Claude-Code-Haha-${APP_VERSION}-linux-amd64.deb',
+      'Claude-Code-Haha-${APP_VERSION}-linux-x86_64.rpm',
       'Claude-Code-Haha-${APP_VERSION}-linux-arm64.AppImage',
       'Claude-Code-Haha-${APP_VERSION}-linux-arm64.deb',
+      'Claude-Code-Haha-${APP_VERSION}-linux-aarch64.rpm',
       'Claude-Code-Haha-${APP_VERSION}-win-x64.exe',
       'Claude-Code-Haha-${APP_VERSION}-win-x64.exe.blockmap',
       'Claude-Code-Haha-${APP_VERSION}-win-arm64.exe',

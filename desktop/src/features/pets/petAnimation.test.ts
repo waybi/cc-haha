@@ -98,18 +98,28 @@ describe('pet animation atlas contract', () => {
     expect(() => getPetAnimationFrameAtElapsedMs('idle', -1)).toThrow(RangeError)
   })
 
-  it('plays the recorded Codex idle row as one continuous six-times-slower loop', () => {
+  it('keeps the recorded Codex idle timing and inserts low-frequency ambient gestures', () => {
     const playback = getPetAnimationPlaybackFrames('idle')
 
     expect(PET_IDLE_DURATION_MULTIPLIER).toBe(6)
-    expect(playback).toHaveLength(6)
-    expect(playback.map((frame) => frame.columnIndex)).toEqual([0, 1, 2, 3, 4, 5])
-    expect(playback.map((frame) => frame.durationMs)).toEqual([1680, 660, 660, 840, 840, 1920])
+    expect(playback.slice(0, 12).map((frame) => frame.columnIndex)).toEqual([
+      0, 1, 2, 3, 4, 5,
+      0, 1, 2, 3, 4, 5,
+    ])
+    expect(playback.slice(0, 6).map((frame) => frame.durationMs)).toEqual([
+      1680, 660, 660, 840, 840, 1920,
+    ])
+    expect(playback[12]).toMatchObject({
+      rowIndex: 3,
+      columnIndex: 0,
+      durationMs: 140,
+    })
+    expect(getPetAnimationPlaybackFrames('idle')).toBe(playback)
     expect(getPetAnimationPlaybackLoopStartIndex('idle')).toBe(0)
-    expect(getNextPetAnimationPlaybackIndex('idle', 5)).toBe(0)
+    expect(getNextPetAnimationPlaybackIndex('idle', playback.length - 1)).toBe(0)
   })
 
-  it('plays three active cycles once, then loops only the slow idle tail', () => {
+  it('repeats three active cycles after each slow idle recovery loop', () => {
     const runningFrames = getPetAnimationFrames('running')
     const playback = getPetAnimationPlaybackFrames('running')
     const loopStartIndex = runningFrames.length * 3
@@ -122,8 +132,8 @@ describe('pet animation atlas contract', () => {
       columnIndex: 0,
       durationMs: 1680,
     })
-    expect(getPetAnimationPlaybackLoopStartIndex('running')).toBe(loopStartIndex)
-    expect(getNextPetAnimationPlaybackIndex('running', playback.length - 1)).toBe(loopStartIndex)
+    expect(getPetAnimationPlaybackLoopStartIndex('running')).toBe(0)
+    expect(getNextPetAnimationPlaybackIndex('running', playback.length - 1)).toBe(0)
     expect(getPetAnimationPlaybackStep('running', runningFrames.length - 1)).toMatchObject({
       phase: 'action',
       cycleBoundaryAfter: true,
@@ -154,9 +164,9 @@ describe('pet animation atlas contract', () => {
       remainingDurationMs: 1680,
     })
     expect(getPetAnimationPlaybackTickAtElapsedMs('running', idleTailStartMs + 6_600)).toMatchObject({
-      playbackIndex: 18,
-      phase: 'idle',
-      remainingDurationMs: 1680,
+      playbackIndex: 0,
+      phase: 'action',
+      remainingDurationMs: 120,
     })
     expect(() => getPetAnimationPlaybackTickAtElapsedMs('idle', -1)).toThrow(RangeError)
   })

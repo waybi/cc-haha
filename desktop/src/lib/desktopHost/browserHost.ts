@@ -72,6 +72,12 @@ export const browserHost: DesktopHost = {
       unsupported('Writing clipboard text')
     },
   },
+  files: {
+    getPathForFile(file) {
+      const legacyPath = (file as File & { path?: unknown }).path
+      return typeof legacyPath === 'string' ? legacyPath : ''
+    },
+  },
   events: {
     async listen() {
       return noopUnlisten
@@ -113,6 +119,12 @@ export const browserHost: DesktopHost = {
     async createFromAtlas() {
       unsupported('Creating custom pets')
     },
+    async pickSourceSheet() {
+      unsupported('Creating custom pets')
+    },
+    async createFromAtlasBytes() {
+      unsupported('Creating custom pets')
+    },
     async openFolder() {
       unsupported('Opening the custom pets folder')
     },
@@ -133,6 +145,9 @@ export const browserHost: DesktopHost = {
     },
     async setInteractiveRegions() {
       unsupported('Changing companion pet interaction regions')
+    },
+    async focusMainWindow() {
+      unsupported('Focusing the main desktop window')
     },
     async focusSession() {
       unsupported('Focusing a pet session')
@@ -299,5 +314,10 @@ export const browserHost: DesktopHost = {
     async set() {
       unsupported('Native app zoom')
     },
+  },
+  appearance: {
+    // No native chrome to keep in sync in a browser tab; the CSS theme is the
+    // whole story there, so reporting it is a no-op rather than an error.
+    async setApplied() {},
   },
 }

@@ -41,6 +41,14 @@ describe('desktop host contract', () => {
       displayName: 'Moon Cat',
       description: 'A quiet companion.',
     })).rejects.toThrow('desktop app runtime')
+    await expect(browserHost.pets.pickSourceSheet({})).rejects.toThrow('desktop app runtime')
+    await expect(browserHost.pets.createFromAtlasBytes({
+      slug: 'moon-cat',
+      displayName: 'Moon Cat',
+      description: 'A quiet moonlight companion.',
+      atlasData: new Uint8Array([1, 2, 3]),
+      mimeType: 'image/png',
+    })).rejects.toThrow('desktop app runtime')
     await expect(browserHost.pets.openFolder()).rejects.toThrow('desktop app runtime')
     await expect(browserHost.pets.show()).rejects.toThrow('desktop app runtime')
     await expect(browserHost.pets.hide()).rejects.toThrow('desktop app runtime')
@@ -48,8 +56,21 @@ describe('desktop host contract', () => {
     await expect(browserHost.pets.dragWindow({ phase: 'start', x: 100, y: 100 })).rejects.toThrow('desktop app runtime')
     await expect(browserHost.pets.setIgnoreMouseEvents(true)).rejects.toThrow('desktop app runtime')
     await expect(browserHost.pets.setInteractiveRegions([{ x: 0, y: 0, width: 10, height: 10 }])).rejects.toThrow('desktop app runtime')
+    await expect(browserHost.pets.focusMainWindow()).rejects.toThrow('desktop app runtime')
     await expect(browserHost.pets.focusSession('session-1')).rejects.toThrow('desktop app runtime')
     await expect(browserHost.pets.onNavigateSession(vi.fn())).resolves.toEqual(expect.any(Function))
+  })
+
+  it('accepts the applied appearance instead of rejecting it in a browser tab', async () => {
+    // Reporting the theme is a notification to a native shell, and a browser
+    // tab simply has none — throwing here would surface as a console error on
+    // every theme change in the H5 entry.
+    await expect(browserHost.appearance.setApplied({
+      isDark: true,
+      background: '#0E0E0E',
+      lightBackground: '#FFFFFF',
+      followSystem: true,
+    })).resolves.toBeUndefined()
   })
 
   it('detects the browser fallback when native host globals are absent', () => {

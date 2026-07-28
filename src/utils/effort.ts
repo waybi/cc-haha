@@ -1,9 +1,13 @@
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
 import { isUltrathinkEnabled } from './thinking.js'
 import { getInitialSettings } from './settings/settings.js'
-import { isProSubscriber, isMaxSubscriber, isTeamSubscriber } from './auth.js'
+import { isClaudeAISubscriber, isProSubscriber, isMaxSubscriber, isTeamSubscriber } from './auth.js'
 import { getFeatureValue_CACHED_MAY_BE_STALE } from 'src/services/analytics/growthbook.js'
-import { getAPIProvider, isFirstPartyAnthropicBaseUrl } from './model/providers.js'
+import {
+  getAPIProvider,
+  hasAnthropicCompatibleThirdPartyConfig,
+  isFirstPartyAnthropicBaseUrl,
+} from './model/providers.js'
 import { get3PModelCapabilityOverride } from './model/modelSupportOverrides.js'
 import { isEnvTruthy } from './envUtils.js'
 import type { EffortLevel as RuntimeEffortLevel } from 'src/entrypoints/sdk/runtimeTypes.js'
@@ -24,6 +28,17 @@ export const EFFORT_LEVELS = [
 
 export type EffortValue = EffortLevel | number
 
+function shouldTrustBuiltInClaudeCapabilityList(): boolean {
+  if (hasAnthropicCompatibleThirdPartyConfig()) {
+    return false
+  }
+  return (
+    getAPIProvider() !== 'firstParty' ||
+    isFirstPartyAnthropicBaseUrl() ||
+    isClaudeAISubscriber()
+  )
+}
+
 // @[MODEL LAUNCH]: Add the new model to the allowlist if it supports the effort parameter.
 export function modelSupportsEffort(model: string): boolean {
   const m = model.toLowerCase()
@@ -38,7 +53,7 @@ export function modelSupportsEffort(model: string): boolean {
     return true
   }
   // Supported by a subset of Claude 4 models
-  if (
+  if (shouldTrustBuiltInClaudeCapabilityList() && (
     m.includes('opus-4-6') ||
     m.includes('opus-4-7') ||
     m.includes('opus-4-8') ||
@@ -48,7 +63,7 @@ export function modelSupportsEffort(model: string): boolean {
     m.includes('fable-5') ||
     m.includes('mythos-5') ||
     m.includes('mythos-preview')
-  ) {
+  )) {
     return true
   }
   // Exclude any other known legacy models (haiku, older opus/sonnet variants)
@@ -63,7 +78,10 @@ export function modelSupportsEffort(model: string): boolean {
   // Default to true for unknown model strings on 1P.
   // Do not default to true for 3P as they have different formats for their
   // model strings (ex. anthropics/claude-code#30795)
-  return getAPIProvider() === 'firstParty' && isFirstPartyAnthropicBaseUrl()
+  return (
+    getAPIProvider() === 'firstParty' &&
+    (isFirstPartyAnthropicBaseUrl() || isClaudeAISubscriber())
+  )
 }
 
 // @[MODEL LAUNCH]: Add new models that expose the 'xhigh' effort level.
@@ -77,7 +95,7 @@ export function modelSupportsXHighEffort(model: string): boolean {
     return entry?.supportedReasoningEfforts.includes('xhigh') ?? true
   }
   const m = model.toLowerCase()
-  return (
+  return shouldTrustBuiltInClaudeCapabilityList() && (
     m.includes('opus-4-7') ||
     m.includes('opus-4-8') ||
     m.includes('sonnet-5') ||
@@ -97,7 +115,7 @@ export function modelSupportsMaxEffort(model: string): boolean {
     return entry?.supportedReasoningEfforts.includes('max') ?? true
   }
   const m = model.toLowerCase()
-  if (
+  if (shouldTrustBuiltInClaudeCapabilityList() && (
     m.includes('opus-4-6') ||
     m.includes('opus-4-7') ||
     m.includes('opus-4-8') ||
@@ -106,7 +124,7 @@ export function modelSupportsMaxEffort(model: string): boolean {
     m.includes('fable-5') ||
     m.includes('mythos-5') ||
     m.includes('mythos-preview')
-  ) {
+  )) {
     return true
   }
   if (process.env.USER_TYPE === 'ant' && resolveAntModel(model)) {

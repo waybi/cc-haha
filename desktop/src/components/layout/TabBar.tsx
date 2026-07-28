@@ -19,13 +19,16 @@ import { useWorkspacePanelStore } from '../../stores/workspacePanelStore'
 import { useTerminalPanelStore } from '../../stores/terminalPanelStore'
 import { useCLITaskStore } from '../../stores/cliTaskStore'
 import { useTeamStore } from '../../stores/teamStore'
+import { StatusDot } from '@/components/ui/Badge'
+import { IconButton } from '@/components/ui/IconButton'
+import { useDismissable } from '@/hooks/useDismissable'
 import { useTranslation } from '../../i18n'
 import { getDesktopHost } from '../../lib/desktopHost'
 import { hasRunningBackgroundTasks } from '../../lib/backgroundTasks'
 import { WindowControls, showWindowControls } from './WindowControls'
 import { OpenProjectMenu } from './OpenProjectMenu'
 import { Folder, FolderOpen, SquareTerminal } from 'lucide-react'
-import { ActionDialog } from '../shared/ActionDialog'
+import { ActionDialog } from '@/components/ui/ActionDialog'
 import { buildSessionActivityModel, hasVisibleSessionActivity } from '../activity/sessionActivityModel'
 import { SessionActivityButton } from '../activity/SessionActivityButton'
 import { useActivityPanelStore } from '../../stores/activityPanelStore'
@@ -157,6 +160,7 @@ export function TabBar() {
   const pendingDragRef = useRef<{ index: number; startX: number; startY: number } | null>(null)
   const suppressClickRef = useRef(false)
   const tabRefs = useRef(new Map<string, HTMLDivElement | null>())
+  const contextMenuRef = useRef<HTMLDivElement>(null)
   const t = useTranslation()
   const runningSessionIds = useMemo(() => {
     const ids = new Set<string>()
@@ -204,12 +208,16 @@ export function TabBar() {
     return () => window.cancelAnimationFrame(frame)
   }, [activeTabId, tabs.length, updateScrollState])
 
-  useEffect(() => {
-    if (!contextMenu) return
-    const close = () => setContextMenu(null)
-    document.addEventListener('click', close)
-    return () => document.removeEventListener('click', close)
-  }, [contextMenu])
+  const closeContextMenu = useCallback(() => setContextMenu(null), [])
+
+  // Every item in the menu clears `contextMenu` itself, so excluding the menu
+  // from "outside" keeps the previous behavior while dropping the hand-rolled
+  // document listener.
+  useDismissable({
+    open: contextMenu !== null,
+    refs: [contextMenuRef],
+    onDismiss: closeContextMenu,
+  })
 
   const scroll = (direction: 'left' | 'right') => {
     const el = scrollRef.current
@@ -397,11 +405,11 @@ export function TabBar() {
     <div
       data-testid="tab-bar"
       data-desktop-drag-region={isDesktopRuntime ? true : undefined}
-      className="flex min-h-11 items-stretch bg-[var(--color-surface-container)] select-none border-b border-[var(--color-border)]"
+      className="flex min-h-[52px] items-stretch bg-[var(--color-surface)] select-none border-b border-[var(--color-border)]"
     >
 
       {canScrollLeft && (
-        <button onClick={() => scroll('left')} className="flex h-11 w-7 flex-shrink-0 items-center justify-center text-[var(--color-text-tertiary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)]">
+        <button type="button" onClick={() => scroll('left')} aria-label={t('tabs.scrollLeft')} className="flex h-[52px] w-7 flex-shrink-0 items-center justify-center text-[var(--color-text-tertiary)] transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--color-border-focus)]">
           <span className="material-symbols-outlined text-[16px]">chevron_left</span>
         </button>
       )}
@@ -413,33 +421,40 @@ export function TabBar() {
         className="flex-1 flex items-stretch overflow-x-hidden"
         onDragOver={(e) => e.preventDefault()}
       >
-        {tabs.map((tab, index) => (
-          <TabItem
-            key={tab.sessionId}
-            ref={(node) => { tabRefs.current.set(tab.sessionId, node) }}
-            tab={tab}
-            isRunning={runningSessionIds.has(tab.sessionId)}
-            isActive={tab.sessionId === activeTabId}
-            isDragOver={dragOverIndex === index}
-            isDragging={tab.sessionId === draggingSessionId}
-            dragOffsetX={tab.sessionId === draggingSessionId ? dragOffsetX : 0}
-            runningLabel={t('tabs.sessionRunning')}
-            onClick={() => handleTabClick(tab.sessionId)}
-            onClose={() => handleClose(tab.sessionId)}
-            onContextMenu={(e) => handleContextMenu(e, tab.sessionId)}
-            onMouseDown={(event) => handleTabMouseDown(event, index)}
-          />
-        ))}
+        {tabs.map((tab, index) => {
+          const displayTitle = tab.type === 'settings'
+            ? t('settings.title')
+            : (tab.title || t('tabs.untitled'))
+          return (
+            <TabItem
+              key={tab.sessionId}
+              ref={(node) => { tabRefs.current.set(tab.sessionId, node) }}
+              tab={tab}
+              displayTitle={displayTitle}
+              closeLabel={t('tabs.closeTab', { title: displayTitle })}
+              isRunning={runningSessionIds.has(tab.sessionId)}
+              isActive={tab.sessionId === activeTabId}
+              isDragOver={dragOverIndex === index}
+              isDragging={tab.sessionId === draggingSessionId}
+              dragOffsetX={tab.sessionId === draggingSessionId ? dragOffsetX : 0}
+              runningLabel={t('tabs.sessionRunning')}
+              onClick={() => handleTabClick(tab.sessionId)}
+              onClose={() => handleClose(tab.sessionId)}
+              onContextMenu={(e) => handleContextMenu(e, tab.sessionId)}
+              onMouseDown={(event) => handleTabMouseDown(event, index)}
+            />
+          )
+        })}
       </div>
 
-      <div className="flex shrink-0 items-center gap-1 border-l border-[var(--color-border)]/70 px-2">
+      <div className="flex shrink-0 items-center gap-1 border-l border-[var(--color-border)] px-2">
         {showActivityButton && activeTabId && (
           <SessionActivityButton sessionId={activeTabId} />
         )}
         {isDesktopRuntime && isActiveSessionTab && (
           <OpenProjectMenu path={openProjectPath} />
         )}
-        <ToolbarIconButton
+        <IconButton
           icon={<SquareTerminal size={17} strokeWidth={1.9} />}
           label={t('tabs.openTerminal')}
           onClick={() => {
@@ -449,10 +464,13 @@ export function TabBar() {
             }
             useTabStore.getState().openTerminalTab()
           }}
-          active={isTerminalPanelOpen}
+          size="md"
+          tone={isTerminalPanelOpen ? 'default' : 'muted'}
+          pressed={isTerminalPanelOpen}
+          data-active={isTerminalPanelOpen ? 'true' : 'false'}
         />
         {isActiveSessionTab && activeTabId && (
-          <ToolbarIconButton
+          <IconButton
             icon={isWorkspacePanelOpen ? <FolderOpen size={18} strokeWidth={1.9} /> : <Folder size={18} strokeWidth={1.9} />}
             label={t(isWorkspacePanelOpen ? 'tabs.hideWorkspace' : 'tabs.showWorkspace')}
             onClick={() => {
@@ -464,7 +482,10 @@ export function TabBar() {
                 workbench.openPanel(activeTabId)
               }
             }}
-            active={isWorkspacePanelOpen}
+            size="md"
+            tone={isWorkspacePanelOpen ? 'default' : 'muted'}
+            pressed={isWorkspacePanelOpen}
+            data-active={isWorkspacePanelOpen ? 'true' : 'false'}
           />
         )}
       </div>
@@ -474,12 +495,12 @@ export function TabBar() {
           data-testid="tab-bar-drag-gutter"
           data-desktop-drag-region
           aria-hidden="true"
-          className={`min-h-11 flex-shrink-0 ${showWindowControls ? 'w-3' : 'w-4'}`}
+          className={`min-h-[52px] flex-shrink-0 ${showWindowControls ? 'w-3' : 'w-4'}`}
         />
       )}
 
       {canScrollRight && (
-        <button onClick={() => scroll('right')} className="flex h-11 w-7 flex-shrink-0 items-center justify-center text-[var(--color-text-tertiary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)]">
+        <button type="button" onClick={() => scroll('right')} aria-label={t('tabs.scrollRight')} className="flex h-[52px] w-7 flex-shrink-0 items-center justify-center text-[var(--color-text-tertiary)] transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--color-border-focus)]">
           <span className="material-symbols-outlined text-[16px]">chevron_right</span>
         </button>
       )}
@@ -488,37 +509,38 @@ export function TabBar() {
 
       {contextMenu && (
         <div
-          className="fixed z-50 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-[var(--radius-md)] py-1 min-w-[160px]"
-          style={{ left: contextMenu.x, top: contextMenu.y, boxShadow: 'var(--shadow-dropdown)' }}
+          ref={contextMenuRef}
+          className="fixed z-[var(--z-dropdown)] min-w-[180px] overflow-hidden rounded-[var(--radius-xl)] border border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] py-2 shadow-[var(--shadow-dropdown)]"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
         >
           <button
             onClick={() => { handleClose(contextMenu.sessionId); setContextMenu(null) }}
-            className="w-full px-3 py-1.5 text-xs text-left text-[var(--color-text-primary)] hover:bg-[var(--color-surface-hover)]"
+            className="w-full px-4 py-2 text-left text-[13px] text-[var(--color-text-primary)] transition-colors hover:bg-[var(--color-surface-hover)]"
           >
             {t('tabs.close')}
           </button>
           <button
             onClick={() => handleCloseOthers(contextMenu.sessionId)}
-            className="w-full px-3 py-1.5 text-xs text-left text-[var(--color-text-primary)] hover:bg-[var(--color-surface-hover)]"
+            className="w-full px-4 py-2 text-left text-[13px] text-[var(--color-text-primary)] transition-colors hover:bg-[var(--color-surface-hover)]"
           >
             {t('tabs.closeOthers')}
           </button>
           <button
             onClick={() => handleCloseLeft(contextMenu.sessionId)}
-            className="w-full px-3 py-1.5 text-xs text-left text-[var(--color-text-primary)] hover:bg-[var(--color-surface-hover)]"
+            className="w-full px-4 py-2 text-left text-[13px] text-[var(--color-text-primary)] transition-colors hover:bg-[var(--color-surface-hover)]"
           >
             {t('tabs.closeLeft')}
           </button>
           <button
             onClick={() => handleCloseRight(contextMenu.sessionId)}
-            className="w-full px-3 py-1.5 text-xs text-left text-[var(--color-text-primary)] hover:bg-[var(--color-surface-hover)]"
+            className="w-full px-4 py-2 text-left text-[13px] text-[var(--color-text-primary)] transition-colors hover:bg-[var(--color-surface-hover)]"
           >
             {t('tabs.closeRight')}
           </button>
-          <div className="my-1 border-t border-[var(--color-border)]" />
+          <div className="my-1.5 border-t border-[var(--color-border)]" />
           <button
             onClick={handleCloseAll}
-            className="w-full px-3 py-1.5 text-xs text-left text-[var(--color-text-primary)] hover:bg-[var(--color-surface-hover)]"
+            className="w-full px-4 py-2 text-left text-[13px] text-[var(--color-text-primary)] transition-colors hover:bg-[var(--color-surface-hover)]"
           >
             {t('tabs.closeAll')}
           </button>
@@ -568,6 +590,8 @@ export function TabBar() {
 
 const TabItem = forwardRef<HTMLDivElement, {
   tab: Tab
+  displayTitle: string
+  closeLabel: string
   isRunning: boolean
   isActive: boolean
   isDragOver: boolean
@@ -578,7 +602,7 @@ const TabItem = forwardRef<HTMLDivElement, {
   onClose: () => void
   onContextMenu: (e: React.MouseEvent) => void
   onMouseDown: (event: React.MouseEvent) => void
-}>(({ tab, isRunning, isActive, isDragOver, isDragging, dragOffsetX, runningLabel, onClick, onClose, onContextMenu, onMouseDown }, ref) => {
+}>(({ tab, displayTitle, closeLabel, isRunning, isActive, isDragOver, isDragging, dragOffsetX, runningLabel, onClick, onClose, onContextMenu, onMouseDown }, ref) => {
   return (
     <div
       ref={ref}
@@ -587,15 +611,17 @@ const TabItem = forwardRef<HTMLDivElement, {
       onMouseDown={onMouseDown}
       onContextMenu={onContextMenu}
       className={`
-        tab-bar-interactive group relative flex min-h-11 flex-shrink-0 items-center gap-1.5 px-3
-        ${isDragging ? 'z-20 cursor-grabbing' : 'cursor-grab'}
+        tab-bar-interactive group relative flex min-h-[52px] flex-shrink-0 items-center gap-1.5 px-3
+        ${isDragging ? 'z-[var(--z-sticky)] cursor-grabbing' : 'cursor-grab'}
         transition-[background-color,box-shadow,opacity,transform] duration-150 ease-out
         ${isActive
-          ? 'bg-[var(--color-surface)] shadow-[inset_0_-2px_0_var(--color-brand)]'
+          // Underline, not a pill: the active tab shares the bar's ground and is
+          // marked by a 3px terracotta rule plus weight on the label.
+          ? 'bg-transparent shadow-[inset_0_-3px_0_var(--color-brand)]'
           : 'bg-transparent hover:bg-[var(--color-surface-hover)]'
         }
-        ${isDragging ? 'opacity-95 shadow-[0_10px_24px_rgba(0,0,0,0.18)] ring-1 ring-[var(--color-border)]' : ''}
-        ${isDragOver ? 'before:absolute before:left-0 before:top-[4px] before:bottom-[4px] before:w-[3px] before:bg-[var(--color-brand)] before:rounded-full before:shadow-[0_0_0_1px_rgba(255,255,255,0.25)]' : ''}
+        ${isDragging ? 'opacity-95 shadow-[var(--shadow-overlay)] ring-1 ring-[var(--color-border)]' : ''}
+        ${isDragOver ? 'before:absolute before:left-0 before:top-[4px] before:bottom-[4px] before:w-[3px] before:bg-[var(--color-brand)] before:rounded-full' : ''}
       `}
       style={{
         width: TAB_WIDTH,
@@ -604,14 +630,10 @@ const TabItem = forwardRef<HTMLDivElement, {
       }}
     >
       {tab.type === 'session' && isRunning && (
-        <span
-          className="h-1.5 w-1.5 flex-shrink-0 rounded-full bg-[var(--color-success)] animate-pulse"
-          aria-label={runningLabel}
-          title={runningLabel}
-        />
+        <StatusDot tone="brand" pulse label={runningLabel} className="flex-shrink-0" />
       )}
       {tab.type === 'session' && tab.status === 'error' && (
-        <span className="w-1.5 h-1.5 rounded-full bg-[var(--color-error)] flex-shrink-0" />
+        <StatusDot tone="danger" className="flex-shrink-0" />
       )}
       {tab.type === 'settings' && (
         <span className="material-symbols-outlined text-[14px] flex-shrink-0 text-[var(--color-text-tertiary)]">settings</span>
@@ -625,50 +647,33 @@ const TabItem = forwardRef<HTMLDivElement, {
       {tab.type === 'workbench' && (
         <span className="material-symbols-outlined text-[14px] flex-shrink-0 text-[var(--color-text-tertiary)]">view_sidebar</span>
       )}
+      {/* Same glyph as the Settings rail entry the trace list sits behind, so a
+          trace tab reads as that section rather than as another chat. */}
+      {tab.type === 'trace' && (
+        <span className="material-symbols-outlined text-[14px] flex-shrink-0 text-[var(--color-text-tertiary)]">account_tree</span>
+      )}
 
       <span className={`flex-1 truncate text-xs ${isActive ? 'text-[var(--color-text-primary)] font-medium' : 'text-[var(--color-text-secondary)]'}`}>
-        {tab.title || 'Untitled'}
+        {displayTitle}
       </span>
 
-      <button
-        type="button"
-        aria-label={`Close ${tab.title || 'Untitled'}`}
-        onMouseDown={(e) => { e.stopPropagation() }}
-        onClick={(e) => { e.stopPropagation(); onClose() }}
-        className="flex-shrink-0 -mr-1 inline-flex h-6 w-6 items-center justify-center rounded-md bg-transparent p-0 opacity-0 transition-[background-color,opacity,color] text-[var(--color-text-tertiary)] group-hover:opacity-100 hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-secondary)] focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-border-focus)]"
-      >
-        <span className="material-symbols-outlined text-[13px] leading-none">close</span>
-      </button>
+      {/*
+        The fade lives on the wrapper, not on the button: `IconButton` pins
+        `transition-colors`, which does not cover opacity, and a competing
+        `transition-[…]` in `className` would resolve by stylesheet order.
+      */}
+      <span className="-mr-1 flex-shrink-0 opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-within:opacity-100">
+        <IconButton
+          icon="close"
+          label={closeLabel}
+          onMouseDown={(e) => { e.stopPropagation() }}
+          onClick={(e) => { e.stopPropagation(); onClose() }}
+          size="xs"
+          tone="muted"
+          showTooltip={false}
+        />
+      </span>
     </div>
   )
 })
 TabItem.displayName = 'TabItem'
-
-function ToolbarIconButton({
-  icon,
-  label,
-  onClick,
-  active = false,
-}: {
-  icon: React.ReactNode
-  label: string
-  onClick: () => void
-  active?: boolean
-}) {
-  return (
-    <button
-      type="button"
-      aria-label={label}
-      title={label}
-      onClick={onClick}
-      data-active={active ? 'true' : 'false'}
-      className={`inline-flex h-8 w-8 items-center justify-center rounded-[10px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-border-focus)] ${
-        active
-          ? 'bg-[var(--color-surface-hover)] text-[var(--color-text-primary)]'
-          : 'text-[var(--color-text-tertiary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)]'
-      }`}
-    >
-      {icon}
-    </button>
-  )
-}

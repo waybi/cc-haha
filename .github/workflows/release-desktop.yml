@@ -94,13 +94,13 @@ jobs:
             arch: x64
           - platform: ubuntu-22.04
             target_triple: x86_64-unknown-linux-gnu
-            builder_args: --linux AppImage deb --x64
+            builder_args: --linux AppImage deb rpm --x64
             label: Linux-x64
             smoke_platform: linux
             arch: x64
           - platform: ubuntu-22.04-arm
             target_triple: aarch64-unknown-linux-gnu
-            builder_args: --linux AppImage deb --arm64
+            builder_args: --linux AppImage deb rpm --arm64
             label: Linux-ARM64
             smoke_platform: linux
             arch: arm64
@@ -145,7 +145,7 @@ jobs:
         if: contains(matrix.platform, 'ubuntu')
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential curl wget file libfuse2
+          sudo apt-get install -y build-essential curl wget file libfuse2 rpm
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -444,6 +444,7 @@ jobs:
               expected=(
                 "Claude-Code-Haha-${APP_VERSION}-linux-x86_64.AppImage"
                 "Claude-Code-Haha-${APP_VERSION}-linux-amd64.deb"
+                "Claude-Code-Haha-${APP_VERSION}-linux-x86_64.rpm"
                 "latest-linux.yml"
               )
               ;;
@@ -451,6 +452,7 @@ jobs:
               expected=(
                 "Claude-Code-Haha-${APP_VERSION}-linux-arm64.AppImage"
                 "Claude-Code-Haha-${APP_VERSION}-linux-arm64.deb"
+                "Claude-Code-Haha-${APP_VERSION}-linux-aarch64.rpm"
                 "latest-linux-arm64.yml"
               )
               ;;
@@ -509,6 +511,7 @@ jobs:
             desktop/build-artifacts/electron/*.exe
             desktop/build-artifacts/electron/*.AppImage
             desktop/build-artifacts/electron/*.deb
+            desktop/build-artifacts/electron/*.rpm
             desktop/build-artifacts/electron/*.blockmap
             desktop/build-artifacts/electron/*.yml
           if-no-files-found: error
@@ -585,8 +588,10 @@ jobs:
             "Claude-Code-Haha-${APP_VERSION}-mac-x64.zip.blockmap"
             "Claude-Code-Haha-${APP_VERSION}-linux-x86_64.AppImage"
             "Claude-Code-Haha-${APP_VERSION}-linux-amd64.deb"
+            "Claude-Code-Haha-${APP_VERSION}-linux-x86_64.rpm"
             "Claude-Code-Haha-${APP_VERSION}-linux-arm64.AppImage"
             "Claude-Code-Haha-${APP_VERSION}-linux-arm64.deb"
+            "Claude-Code-Haha-${APP_VERSION}-linux-aarch64.rpm"
             "Claude-Code-Haha-${APP_VERSION}-win-x64.exe"
             "Claude-Code-Haha-${APP_VERSION}-win-x64.exe.blockmap"
             "Claude-Code-Haha-${APP_VERSION}-win-arm64.exe"
@@ -645,6 +650,7 @@ jobs:
             artifacts/release-assets/**/*.exe
             artifacts/release-assets/**/*.AppImage
             artifacts/release-assets/**/*.deb
+            artifacts/release-assets/**/*.rpm
             artifacts/release-assets/**/*.blockmap
             artifacts/update-metadata-standard/*.yml
             desktop/scripts/install-macos-unsigned.sh

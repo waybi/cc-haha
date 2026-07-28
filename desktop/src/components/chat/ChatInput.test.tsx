@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import '@testing-library/jest-dom'
 import { act } from 'react'
@@ -96,6 +96,22 @@ import { useSettingsStore } from '../../stores/settingsStore'
 import { useTabStore } from '../../stores/tabStore'
 import { useWorkspaceChatContextStore } from '../../stores/workspaceChatContextStore'
 import { browserHost } from '../../lib/desktopHost/browserHost'
+
+/**
+ * Opens the run-location pill's menu. Directory, branch and worktree all live
+ * behind it now — they used to be three standing buttons on a bar under the
+ * composer.
+ */
+async function openLocationMenu() {
+  fireEvent.click(await screen.findByRole('button', { name: /^Location/ }))
+}
+
+/** Opens the pill, then drills into its branch list. */
+async function openBranchList() {
+  await openLocationMenu()
+  fireEvent.click(await screen.findByRole('menuitem', { name: /Branch/ }))
+  return screen.findByRole('listbox', { name: 'Select branch' })
+}
 
 function okRepositoryContext() {
   return {
@@ -213,6 +229,9 @@ describe('ChatInput file mentions', () => {
         },
       },
     })
+    // jsdom does not implement it, and the branch list scrolls its active row
+    // into view whenever the selection moves.
+    Element.prototype.scrollIntoView = vi.fn()
     mocks.getGitInfo.mockResolvedValue({ branch: 'main', repoName: 'repo', workDir: '/repo', changedFiles: 0 })
     mocks.getRepositoryContext.mockResolvedValue(okRepositoryContext())
     mocks.getRecentProjects.mockResolvedValue({ projects: [] })
@@ -448,6 +467,7 @@ describe('ChatInput file mentions', () => {
       target: { value: 'draft before switching project', selectionStart: 30 },
     })
 
+    await openLocationMenu()
     fireEvent.click(screen.getAllByTitle('/repo')[0]!)
     await screen.findByTestId('directory-picker-menu')
     fireEvent.click(screen.getByRole('button', { name: /Choose a different folder/ }))
@@ -761,15 +781,57 @@ describe('ChatInput file mentions', () => {
     render(<ChatInput variant="hero" />)
 
     const panel = screen.getByTestId('chat-input-panel')
-    expect(panel).toHaveClass('rounded-xl')
+    // 20px composer corner + the composer step of the shadow scale, the same
+    // shell EmptySession renders (docs/redesign-paper-ink-seal.md §2).
+    expect(panel).toHaveClass('rounded-[var(--radius-2xl)]', 'glass-panel--composer')
     expect(panel).not.toHaveClass('rounded-b-none')
 
-    expect(await screen.findByRole('button', { name: /Select branch: main/ })).toBeInTheDocument()
-    expect(screen.getByText('Current worktree')).toBeInTheDocument()
+    // One pill in the toolbar instead of a three-button bar welded to the
+    // panel's bottom edge — which is what used to square off that edge.
+    const pill = await screen.findByRole('button', { name: 'Location: repo / main' })
+    expect(panel).toContainElement(pill)
+    expect(pill).toHaveClass('h-9')
     expect(screen.queryByText('Select a project...')).not.toBeInTheDocument()
-    const branchButton = screen.getByRole('button', { name: /Select branch: main/ })
-    expect(panel).toContainElement(branchButton.parentElement)
-    expect(branchButton.parentElement).toHaveClass('bg-transparent')
+
+    await openLocationMenu()
+    const menu = await screen.findByRole('menu', { name: 'Location' })
+    expect(within(menu).getByRole('menuitem', { name: /Branch/ })).toBeInTheDocument()
+    expect(within(menu).getByRole('menuitemradio', { name: /Current worktree/ })).toHaveAttribute('aria-checked', 'true')
+    expect(within(menu).getByRole('menuitemradio', { name: /Isolated worktree/ })).toBeInTheDocument()
+  })
+
+  // Sending the first message used to move the run location from inside the
+  // panel to a chip below it. It stays in the toolbar now and only loses its
+  // affordances, so nothing shifts under the cursor.
+  //
+  // The variant here is `default` on purpose: ActiveSession renders the hero
+  // composer only while the session is empty, so a live session is always the
+  // default one. Asserting this against `hero` passed while the shipped
+  // composer still dropped the chip below the panel.
+  it('swaps the pill for a read-only chip in the same row once the session has messages', async () => {
+    // beforeEach seeds one message, so this is a live session, not a draft.
+    render(<ChatInput variant="default" />)
+
+    const chip = await screen.findByTestId('run-location-readonly')
+    expect(chip).toHaveTextContent('repo')
+    expect(chip).toHaveTextContent('main')
+
+    expect(screen.getByTestId('chat-input-toolbar')).toContainElement(chip)
+    expect(screen.getByTestId('chat-input-panel')).toContainElement(chip)
+    expect(screen.queryByTestId('run-location-outside')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^Location/ })).not.toBeInTheDocument()
+  })
+
+  // The narrow layouts never adopted the in-toolbar pill: there is no room for
+  // it beside the model selector, so they keep the location on its own line
+  // below the panel.
+  it('keeps the run location below the panel on the composer beside a workspace panel', async () => {
+    render(<ChatInput compact />)
+
+    const chip = await screen.findByTestId('run-location-outside')
+    expect(chip).toHaveTextContent('repo')
+    expect(screen.getByTestId('chat-input-panel')).not.toContainElement(chip)
+    expect(screen.queryByTestId('run-location-readonly')).not.toBeInTheDocument()
   })
 
   it('uses the persisted message count to keep reopened sessions in context mode while history loads', async () => {
@@ -859,7 +921,7 @@ describe('ChatInput file mentions', () => {
 
     render(<ChatInput variant="hero" />)
 
-    fireEvent.click(await screen.findByRole('button', { name: /Select branch: main/ }))
+    await openBranchList()
     fireEvent.click(await screen.findByRole('option', { name: /feature\/a/ }))
     const input = screen.getByRole('textbox') as HTMLTextAreaElement
     fireEvent.change(input, { target: { value: 'run on feature branch', selectionStart: 21 } })
@@ -921,7 +983,7 @@ describe('ChatInput file mentions', () => {
 
     render(<ChatInput variant="hero" />)
 
-    fireEvent.click(await screen.findByRole('button', { name: /Select branch: main/ }))
+    await openBranchList()
     fireEvent.click(await screen.findByRole('option', { name: /feature\/a/ }))
     const input = screen.getByRole('textbox') as HTMLTextAreaElement
     fireEvent.change(input, { target: { value: 'run with preserved permissions', selectionStart: 30 } })
@@ -986,11 +1048,12 @@ describe('ChatInput file mentions', () => {
 
     render(<ChatInput variant="hero" />)
 
-    fireEvent.click(await screen.findByRole('button', { name: /Select branch: main/ }))
+    await openBranchList()
     fireEvent.click(await screen.findByRole('option', { name: /feature\/a/ }))
-    fireEvent.click(screen.getByRole('button', { name: /Select worktree mode: Current worktree/ }))
-    fireEvent.click(await screen.findByRole('option', { name: 'Isolated worktree' }))
-    expect(screen.getByText('Isolated worktree')).toBeInTheDocument()
+    // Picking a branch returns to the root view, where both worktree modes are
+    // one click away — no second menu to open.
+    fireEvent.click(await screen.findByRole('menuitemradio', { name: /Isolated worktree/ }))
+    expect(await screen.findByText('Isolated')).toBeInTheDocument()
     const input = screen.getByRole('textbox') as HTMLTextAreaElement
     fireEvent.change(input, { target: { value: 'run in a worktree', selectionStart: 17 } })
     fireEvent.keyDown(input, { key: 'Enter' })
@@ -1292,7 +1355,53 @@ describe('ChatInput file mentions', () => {
     })
   })
 
-  it('ignores pasted images that finish loading after the prompt was sent', async () => {
+  it('pastes copied desktop files into the active session as path-only attachments', async () => {
+    installElectronFileHost()
+    const copiedFile = new File(['# Project notes'], 'ignored-name.md', { type: 'text/markdown' })
+    Object.defineProperty(copiedFile, 'path', {
+      configurable: true,
+      value: 'C:\\Users\\Nanmi\\Desktop\\project-notes.md',
+    })
+
+    render(<ChatInput compact />)
+
+    const input = screen.getByRole('textbox') as HTMLTextAreaElement
+    fireEvent.paste(input, {
+      clipboardData: {
+        files: [],
+        items: [{
+          kind: 'file',
+          type: 'text/markdown',
+          getAsFile: () => copiedFile,
+        }],
+      },
+    })
+
+    expect(await screen.findByText('project-notes.md')).toBeInTheDocument()
+
+    fireEvent.change(input, {
+      target: {
+        value: 'review this document',
+        selectionStart: 'review this document'.length,
+      },
+    })
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    expect(mocks.wsSend).toHaveBeenCalledWith(sessionId, {
+      type: 'user_message',
+      content: 'review this document',
+      attachments: [
+        expect.objectContaining({
+          type: 'file',
+          name: 'project-notes.md',
+          path: 'C:\\Users\\Nanmi\\Desktop\\project-notes.md',
+          data: undefined,
+        }),
+      ],
+    })
+  })
+
+  it('ignores pasted files that finish loading after the prompt was sent', async () => {
     class DeferredFileReader {
       result: string | ArrayBuffer | null = null
       onload: ((event: ProgressEvent<FileReader>) => void) | null = null
@@ -1311,7 +1420,9 @@ describe('ChatInput file mentions', () => {
 
     fireEvent.paste(input, {
       clipboardData: {
+        files: [],
         items: [{
+          kind: 'file',
           type: 'image/png',
           getAsFile: () => file,
         }],
@@ -1405,7 +1516,12 @@ describe('ChatInput file mentions', () => {
     expect(screen.queryByText('Run')).not.toBeInTheDocument()
     expect(screen.getByTestId('chat-input-shell')).toHaveClass('px-3')
     expect(screen.getByTestId('chat-input-shell').className).toContain('safe-area-inset-bottom')
-    expect(screen.getByTestId('chat-input-panel')).toHaveClass('rounded-2xl')
+    // `glass-panel--composer` carries the composer step of the shadow scale.
+    // The phone branch used to swap it for a `shadow-[…]` utility, which loses
+    // to `.glass-panel`'s own `box-shadow` on stylesheet order — so the phone
+    // composer silently rendered the floating-overlay shadow instead.
+    expect(screen.getByTestId('chat-input-panel')).toHaveClass('glass-panel--composer')
+    expect(screen.getByTestId('chat-input-panel')).toHaveClass('rounded-[var(--radius-2xl)]')
     expect(screen.getByTestId('chat-input-panel')).not.toHaveClass('rounded-b-none')
     expect(screen.getByTestId('chat-input-toolbar-leading')).toHaveClass('shrink-0', 'gap-1')
     expect(screen.getByTestId('chat-input-toolbar-trailing')).toHaveClass('min-w-0', 'flex-1', 'justify-end', 'gap-1')
@@ -1433,9 +1549,36 @@ describe('ChatInput file mentions', () => {
     const toolbar = screen.getByTestId('chat-input-toolbar')
 
     expect(toolbar).not.toHaveClass('absolute')
-    expect(toolbar).toHaveClass('mt-2')
+    expect(toolbar).toHaveClass('mt-3')
     expect(input).not.toHaveClass('pb-12')
     expect(input).not.toHaveClass('pb-14')
+  })
+
+  // The draft and the live session render the same composer, so the row that
+  // carries the location, the permission mode and the model has to sit in the
+  // same place in both. The live one used to weld itself to the panel edge
+  // with `-mx-4 -mb-4`, which pulled every control 4px left and stretched the
+  // divider across the panel the moment the first message landed.
+  it('keeps the wide composer toolbar inset when a draft turns into a live session', async () => {
+    const { unmount } = render(<ChatInput variant="hero" />)
+
+    const draftToolbar = screen.getByTestId('chat-input-toolbar')
+    expect(draftToolbar).toHaveClass('pt-3')
+    expect(draftToolbar.className).not.toMatch(/-m[xy]-\d/)
+    unmount()
+
+    const live = render(<ChatInput variant="default" />)
+
+    const liveToolbar = screen.getByTestId('chat-input-toolbar')
+    expect(liveToolbar).toHaveClass('pt-3')
+    expect(liveToolbar.className).not.toMatch(/-m[xy]-\d/)
+    live.unmount()
+
+    // The narrow composer keeps the band: `p-3` leaves too little room to
+    // spend on inset, and it never swaps variants mid-session.
+    render(<ChatInput compact />)
+
+    expect(screen.getByTestId('chat-input-toolbar')).toHaveClass('-mx-3')
   })
 
   it('uses Ctrl or Command Enter to send when that composer preference is selected', async () => {

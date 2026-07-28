@@ -5,6 +5,7 @@ import * as path from 'node:path'
 import type { AppState } from '../../state/AppStateStore.js'
 import { handleAgentsApi } from '../api/agents.js'
 import { clearAgentDefinitionsCache } from '../../tools/AgentTool/loadAgentsDir.js'
+import { findGitRoot } from '../../utils/git.js'
 import { refreshActivePlugins } from '../../utils/plugins/refresh.js'
 import { AgentService } from '../services/agentService.js'
 import { conversationService } from '../services/conversationService.js'
@@ -248,11 +249,33 @@ describe('Agents API Markdown CRUD', () => {
     expect(createdMarkdown).toContain('effort: xhigh')
     expect(createdMarkdown).toContain('Review this change for security regressions.')
 
+    const wildcardTools = [
+      'Read',
+      '*',
+      'Bash(git:*)',
+      'Agent(worker, researcher)',
+      'mcp__qa__search',
+    ]
+    const wildcardCreate = await api('POST', '/api/agents', {
+      scope: 'user',
+      cwd: projectCwd,
+      name: 'wildcard-editor',
+      description: 'Preserves persisted wildcard tool rules',
+      systemPrompt: 'Keep the exact persisted tool list available to editors.',
+      tools: wildcardTools,
+    })
+    expect(wildcardCreate.status).toBe(201)
+    expect(wildcardCreate.data.agent.tools).toEqual(wildcardTools)
+
     const userList = await api(
       'GET',
       `/api/agents?cwd=${encodeURIComponent(projectCwd)}`,
     )
     expect(userList.status).toBe(200)
+    expect(userList.data.availableTools).toEqual(
+      expect.arrayContaining(['Read', 'Grep', 'Bash']),
+    )
+    expect(userList.data.availableTools).not.toContain('Agent')
     expect(userList.data.activeAgents).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -262,6 +285,11 @@ describe('Agents API Markdown CRUD', () => {
         }),
       ]),
     )
+    expect(
+      userList.data.activeAgents.find(
+        (agent: { agentType: string }) => agent.agentType === 'wildcard-editor',
+      )?.tools,
+    ).toEqual(wildcardTools)
 
     const nestedUserDir = path.join(configDir, 'agents', 'review')
     const nestedUserFile = path.join(nestedUserDir, 'reviewer-definition.md')
@@ -458,6 +486,47 @@ describe('Agents API Markdown CRUD', () => {
         (agent: { agentType: string }) => agent.agentType === 'test-writer',
       ),
     ).toBe(false)
+  })
+
+  it('creates a project agent in a nested repository initialized after its root was cached', async () => {
+    const nestedProjectRoot = path.join(projectRoot, 'manual-workspace')
+    await fs.mkdir(nestedProjectRoot, { recursive: true })
+
+    findGitRoot.cache.delete(nestedProjectRoot)
+    expect(findGitRoot(nestedProjectRoot)).toBe(projectRoot)
+    await fs.mkdir(path.join(nestedProjectRoot, '.git'))
+
+    try {
+      const creation = await api('POST', '/api/agents', {
+        scope: 'project',
+        cwd: nestedProjectRoot,
+        name: 'nested-repository-reviewer',
+        description: 'Reviews the independently initialized nested repository',
+        systemPrompt: 'Keep project agent changes inside this repository.',
+      })
+
+      const nestedAgentFile = path.join(
+        nestedProjectRoot,
+        '.claude',
+        'agents',
+        'nested-repository-reviewer.md',
+      )
+      expect(creation.status).toBe(201)
+      expect(creation.data.agent.target).toBe(await fs.realpath(nestedAgentFile))
+      expect(await fileExists(nestedAgentFile)).toBe(true)
+      expect(
+        await fileExists(
+          path.join(
+            projectRoot,
+            '.claude',
+            'agents',
+            'nested-repository-reviewer.md',
+          ),
+        ),
+      ).toBe(false)
+    } finally {
+      findGitRoot.cache.delete(nestedProjectRoot)
+    }
   })
 
   it('updates and deletes the exact nested project file when its filename differs from its agent name', async () => {

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, Notification, screen, session, WebContentsView } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, screen, session, WebContentsView } from 'electron'
 import { autoUpdater } from 'electron-updater'
 import path from 'node:path'
 import { ELECTRON_EVENT_CHANNELS, ELECTRON_INTERNAL_CHANNELS, ELECTRON_IPC_CHANNELS, type ElectronIpcChannel } from './ipc/channels'
@@ -35,11 +35,19 @@ import {
   setAppMode,
 } from './services/appMode'
 import { installMacOsChromiumKeychainPromptGuard } from './services/keychain'
+import { installStdioWriteFailureGuards } from './services/stdioGuards'
 import { applyWindowsAppUserModelId } from './services/appIdentity'
 import { installMainWindowNavigationGuards, installPreviewNavigationGuards } from './services/navigationGuards'
 import { installPreviewCleanupOnRendererNavigation } from './services/previewLifecycle'
 import { logNotificationSmokeRendererAck, scheduleNotificationSmoke } from './services/notificationSmoke'
 import { normalizeZoomFactor } from './services/zoom'
+import {
+  applyAppliedAppearance,
+  isAppliedAppearance,
+  readAppearanceState,
+  startupWindowBackground,
+  type AppliedAppearance,
+} from './services/nativeAppearance'
 import { resolveRendererEntry } from './services/rendererEntry'
 import { installRendererLifecycle } from './services/rendererLifecycle'
 import { writeWindowSmokeSnapshot } from './services/windowSmoke'
@@ -53,9 +61,12 @@ import {
 import {
   createCustomPetCatalogLoader,
   createCustomPetFromAtlas,
+  createCustomPetFromAtlasBytes,
   createCustomPetFromImage,
   ensureCustomPetsRoot,
+  getPetPackageErrorCode,
   loadCustomPets,
+  readCustomPetSourceImage,
 } from './services/pets'
 import {
   installWindowLifecycle,
@@ -80,6 +91,9 @@ const traceWindows = new Map<string, BrowserWindow>()
 let isQuitting = false
 let trayController: TrayController | null = null
 
+// Must run before anything logs: a Finder/Dock launch inherits unreadable
+// stdio, and an unguarded write failure there surfaces as a crash dialog.
+installStdioWriteFailureGuards()
 installMacOsChromiumKeychainPromptGuard(app)
 
 function appRoot() {
@@ -115,6 +129,47 @@ function rendererEntry() {
   })
 }
 
+/**
+ * Last appearance the renderer reported, kept in memory so the OS-flip watcher
+ * does not have to re-read the cache file (and race with its own write).
+ * Seeded from disk on first use because the renderer has not reported yet.
+ */
+let lastAppliedAppearance: AppliedAppearance | null = null
+
+function currentAppearance(): AppliedAppearance | null {
+  if (!lastAppliedAppearance) lastAppliedAppearance = readAppearanceState(app)
+  return lastAppliedAppearance
+}
+
+/**
+ * The renderer keeps its theme in localStorage, which the main process cannot
+ * read, so the last applied appearance is replayed from cache to pick the
+ * pre-paint window background. First launch falls back to the OS setting.
+ *
+ * `shouldUseDarkColors` is the true OS setting here because `themeSource` is
+ * never pinned — see services/nativeAppearance.ts.
+ */
+function resolveStartupWindowBackground(): string {
+  return startupWindowBackground(currentAppearance(), nativeTheme.shouldUseDarkColors)
+}
+
+/**
+ * While the user follows the OS, repaint window backgrounds the moment the OS
+ * flips instead of waiting for the renderer to notice and report back — that
+ * round-trip is visible as a flash of the old color when resizing.
+ */
+function installSystemAppearanceWatch() {
+  nativeTheme.on('updated', () => {
+    const current = currentAppearance()
+    if (current && !current.followSystem) return
+    const background = startupWindowBackground(current, nativeTheme.shouldUseDarkColors)
+    for (const window of [mainWindow, ...traceWindows.values()]) {
+      if (!window || window.isDestroyed()) continue
+      window.setBackgroundColor(background)
+    }
+  })
+}
+
 async function loadRendererEntry(
   window: BrowserWindow,
   query?: Record<string, string>,
@@ -146,6 +201,7 @@ async function openTraceWindow(sessionId: string) {
     title: 'Trace',
     autoHideMenuBar: true,
     show: false,
+    backgroundColor: resolveStartupWindowBackground(),
     webPreferences: {
       preload: preloadPath(),
       contextIsolation: true,
@@ -370,30 +426,105 @@ function registerIpcHandlers() {
   registerHandler(ELECTRON_IPC_CHANNELS.traceOpenWindow, (_event, payload) => openTraceWindow(String(payload)))
   registerHandler(ELECTRON_IPC_CHANNELS.petsList, () => listCustomPets())
   registerHandler(ELECTRON_IPC_CHANNELS.petsCreateFromImage, async (event, payload) => {
+    const input = payload as {
+      slug: string
+      displayName: string
+      description: string
+      dialogTitle?: string
+      dialogFilterName?: string
+    }
     const imagePath = await openDialog(currentWindow(event), {
-      title: 'Choose a transparent pet image',
-      filters: [{ name: 'Pet image', extensions: ['png', 'webp'] }],
+      title: input.dialogTitle || 'Choose a transparent pet image',
+      filters: [{ name: input.dialogFilterName || 'Pet image', extensions: ['png', 'webp'] }],
     })
     if (typeof imagePath !== 'string') return null
-    const input = payload as { slug: string, displayName: string, description: string }
-    const pet = await loadCustomPetCatalog.invalidateAfter(() =>
-      createCustomPetFromImage({ ...input, imagePath }, {
-        inspectImageSize: ({ data }) => nativeImage.createFromBuffer(data).getSize(),
-      }))
-    return { id: pet.id }
+    try {
+      const pet = await loadCustomPetCatalog.invalidateAfter(() =>
+        createCustomPetFromImage({
+          slug: input.slug,
+          displayName: input.displayName,
+          description: input.description,
+          imagePath,
+        }, {
+          inspectImageSize: ({ data }) => nativeImage.createFromBuffer(data).getSize(),
+        }))
+      return { id: pet.id }
+    } catch (error) {
+      return { errorCode: getPetPackageErrorCode(error) }
+    }
   })
   registerHandler(ELECTRON_IPC_CHANNELS.petsCreateFromAtlas, async (event, payload) => {
+    const input = payload as {
+      slug: string
+      displayName: string
+      description: string
+      dialogTitle?: string
+      dialogFilterName?: string
+    }
     const atlasPath = await openDialog(currentWindow(event), {
-      title: 'Choose a v2 pet animation atlas',
-      filters: [{ name: 'Pet animation atlas', extensions: ['png', 'webp'] }],
+      title: input.dialogTitle || 'Choose a v2 pet animation atlas',
+      filters: [{ name: input.dialogFilterName || 'Pet animation atlas', extensions: ['png', 'webp'] }],
     })
     if (typeof atlasPath !== 'string') return null
-    const input = payload as { slug: string, displayName: string, description: string }
-    const pet = await loadCustomPetCatalog.invalidateAfter(() =>
-      createCustomPetFromAtlas({ ...input, atlasPath }, {
-        inspectImageSize: ({ data }) => nativeImage.createFromBuffer(data).getSize(),
-      }))
-    return { id: pet.id }
+    try {
+      const pet = await loadCustomPetCatalog.invalidateAfter(() =>
+        createCustomPetFromAtlas({
+          slug: input.slug,
+          displayName: input.displayName,
+          description: input.description,
+          atlasPath,
+        }, {
+          inspectImageSize: ({ data }) => nativeImage.createFromBuffer(data).getSize(),
+        }))
+      return { id: pet.id }
+    } catch (error) {
+      return { errorCode: getPetPackageErrorCode(error) }
+    }
+  })
+  registerHandler(ELECTRON_IPC_CHANNELS.petsPickSourceSheet, async (event, payload) => {
+    const input = payload as { dialogTitle?: string, dialogFilterName?: string }
+    const imagePath = await openDialog(currentWindow(event), {
+      title: input.dialogTitle || 'Choose a pet action sheet',
+      filters: [{ name: input.dialogFilterName || 'Pet action sheet', extensions: ['png', 'webp'] }],
+    })
+    if (typeof imagePath !== 'string') return null
+    try {
+      const source = await readCustomPetSourceImage(imagePath)
+      // The renderer needs the pixels to assemble the atlas on a canvas; the path
+      // itself is deliberately never handed over.
+      return {
+        bytes: source.data,
+        mimeType: source.mimeType,
+        width: source.width,
+        height: source.height,
+      }
+    } catch (error) {
+      return { errorCode: getPetPackageErrorCode(error) }
+    }
+  })
+  registerHandler(ELECTRON_IPC_CHANNELS.petsCreateFromAtlasBytes, async (_event, payload) => {
+    const input = payload as {
+      slug: string
+      displayName: string
+      description: string
+      atlasData: Uint8Array
+      mimeType: 'image/png' | 'image/webp'
+    }
+    try {
+      const pet = await loadCustomPetCatalog.invalidateAfter(() =>
+        createCustomPetFromAtlasBytes({
+          slug: input.slug,
+          displayName: input.displayName,
+          description: input.description,
+          atlasData: input.atlasData,
+          mimeType: input.mimeType,
+        }, {
+          inspectImageSize: ({ data }) => nativeImage.createFromBuffer(data).getSize(),
+        }))
+      return { id: pet.id }
+    } catch (error) {
+      return { errorCode: getPetPackageErrorCode(error) }
+    }
   })
   registerHandler(ELECTRON_IPC_CHANNELS.petsOpenFolder, async () => {
     const root = await ensureCustomPetsRoot()
@@ -429,6 +560,12 @@ function registerIpcHandlers() {
       currentWindow(event),
       payload as Electron.Rectangle[],
     )
+  })
+  registerHandler(ELECTRON_IPC_CHANNELS.petsFocusMainWindow, (event) => {
+    if (!getPetWindowController().owns(currentWindow(event))) {
+      throw new Error('Pet window IPC sender does not own the companion window')
+    }
+    showMainWindow(mainWindow, app)
   })
   registerHandler(ELECTRON_IPC_CHANNELS.petsFocusSession, (_event, payload) =>
     focusPetSession(String(payload)))
@@ -475,17 +612,17 @@ function registerIpcHandlers() {
   registerHandler(ELECTRON_IPC_CHANNELS.windowIsMaximized, event => currentWindow(event).isMaximized())
   registerHandler(ELECTRON_IPC_CHANNELS.terminalSpawn, (event, payload) =>
     getTerminalService().spawn((payload ?? {}) as TerminalSpawnInput, event.sender))
-  registerHandler(ELECTRON_IPC_CHANNELS.terminalWrite, (_event, payload) => {
+  registerHandler(ELECTRON_IPC_CHANNELS.terminalWrite, (event, payload) => {
     const { sessionId, data } = payload as { sessionId: number, data: string }
-    return getTerminalService().write(sessionId, data)
+    return getTerminalService().write(sessionId, data, event.sender)
   })
-  registerHandler(ELECTRON_IPC_CHANNELS.terminalResize, (_event, payload) => {
+  registerHandler(ELECTRON_IPC_CHANNELS.terminalResize, (event, payload) => {
     const { sessionId, cols, rows } = payload as { sessionId: number, cols: number, rows: number }
-    return getTerminalService().resize(sessionId, cols, rows)
+    return getTerminalService().resize(sessionId, cols, rows, event.sender)
   })
-  registerHandler(ELECTRON_IPC_CHANNELS.terminalKill, (_event, payload) => {
+  registerHandler(ELECTRON_IPC_CHANNELS.terminalKill, (event, payload) => {
     const { sessionId } = payload as { sessionId: number }
-    return getTerminalService().kill(sessionId)
+    return getTerminalService().kill(sessionId, event.sender)
   })
   registerHandler(ELECTRON_IPC_CHANNELS.terminalGetBashPath, () => getTerminalService().getBashPath())
   registerHandler(ELECTRON_IPC_CHANNELS.terminalSetBashPath, (_event, payload) => getTerminalService().setBashPath(payload as string | null))
@@ -509,6 +646,15 @@ function registerIpcHandlers() {
   })
   registerHandler(ELECTRON_IPC_CHANNELS.adaptersRestartSidecar, () => getServerRuntime().restartAdaptersSidecars())
   registerHandler(ELECTRON_IPC_CHANNELS.zoomSet, (event, payload) => currentWindow(event).webContents.setZoomFactor(normalizeZoomFactor(payload)))
+  registerHandler(ELECTRON_IPC_CHANNELS.appearanceSetApplied, (_event, payload) => {
+    if (!isAppliedAppearance(payload)) return
+    lastAppliedAppearance = payload
+    applyAppliedAppearance(payload, {
+      app,
+      // The pet window is deliberately transparent, so it stays out of this.
+      windows: () => [mainWindow, ...traceWindows.values()].filter((window): window is BrowserWindow => !!window),
+    })
+  })
 }
 
 async function createMainWindow() {
@@ -519,6 +665,9 @@ async function createMainWindow() {
     minWidth: MIN_WINDOW_WIDTH,
     minHeight: MIN_WINDOW_HEIGHT,
     show: false,
+    // Painted before the renderer produces its first frame; without it a
+    // dark-theme user gets a white flash on every launch.
+    backgroundColor: resolveStartupWindowBackground(),
     ...windowChromeOptionsForPlatform(process.platform),
     webPreferences: {
       preload: preloadPath(),
@@ -600,6 +749,7 @@ registerIpcHandlers()
 app.whenReady().then(async () => {
   applyWindowsAppUserModelId(app)
   applyStartupPortableMode(app)
+  installSystemAppearanceWatch()
   screen.on('display-metrics-changed', (_event, _display, changedMetrics) => {
     if (changedMetrics.includes('scaleFactor') || changedMetrics.includes('bounds')) {
       previewService?.refreshBounds()

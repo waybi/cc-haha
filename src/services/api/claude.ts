@@ -90,6 +90,7 @@ import {
   getSmallFastModel,
   isNonCustomOpusModel,
 } from "../../utils/model/model.js";
+import { disableKeepAlive } from "../../utils/proxy.js";
 import {
   asSystemPrompt,
   type SystemPrompt,
@@ -273,6 +274,7 @@ import {
   isRetryableStreamError,
   RetriableStreamError,
   type RetryContext,
+  shouldRetryStreamAfterTransportDisconnect,
   withRetry,
 } from "./withRetry.js";
 
@@ -2768,6 +2770,38 @@ async function* queryModel(
       ) {
         logForDebugging(
           `Watchdog timeout before content/tool output, will retry stream: ${errorMessage(
+            streamingError,
+          )}`,
+          { level: "warn" },
+        );
+        throw new RetriableStreamError(streamingError);
+      }
+
+      // The socket under the stream died mid-response (stale pooled keep-alive
+      // connection, proxy/NAT dropping a reused one, upstream edge reset). It
+      // arrives as a bare transport error inside the SSE body, so withRetry
+      // (stream creation only) and isRetryableStreamError (SSE error payloads)
+      // both miss it, and with the non-streaming fallback disabled the turn
+      // would die on a fault a plain re-send clears. Recover on the same
+      // side-effect boundary the watchdog retry uses.
+      if (
+        shouldRetryStreamAfterTransportDisconnect({
+          error: streamingError,
+          hasCrossedSideEffectBoundary:
+            assistantCommitBuffer.hasCrossedSideEffectBoundary(),
+          streamIdleAborted,
+          signalAborted: signal.aborted,
+        })
+      ) {
+        // Nothing arrived at all, so the connection was already dead when the
+        // request went out — the pool is serving closed sockets. Stop reusing
+        // it so the retry opens a fresh one. A disconnect after message_start
+        // is a live connection that broke later; that pool stays trusted.
+        if (partialMessage === undefined) {
+          disableKeepAlive();
+        }
+        logForDebugging(
+          `Mid-stream transport disconnect before any tool output, will retry stream: ${errorMessage(
             streamingError,
           )}`,
           { level: "warn" },

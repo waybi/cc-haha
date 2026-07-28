@@ -12,14 +12,34 @@ const booleanPayload: Validator = value => typeof value === 'boolean'
 const hasOnlyKeys = (value: Record<string, unknown>, allowedKeys: string[]) =>
   Object.keys(value).every(key => allowedKeys.includes(key))
 
+const MAX_TERMINAL_DIMENSION = 1_000
+const MAX_TERMINAL_CWD_LENGTH = 4_096
+const MAX_TERMINAL_WRITE_LENGTH = 1_048_576
+
+const isTerminalSessionId = (value: unknown) =>
+  typeof value === 'number'
+  && Number.isSafeInteger(value)
+  && value > 0
+
+const isTerminalDimension = (value: unknown) =>
+  typeof value === 'number'
+  && Number.isInteger(value)
+  && value > 0
+  && value <= MAX_TERMINAL_DIMENSION
+
 const sessionIdPayload: Validator = value =>
   typeof value === 'string'
   && value.length > 0
   && value.length <= 200
   && /^[A-Za-z0-9._:-]+$/.test(value)
 
-const petCreateFromAtlas: Validator = value => {
-  if (!isRecord(value) || !hasOnlyKeys(value, ['slug', 'displayName', 'description'])) return false
+const isSafeUiLabel = (value: unknown) =>
+  typeof value === 'string'
+  && value.trim().length > 0
+  && value.length <= 120
+  && !/[\u0000-\u001f\u007f-\u009f]/.test(value)
+
+const hasValidPetIdentity = (value: Record<string, unknown>): boolean => {
   if (
     typeof value.slug !== 'string'
     || value.slug.length === 0
@@ -32,6 +52,46 @@ const petCreateFromAtlas: Validator = value => {
     && typeof value.description === 'string'
     && value.description.trim().length > 0
     && value.description.length <= 500
+}
+
+const petCreateFromAtlas: Validator = value => {
+  if (!isRecord(value) || !hasOnlyKeys(value, [
+    'slug',
+    'displayName',
+    'description',
+    'dialogTitle',
+    'dialogFilterName',
+  ])) return false
+  return hasValidPetIdentity(value)
+    && (value.dialogTitle === undefined || isSafeUiLabel(value.dialogTitle))
+    && (value.dialogFilterName === undefined || isSafeUiLabel(value.dialogFilterName))
+}
+
+const petPickSourceSheet: Validator = value => {
+  if (value === undefined) return true
+  if (!isRecord(value) || !hasOnlyKeys(value, ['dialogTitle', 'dialogFilterName'])) return false
+  return (value.dialogTitle === undefined || isSafeUiLabel(value.dialogTitle))
+    && (value.dialogFilterName === undefined || isSafeUiLabel(value.dialogFilterName))
+}
+
+/** Matches DEFAULT_CUSTOM_PET_MAX_IMAGE_BYTES so oversized atlases are dropped at the boundary. */
+const MAX_PET_ATLAS_PAYLOAD_BYTES = 8 * 1024 * 1024
+
+const petCreateFromAtlasBytes: Validator = value => {
+  if (!isRecord(value) || !hasOnlyKeys(value, [
+    'slug',
+    'displayName',
+    'description',
+    'atlasData',
+    'mimeType',
+  ])) return false
+  if (
+    !(value.atlasData instanceof Uint8Array)
+    || value.atlasData.byteLength === 0
+    || value.atlasData.byteLength > MAX_PET_ATLAS_PAYLOAD_BYTES
+  ) return false
+  if (value.mimeType !== 'image/png' && value.mimeType !== 'image/webp') return false
+  return hasValidPetIdentity(value)
 }
 
 const petContextMenu: Validator = value => {
@@ -60,28 +120,39 @@ const commandInvoke: Validator = value =>
 
 const terminalWrite: Validator = value =>
   isRecord(value)
-  && typeof value.sessionId === 'number'
+  && hasOnlyKeys(value, ['sessionId', 'data'])
+  && isTerminalSessionId(value.sessionId)
   && typeof value.data === 'string'
+  && value.data.length <= MAX_TERMINAL_WRITE_LENGTH
 
 const terminalSpawn: Validator = value =>
   value === undefined
   || (
     isRecord(value)
-    && (value.cols === undefined || typeof value.cols === 'number')
-    && (value.rows === undefined || typeof value.rows === 'number')
-    && (value.cwd === undefined || typeof value.cwd === 'string')
-    && (value.shell === undefined || typeof value.shell === 'string')
+    && hasOnlyKeys(value, ['cols', 'rows', 'cwd'])
+    && (value.cols === undefined || isTerminalDimension(value.cols))
+    && (value.rows === undefined || isTerminalDimension(value.rows))
+    && (
+      value.cwd === undefined
+      || (
+        typeof value.cwd === 'string'
+        && value.cwd.length <= MAX_TERMINAL_CWD_LENGTH
+        && !value.cwd.includes('\0')
+      )
+    )
   )
 
 const terminalResize: Validator = value =>
   isRecord(value)
-  && typeof value.sessionId === 'number'
-  && typeof value.cols === 'number'
-  && typeof value.rows === 'number'
+  && hasOnlyKeys(value, ['sessionId', 'cols', 'rows'])
+  && isTerminalSessionId(value.sessionId)
+  && isTerminalDimension(value.cols)
+  && isTerminalDimension(value.rows)
 
 const terminalSessionId: Validator = value =>
   isRecord(value)
-  && typeof value.sessionId === 'number'
+  && hasOnlyKeys(value, ['sessionId'])
+  && isTerminalSessionId(value.sessionId)
 
 const boundsPayload: Validator = value =>
   isRecord(value)
@@ -110,6 +181,22 @@ const urlWithOptionalBounds: Validator = value =>
 
 const zoomPayload: Validator = value => typeof value === 'number' && Number.isFinite(value)
 
+// The colors reach BrowserWindow.setBackgroundColor, so they are pinned to a
+// literal 6-digit #RRGGBB. This is load-bearing, not tidiness: that API also
+// accepts #AARRGGBB, so an 8-digit value would let a compromised renderer make
+// a window translucent or fully transparent — click-through and overlay
+// spoofing. Do not relax this into "any CSS color".
+const HEX_COLOR = /^#[0-9a-fA-F]{6}$/
+const appliedAppearance: Validator = value =>
+  isRecord(value)
+  && hasOnlyKeys(value, ['isDark', 'background', 'lightBackground', 'followSystem'])
+  && typeof value.isDark === 'boolean'
+  && typeof value.followSystem === 'boolean'
+  && typeof value.background === 'string'
+  && HEX_COLOR.test(value.background)
+  && typeof value.lightBackground === 'string'
+  && HEX_COLOR.test(value.lightBackground)
+
 const updateCheckOptions: Validator = value => {
   if (value === undefined) return true
   if (!isRecord(value) || !hasOnlyKeys(value, ['proxy'])) return false
@@ -130,6 +217,8 @@ export const ELECTRON_IPC_VALIDATORS = {
   [ELECTRON_IPC_CHANNELS.petsList]: noPayload,
   [ELECTRON_IPC_CHANNELS.petsCreateFromImage]: petCreateFromAtlas,
   [ELECTRON_IPC_CHANNELS.petsCreateFromAtlas]: petCreateFromAtlas,
+  [ELECTRON_IPC_CHANNELS.petsPickSourceSheet]: petPickSourceSheet,
+  [ELECTRON_IPC_CHANNELS.petsCreateFromAtlasBytes]: petCreateFromAtlasBytes,
   [ELECTRON_IPC_CHANNELS.petsOpenFolder]: noPayload,
   [ELECTRON_IPC_CHANNELS.petsShow]: noPayload,
   [ELECTRON_IPC_CHANNELS.petsHide]: noPayload,
@@ -137,6 +226,7 @@ export const ELECTRON_IPC_VALIDATORS = {
   [ELECTRON_IPC_CHANNELS.petsDragWindow]: petWindowDrag,
   [ELECTRON_IPC_CHANNELS.petsSetIgnoreMouseEvents]: booleanPayload,
   [ELECTRON_IPC_CHANNELS.petsSetInteractiveRegions]: petInteractiveRegions,
+  [ELECTRON_IPC_CHANNELS.petsFocusMainWindow]: noPayload,
   [ELECTRON_IPC_CHANNELS.petsFocusSession]: sessionIdPayload,
   [ELECTRON_IPC_CHANNELS.dialogOpen]: optionalRecord,
   [ELECTRON_IPC_CHANNELS.dialogSave]: optionalRecord,
@@ -176,6 +266,7 @@ export const ELECTRON_IPC_VALIDATORS = {
   [ELECTRON_IPC_CHANNELS.appModeRestart]: noPayload,
   [ELECTRON_IPC_CHANNELS.adaptersRestartSidecar]: noPayload,
   [ELECTRON_IPC_CHANNELS.zoomSet]: zoomPayload,
+  [ELECTRON_IPC_CHANNELS.appearanceSetApplied]: appliedAppearance,
 } satisfies Record<ElectronIpcChannel, Validator>
 
 const allowedChannels = new Set<ElectronIpcChannel>(
@@ -191,6 +282,7 @@ const petWindowChannels = new Set<ElectronIpcChannel>([
   ELECTRON_IPC_CHANNELS.petsDragWindow,
   ELECTRON_IPC_CHANNELS.petsSetIgnoreMouseEvents,
   ELECTRON_IPC_CHANNELS.petsSetInteractiveRegions,
+  ELECTRON_IPC_CHANNELS.petsFocusMainWindow,
   ELECTRON_IPC_CHANNELS.petsFocusSession,
 ])
 

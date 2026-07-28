@@ -57,12 +57,21 @@ export type PetAnimationFrame = PetAtlasFrame & Readonly<{
 
 export const PET_ACTIVE_BURST_LOOPS = 3
 export const PET_IDLE_DURATION_MULTIPLIER = 6
+export const PET_AMBIENT_IDLE_LOOPS = 2
+export const PET_AMBIENT_GESTURE_LOOPS = 2
 
 export type PetAnimationPlaybackPhase = 'action' | 'idle'
 
 export type PetAnimationPlaybackStep = Readonly<{
   frame: PetAnimationFrame
   phase: PetAnimationPlaybackPhase
+  motionState: PetAnimationState
+  cycleBoundaryAfter: boolean
+}>
+
+type PetAnimationPlaybackFrame = PetAnimationFrame & Readonly<{
+  phase: PetAnimationPlaybackPhase
+  motionState: PetAnimationState
   cycleBoundaryAfter: boolean
 }>
 
@@ -99,24 +108,53 @@ export function getPetAnimationFrames(state: PetAnimationState): readonly PetAni
   }))
 }
 
-export function getPetAnimationPlaybackFrames(state: PetAnimationState): readonly PetAnimationFrame[] {
+function getRepeatedPetAnimationFrames(
+  state: PetAnimationState,
+  loops: number,
+  phase: PetAnimationPlaybackPhase,
+  durationMultiplier = 1,
+): readonly PetAnimationPlaybackFrame[] {
   const frames = getPetAnimationFrames(state)
-  const idleSequence = getPetAnimationFrames('idle').map((frame) => ({
+  return Array.from({ length: loops }, () => frames.map((frame) => ({
     ...frame,
-    durationMs: frame.durationMs * PET_IDLE_DURATION_MULTIPLIER,
-  }))
-  if (state === 'idle') return idleSequence
-
-  return [
-    ...Array.from({ length: PET_ACTIVE_BURST_LOOPS }, () => frames).flat(),
-    ...idleSequence,
-  ]
+    durationMs: frame.durationMs * durationMultiplier,
+    phase,
+    motionState: state,
+    cycleBoundaryAfter: frame.frameIndex === frames.length - 1,
+  }))).flat()
 }
 
-export function getPetAnimationPlaybackLoopStartIndex(state: PetAnimationState): number {
-  return state === 'idle'
-    ? 0
-    : getPetAnimationFrames(state).length * PET_ACTIVE_BURST_LOOPS
+const petAnimationPlaybackCache = new Map<PetAnimationState, readonly PetAnimationPlaybackFrame[]>()
+
+export function getPetAnimationPlaybackFrames(state: PetAnimationState): readonly PetAnimationPlaybackFrame[] {
+  const cached = petAnimationPlaybackCache.get(state)
+  if (cached) return cached
+
+  const slowIdle = () => getRepeatedPetAnimationFrames(
+    'idle',
+    1,
+    'idle',
+    PET_IDLE_DURATION_MULTIPLIER,
+  )
+
+  const playback = state === 'idle'
+    ? [
+      ...Array.from({ length: PET_AMBIENT_IDLE_LOOPS }, slowIdle).flat(),
+      ...getRepeatedPetAnimationFrames('waving', PET_AMBIENT_GESTURE_LOOPS, 'action'),
+      ...Array.from({ length: PET_AMBIENT_IDLE_LOOPS }, slowIdle).flat(),
+      ...getRepeatedPetAnimationFrames('jumping', PET_AMBIENT_GESTURE_LOOPS, 'action'),
+    ]
+    : [
+      ...getRepeatedPetAnimationFrames(state, PET_ACTIVE_BURST_LOOPS, 'action'),
+      ...slowIdle(),
+    ]
+
+  petAnimationPlaybackCache.set(state, playback)
+  return playback
+}
+
+export function getPetAnimationPlaybackLoopStartIndex(_state: PetAnimationState): number {
+  return 0
 }
 
 export function getNextPetAnimationPlaybackIndex(
@@ -144,22 +182,12 @@ export function getPetAnimationPlaybackStep(
 
   const playback = getPetAnimationPlaybackFrames(state)
   const normalizedIndex = playbackIndex % playback.length
-  const actionFrameCount = getPetAnimationPlaybackLoopStartIndex(state)
-
-  if (normalizedIndex < actionFrameCount) {
-    const actionCycleLength = getPetAnimationFrames(state).length
-    return {
-      frame: playback[normalizedIndex]!,
-      phase: 'action',
-      cycleBoundaryAfter: (normalizedIndex + 1) % actionCycleLength === 0,
-    }
-  }
-
-  const idleIndex = normalizedIndex - actionFrameCount
+  const frame = playback[normalizedIndex]!
   return {
-    frame: playback[normalizedIndex]!,
-    phase: 'idle',
-    cycleBoundaryAfter: idleIndex === getPetAnimationFrames('idle').length - 1,
+    frame,
+    phase: frame.phase,
+    motionState: frame.motionState,
+    cycleBoundaryAfter: frame.cycleBoundaryAfter,
   }
 }
 

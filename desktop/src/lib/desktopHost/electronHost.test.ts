@@ -37,6 +37,19 @@ describe('electron desktop host', () => {
     expect(invoke).toHaveBeenNthCalledWith(2, ELECTRON_IPC_CHANNELS.clipboardWriteText, 'to clipboard')
   })
 
+  it('resolves native paths for renderer File objects through the preload bridge', () => {
+    const file = new File(['# Notes'], 'notes.md', { type: 'text/markdown' })
+    const getPathForFile = vi.fn().mockReturnValue('C:\\Users\\Nanmi\\Desktop\\notes.md')
+    const host = createElectronHost({
+      getPathForFile,
+      invoke: vi.fn(),
+      subscribe: vi.fn(),
+    })
+
+    expect(host.files.getPathForFile(file)).toBe('C:\\Users\\Nanmi\\Desktop\\notes.md')
+    expect(getPathForFile).toHaveBeenCalledWith(file)
+  })
+
   it('rejects invalid preload payloads before invoking Electron IPC', async () => {
     const invoke = vi.fn()
     const host = createElectronHost({
@@ -147,6 +160,7 @@ describe('electron desktop host', () => {
     await host.pets.dragWindow({ phase: 'move', x: 640, y: 480 })
     await host.pets.setIgnoreMouseEvents(true)
     await host.pets.setInteractiveRegions([{ x: 100, y: 200, width: 120, height: 140 }])
+    await host.pets.focusMainWindow()
     await host.pets.focusSession('session-123')
     await host.pets.onNavigateSession(handler)
     await host.pets.onVisibilityChanged(handler)
@@ -177,7 +191,8 @@ describe('electron desktop host', () => {
     expect(invoke).toHaveBeenNthCalledWith(10, ELECTRON_IPC_CHANNELS.petsSetInteractiveRegions, [
       { x: 100, y: 200, width: 120, height: 140 },
     ])
-    expect(invoke).toHaveBeenNthCalledWith(11, ELECTRON_IPC_CHANNELS.petsFocusSession, 'session-123')
+    expect(invoke).toHaveBeenNthCalledWith(11, ELECTRON_IPC_CHANNELS.petsFocusMainWindow, undefined)
+    expect(invoke).toHaveBeenNthCalledWith(12, ELECTRON_IPC_CHANNELS.petsFocusSession, 'session-123')
     expect(subscribe).toHaveBeenCalledWith(ELECTRON_EVENT_CHANNELS.petNavigateSession, handler)
     expect(subscribe).toHaveBeenCalledWith(ELECTRON_EVENT_CHANNELS.petVisibilityChanged, handler)
   })

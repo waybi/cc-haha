@@ -6,7 +6,7 @@ import { ApiError } from '../middleware/errorHandler.js'
 import { readRecoverableJsonFile } from './recoverableJsonFile.js'
 import { ensurePersistentStorageUpgraded } from './persistentStorageMigrations.js'
 
-const CURRENT_DESKTOP_UI_PREFERENCES_SCHEMA_VERSION = 3
+const CURRENT_DESKTOP_UI_PREFERENCES_SCHEMA_VERSION = 4
 const MAX_PROJECT_PREFERENCE_ENTRIES = 2_000
 const MAX_PROFILE_DISPLAY_NAME_LENGTH = 80
 const MAX_PROFILE_SUBTITLE_LENGTH = 160
@@ -44,6 +44,7 @@ export type DesktopPetPreferences = {
   enabled: boolean
   selectedPetId: string
   size: number
+  showTaskPanel: boolean
   collapsed: boolean
   motionEnabled: boolean
   lastSessionId: string | null
@@ -81,6 +82,7 @@ const DEFAULT_PET_PREFERENCES: DesktopPetPreferences = {
   enabled: false,
   selectedPetId: DEFAULT_PET_ID,
   size: DEFAULT_PET_SIZE,
+  showTaskPanel: false,
   collapsed: false,
   motionEnabled: true,
   lastSessionId: null,
@@ -161,6 +163,28 @@ function normalizeProfilePreferences(value: unknown): DesktopProfilePreferences 
   }
 }
 
+function validateProfilePreferencesPatch(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw ApiError.badRequest('Profile preferences must be an object')
+  }
+  const patch = value as Record<string, unknown>
+  for (const [field, maxLength] of [
+    ['displayName', MAX_PROFILE_DISPLAY_NAME_LENGTH],
+    ['subtitle', MAX_PROFILE_SUBTITLE_LENGTH],
+  ] as const) {
+    if (!Object.prototype.hasOwnProperty.call(patch, field)) continue
+    const candidate = patch[field]
+    if (typeof candidate !== 'string') {
+      throw ApiError.badRequest(`${field} must be a string`)
+    }
+    const normalized = candidate.trim().replace(/\s+/g, ' ')
+    if (normalized.length === 0 || normalized.length > maxLength) {
+      throw ApiError.badRequest(`${field} must be between 1 and ${maxLength} characters`)
+    }
+  }
+  return patch
+}
+
 function normalizePetId(value: unknown): string {
   if (typeof value !== 'string') return DEFAULT_PET_ID
   const trimmed = value.trim()
@@ -196,6 +220,9 @@ export function normalizeDesktopPetPreferences(value: unknown): DesktopPetPrefer
     enabled: typeof record.enabled === 'boolean' ? record.enabled : DEFAULT_PET_PREFERENCES.enabled,
     selectedPetId: normalizePetId(record.selectedPetId),
     size: normalizePetSize(record.size),
+    showTaskPanel: typeof record.showTaskPanel === 'boolean'
+      ? record.showTaskPanel
+      : DEFAULT_PET_PREFERENCES.showTaskPanel,
     collapsed: typeof record.collapsed === 'boolean' ? record.collapsed : DEFAULT_PET_PREFERENCES.collapsed,
     motionEnabled: typeof record.motionEnabled === 'boolean'
       ? record.motionEnabled
@@ -353,9 +380,7 @@ export class DesktopUiPreferencesService {
     return this.withWriteLock(filePath, async () => {
       const { preferences } = await this.readPreferences()
       const currentProfile = normalizeProfilePreferences(preferences.profile)
-      const patch = profile && typeof profile === 'object' && !Array.isArray(profile)
-        ? profile as Record<string, unknown>
-        : {}
+      const patch = validateProfilePreferencesPatch(profile)
       const nextProfile = normalizeProfilePreferences({
         ...currentProfile,
         displayName: Object.prototype.hasOwnProperty.call(patch, 'displayName')

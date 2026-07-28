@@ -21,12 +21,23 @@ import { Copy, Eye, EyeOff, GripVertical, PowerOff, QrCode, RotateCw } from 'luc
 import { useSettingsStore, UI_ZOOM_DEFAULT, UI_ZOOM_MIN, UI_ZOOM_MAX, UI_ZOOM_STEP } from '../stores/settingsStore'
 import { useProviderStore } from '../stores/providerStore'
 import { useTranslation, type TranslationKey } from '../i18n'
-import { Modal } from '../components/shared/Modal'
-import { ConfirmDialog } from '../components/shared/ConfirmDialog'
-import { Input } from '../components/shared/Input'
-import { Button } from '../components/shared/Button'
-import { Dropdown } from '../components/shared/Dropdown'
+import { Modal } from '@/components/ui/Modal'
+import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
+import { Input } from '@/components/ui/Input'
+import { Button } from '@/components/ui/Button'
+import { IconButton } from '@/components/ui/IconButton'
+import { Badge, StatusDot } from '@/components/ui/Badge'
+import { Card } from '@/components/ui/Card'
+import { Spinner } from '@/components/ui/Spinner'
+import {
+  SettingsPageHeader,
+  SettingsPill,
+  SettingsSection,
+} from '@/components/settings/SettingsSection'
+import { Dropdown } from '@/components/ui/Dropdown'
+import { Switch } from '@/components/ui/Switch'
 import { PermissionModeSelector } from '../components/controls/PermissionModeSelector'
+import { isDarkThemeMode, isLightThemeMode } from '../types/settings'
 import type { ThemeMode, UpdateProxyMode, NetworkProxyMode, WebSearchMode, AppMode, ChatSendBehavior, OutputStyleSource } from '../types/settings'
 import type { Locale } from '../i18n'
 import type { SavedProvider, UpdateProviderInput, ProviderTestResult, ModelMapping, Model1mSupport, ApiFormat, ProviderAuthStrategy } from '../types/provider'
@@ -65,6 +76,7 @@ import { formatBytes } from '../lib/formatBytes'
 import { isDesktopRuntime } from '../lib/desktopRuntime'
 import { getDesktopHost } from '../lib/desktopHost'
 import { publicAssetPath } from '../lib/publicAsset'
+import { BrandSeal } from '../components/composite/BrandSeal'
 import { isBrowserSafePort } from '../lib/browserSafePort'
 import {
   getDesktopNotificationPermission,
@@ -80,7 +92,7 @@ import {
   restoreSettingsJsonSecrets,
   stripProviderSettingsJsonEnv,
 } from '../lib/providerSettingsJson'
-import { copyTextToClipboard } from '../components/chat/clipboard'
+import { copyTextToClipboard } from '@/lib/clipboard'
 
 const NETWORK_TIMEOUT_MIN_SECONDS = 30
 const NETWORK_TIMEOUT_MAX_SECONDS = 1800
@@ -214,8 +226,11 @@ export function Settings() {
     <div className="flex-1 flex flex-col overflow-hidden bg-[var(--color-surface)]">
       <div className="flex-1 flex overflow-hidden">
         {/* Tab navigation */}
-        <div className="w-[180px] border-r border-[var(--color-border)] py-3 flex-shrink-0 flex flex-col">
-          <div className="flex-1">
+        {/* Narrow enough that the rail is not a gutter of dead space, wide
+            enough that the longest label in any locale — the Japanese
+            "コンピューター操作" — still clears the truncation on TabButton. */}
+        <div className="w-[220px] flex-shrink-0 flex flex-col overflow-y-auto border-r border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-3 py-4">
+          <div className="flex-1 flex flex-col gap-0.5">
             <TabButton icon="dns" label={t('settings.tab.providers')} active={activeTab === 'providers'} onClick={() => setActiveTab('providers')} />
             <TabButton icon="tune" label={t('settings.tab.general')} active={activeTab === 'general'} onClick={() => setActiveTab('general')} />
             <TabButton icon="qr_code_2" label={t('settings.tab.h5Access')} active={activeTab === 'h5Access'} onClick={() => setActiveTab('h5Access')} />
@@ -232,13 +247,13 @@ export function Settings() {
             <TabButton icon="account_tree" label={t('settings.tab.trace')} active={activeTab === 'trace'} onClick={() => setActiveTab('trace')} />
             <TabButton icon="monitor_heart" label={t('settings.tab.diagnostics')} active={activeTab === 'diagnostics'} onClick={() => setActiveTab('diagnostics')} />
           </div>
-          <div className="border-t border-[var(--color-border)]/40 pt-1">
+          <div className="mt-2 border-t border-[var(--color-border-separator)] pt-2">
             <TabButton icon="info" label={t('settings.tab.about')} active={activeTab === 'about'} onClick={() => setActiveTab('about')} />
           </div>
         </div>
 
         {/* Tab content; trace embeds a full-bleed page that manages its own scroll */}
-        <div className={activeTab === 'trace' ? 'flex-1 flex min-h-0 flex-col overflow-hidden' : 'flex-1 overflow-y-auto px-8 py-6'}>
+        <div className={activeTab === 'trace' ? 'flex-1 flex min-h-0 flex-col overflow-hidden' : 'flex-1 overflow-y-auto px-9 py-8'}>
           {activeTab === 'providers' && <ProviderSettings />}
           {activeTab === 'activity' && <ActivitySettings />}
           {activeTab === 'general' && <GeneralSettings />}
@@ -262,18 +277,35 @@ export function Settings() {
 }
 
 function TabButton({ icon, label, active, onClick }: { icon: string; label: string; active: boolean; onClick: () => void }) {
+  const ref = useRef<HTMLButtonElement>(null)
+
+  // The rail is taller than its viewport, and Settings remounts whenever the
+  // tab is re-entered — from a trace tab's "back to list", say — with the
+  // scroll position reset to the top. Without this the selected section can be
+  // highlighted somewhere off-screen. `nearest` is a no-op when already visible.
+  useEffect(() => {
+    if (!active) return
+    ref.current?.scrollIntoView?.({ block: 'nearest' })
+  }, [active])
+
   return (
     <button
+      ref={ref}
       onClick={onClick}
       aria-current={active ? 'page' : undefined}
-      className={`w-full flex items-center gap-2.5 px-4 py-2.5 text-sm text-left transition-colors ${
+      className={`w-full flex items-center gap-3 rounded-[var(--radius-md)] px-3 py-2 text-[13.5px] text-left transition-[background-color,color] duration-150 ease-out focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-border-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--color-surface-container-low)] ${
         active
-          ? 'bg-[var(--color-surface-selected)] text-[var(--color-text-primary)] font-medium'
-          : 'text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)]'
+          ? 'bg-[var(--color-surface-hover)] text-[var(--color-text-primary)] font-medium'
+          : 'text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)]'
       }`}
     >
-      <span className="material-symbols-outlined text-[18px]" aria-hidden="true">{icon}</span>
-      {label}
+      <span
+        className={`material-symbols-outlined text-[18px] ${active ? 'text-[var(--color-brand)]' : 'text-[var(--color-text-tertiary)]'}`}
+        aria-hidden="true"
+      >
+        {icon}
+      </span>
+      <span className="min-w-0 truncate">{label}</span>
     </button>
   )
 }
@@ -453,16 +485,19 @@ function ProviderSettings() {
 
   return (
     <div className="max-w-2xl">
-      <div className="flex items-center justify-between mb-4">
-        <div>
-          <h2 className="text-base font-semibold text-[var(--color-text-primary)]">{t('settings.providers.title')}</h2>
-          <p className="text-sm text-[var(--color-text-tertiary)] mt-0.5">{t('settings.providers.description')}</p>
-        </div>
-        <Button size="sm" onClick={() => setShowCreateModal(true)}>
-          <span className="material-symbols-outlined text-[16px]">add</span>
-          {t('settings.providers.addProvider')}
-        </Button>
-      </div>
+      <SettingsPageHeader
+        title={t('settings.providers.title')}
+        description={t('settings.providers.description')}
+        action={(
+          <Button
+            size="base"
+            onClick={() => setShowCreateModal(true)}
+            icon={<span className="material-symbols-outlined text-[16px]">add</span>}
+          >
+            {t('settings.providers.addProvider')}
+          </Button>
+        )}
+      />
 
       <DndContext
         sensors={sensors}
@@ -486,7 +521,7 @@ function ProviderSettings() {
                     title={t('settings.providers.officialName')}
                     subtitle={t('settings.providers.officialDesc')}
                     badges={isClaudeOfficialActive ? (
-                      <span className="rounded border border-[var(--color-brand)]/18 bg-[var(--color-brand)]/12 px-1.5 py-0.5 text-[10px] font-bold leading-none text-[var(--color-brand)]">{t('settings.providers.default')}</span>
+                      <Badge tone="brand" bordered>{t('settings.providers.default')}</Badge>
                     ) : null}
                     details={isClaudeOfficialActive ? (
                       <div className="border-t border-[var(--color-border-separator)] px-4 pb-4 pt-3">
@@ -508,7 +543,7 @@ function ProviderSettings() {
                     title={t('settings.providers.openaiOfficialName')}
                     subtitle={t('settings.providers.openaiOfficialDesc')}
                     badges={isOpenAIOfficialActive ? (
-                      <span className="rounded border border-[var(--color-brand)]/18 bg-[var(--color-brand)]/12 px-1.5 py-0.5 text-[10px] font-bold leading-none text-[var(--color-brand)]">{t('settings.providers.default')}</span>
+                      <Badge tone="brand" bordered>{t('settings.providers.default')}</Badge>
                     ) : null}
                     details={isOpenAIOfficialActive ? (
                       <div className="border-t border-[var(--color-border-separator)] px-4 pb-4 pt-3">
@@ -530,7 +565,7 @@ function ProviderSettings() {
                     title={t('settings.providers.grokOfficialName')}
                     subtitle={t('settings.providers.grokOfficialDesc')}
                     badges={isGrokOfficialActive ? (
-                      <span className="rounded border border-[var(--color-brand)]/18 bg-[var(--color-brand)]/12 px-1.5 py-0.5 text-[10px] font-bold leading-none text-[var(--color-brand)]">{t('settings.providers.default')}</span>
+                      <Badge tone="brand" bordered>{t('settings.providers.default')}</Badge>
                     ) : null}
                     details={isGrokOfficialActive ? (
                       <div className="border-t border-[var(--color-border-separator)] px-4 pb-4 pt-3">
@@ -554,19 +589,19 @@ function ProviderSettings() {
                   dragLabel={t('settings.providers.dragToReorder')}
                   onActivate={!isActive ? () => handleActivate(provider.id) : undefined}
                   title={provider.name}
-                  subtitle={`${provider.baseUrl} · ${provider.models.main}`}
+                  subtitle={<span className="font-mono text-[11.5px]">{`${provider.baseUrl} · ${provider.models.main}`}</span>}
                   badges={(
                     <>
                       {preset && preset.id !== 'custom' && (
-                        <span className="rounded bg-[var(--color-surface-container-high)] px-1.5 py-0.5 text-[10px] font-medium leading-none text-[var(--color-text-tertiary)]">{preset.name}</span>
+                        <Badge tone="neutral">{preset.name}</Badge>
                       )}
                       {provider.apiFormat && provider.apiFormat !== 'anthropic' && (
-                        <span className="rounded bg-[var(--color-surface-container-high)] px-1.5 py-0.5 text-[10px] font-medium leading-none text-[var(--color-warning)]">
+                        <Badge tone="warning">
                           {provider.apiFormat === 'openai_chat' ? 'OpenAI Chat' : 'OpenAI Responses'}
-                        </span>
+                        </Badge>
                       )}
                       {isActive && (
-                        <span className="rounded border border-[var(--color-brand)]/18 bg-[var(--color-brand)]/12 px-1.5 py-0.5 text-[10px] font-bold leading-none text-[var(--color-brand)]">{t('settings.providers.default')}</span>
+                        <Badge tone="brand" bordered>{t('settings.providers.default')}</Badge>
                       )}
                     </>
                   )}
@@ -607,7 +642,7 @@ function ProviderSettings() {
 
       {isLoading && providers.length === 0 ? (
         <div className="flex justify-center py-8">
-          <div className="animate-spin w-5 h-5 border-2 border-[var(--color-brand)] border-t-transparent rounded-full" />
+          <Spinner size={20} tone="brand" label={t('common.loading')} />
         </div>
       ) : null}
 
@@ -683,20 +718,20 @@ function SortableProviderCard({
       ref={setNodeRef}
       style={style}
       data-testid={providerItemTestId(item)}
-      className={`group relative flex flex-col rounded-[8px] border transition-colors ${
+      className={`group relative flex flex-col rounded-[var(--radius-xl)] transition-[background-color,border-color,box-shadow] duration-150 ease-out ${
         isActive
-          ? 'border-[var(--color-border-focus)] bg-[var(--color-surface-container-low)]'
-          : 'border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] hover:border-[var(--color-border-focus)] hover:bg-[var(--color-surface-hover)]'
-      } ${isDragging ? 'shadow-[var(--shadow-dropdown)] opacity-90' : ''}`}
+          ? 'border-[1.5px] border-[var(--color-primary-fixed-dim)] bg-[var(--color-surface-container-low)]'
+          : 'border border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] hover:border-[var(--color-outline)] hover:bg-[var(--color-surface-hover)]'
+      } ${isDragging ? 'shadow-[var(--shadow-overlay)] opacity-90' : ''}`}
     >
-      <div className="flex items-center gap-2 px-3 py-3">
+      <div className="flex items-center gap-2 px-3.5 py-3">
         <button
           type="button"
           {...attributes}
           {...listeners}
           aria-label={dragLabel}
           title={dragLabel}
-          className="flex h-8 w-8 shrink-0 cursor-grab items-center justify-center rounded-[6px] text-[var(--color-text-tertiary)] transition-colors hover:bg-[var(--color-surface-container-high)] hover:text-[var(--color-text-secondary)] focus:outline-none focus-visible:shadow-[var(--shadow-focus-ring)] active:cursor-grabbing"
+          className="flex h-8 w-8 shrink-0 cursor-grab items-center justify-center rounded-[var(--radius-sm)] text-[var(--color-text-tertiary)] transition-colors hover:bg-[var(--color-surface-container-high)] hover:text-[var(--color-text-secondary)] focus:outline-none focus-visible:shadow-[var(--shadow-focus-ring)] active:cursor-grabbing"
           style={{ touchAction: 'none' }}
         >
           <GripVertical className="h-4 w-4" />
@@ -705,22 +740,22 @@ function SortableProviderCard({
           type="button"
           onClick={onActivate}
           aria-disabled={!onActivate}
-          className={`flex min-w-0 flex-1 items-center gap-3 rounded-[6px] text-left focus:outline-none focus-visible:shadow-[var(--shadow-focus-ring)] ${
+          className={`flex min-w-0 flex-1 items-center gap-3 rounded-[var(--radius-sm)] text-left focus:outline-none focus-visible:shadow-[var(--shadow-focus-ring)] ${
             onActivate ? 'cursor-pointer' : 'cursor-default'
           }`}
         >
-          <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${isActive ? 'bg-[var(--color-success)]' : 'bg-[var(--color-text-tertiary)]'}`} />
+          <StatusDot tone={isActive ? 'success' : 'neutral'} size="lg" />
           <span className="min-w-0 flex-1">
             <span className="flex min-w-0 items-center gap-2">
               <span className="truncate text-sm font-semibold text-[var(--color-text-primary)]">{title}</span>
               {badges}
             </span>
-            <span className="mt-0.5 block truncate text-xs text-[var(--color-text-tertiary)]">{subtitle}</span>
+            <span className="mt-1 block truncate text-[12px] text-[var(--color-text-tertiary)]">{subtitle}</span>
             {result}
           </span>
         </button>
         {actions && (
-          <div className="flex shrink-0 items-center gap-1 opacity-100 transition-opacity sm:opacity-0 sm:group-hover:opacity-100">
+          <div className="flex shrink-0 items-center gap-1 opacity-100 transition-opacity sm:opacity-0 sm:group-focus-within:opacity-100 sm:group-hover:opacity-100">
             {actions}
           </div>
         )}
@@ -900,6 +935,7 @@ function stripModel1mMarker(model: string): string {
 function stripModel1mMarkers(models: ModelMapping): ModelMapping {
   return {
     main: stripModel1mMarker(models.main),
+    ...(models.fable ? { fable: stripModel1mMarker(models.fable) } : {}),
     haiku: stripModel1mMarker(models.haiku),
     sonnet: stripModel1mMarker(models.sonnet),
     opus: stripModel1mMarker(models.opus),
@@ -929,6 +965,7 @@ function applyModel1mSupportMapping(
 ): ModelMapping {
   return {
     main: applyModel1mSupport(models.main, model1mSupport.main),
+    ...(models.fable ? { fable: stripModel1mMarker(models.fable) } : {}),
     haiku: applyModel1mSupport(models.haiku, model1mSupport.haiku),
     sonnet: applyModel1mSupport(models.sonnet, model1mSupport.sonnet),
     opus: applyModel1mSupport(models.opus, model1mSupport.opus),
@@ -968,6 +1005,7 @@ function normalizeModelMapping(models: ModelMapping): ModelMapping {
   const main = models.main.trim()
   return {
     main,
+    ...(models.fable?.trim() ? { fable: models.fable.trim() } : {}),
     haiku: models.haiku.trim() || main,
     sonnet: models.sonnet.trim() || main,
     opus: models.opus.trim() || main,
@@ -982,6 +1020,14 @@ function readSettingsEnvString(env: Record<string, unknown>, key: string): strin
 }
 
 function readModelMappingFromSettingsEnv(env: Record<string, unknown>): Partial<ModelMapping> {
+  const hasModelEnv = [
+    'ANTHROPIC_MODEL',
+    'ANTHROPIC_DEFAULT_FABLE_MODEL',
+    'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+    'ANTHROPIC_DEFAULT_SONNET_MODEL',
+    'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  ].some((key) => Object.prototype.hasOwnProperty.call(env, key))
+  const fable = readSettingsEnvString(env, 'ANTHROPIC_DEFAULT_FABLE_MODEL')
   const haiku = readSettingsEnvString(env, 'ANTHROPIC_DEFAULT_HAIKU_MODEL')
   const sonnet = readSettingsEnvString(env, 'ANTHROPIC_DEFAULT_SONNET_MODEL')
   const opus = readSettingsEnvString(env, 'ANTHROPIC_DEFAULT_OPUS_MODEL')
@@ -989,6 +1035,7 @@ function readModelMappingFromSettingsEnv(env: Record<string, unknown>): Partial<
 
   return {
     ...(main ? { main } : {}),
+    ...(hasModelEnv ? { fable } : {}),
     ...(haiku ? { haiku } : {}),
     ...(sonnet ? { sonnet } : {}),
     ...(opus ? { opus } : {}),
@@ -1133,9 +1180,15 @@ function updateSettingsJsonModels(
       ? parsed.env
       : {}
     const runtimeModels = applyModel1mSupportMapping(models, model1mSupport)
+    const env = { ...existingEnv }
+    delete env.ANTHROPIC_DEFAULT_FABLE_MODEL
+    delete env.ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION
+    delete env.ANTHROPIC_DEFAULT_FABLE_MODEL_NAME
+    delete env.ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES
     parsed.env = {
-      ...existingEnv,
+      ...env,
       ANTHROPIC_MODEL: runtimeModels.main,
+      ...(runtimeModels.fable ? { ANTHROPIC_DEFAULT_FABLE_MODEL: runtimeModels.fable } : {}),
       ANTHROPIC_DEFAULT_HAIKU_MODEL: runtimeModels.haiku,
       ANTHROPIC_DEFAULT_SONNET_MODEL: runtimeModels.sonnet,
       ANTHROPIC_DEFAULT_OPUS_MODEL: runtimeModels.opus,
@@ -1282,6 +1335,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
           ANTHROPIC_BASE_URL: needsProxy ? providerProxyBaseUrl : baseUrl,
           ...buildSettingsJsonAuthEnv(apiFormat, authStrategy, apiKey, selectedPreset),
           ANTHROPIC_MODEL: runtimeModels.main,
+          ...(runtimeModels.fable ? { ANTHROPIC_DEFAULT_FABLE_MODEL: runtimeModels.fable } : {}),
           ANTHROPIC_DEFAULT_HAIKU_MODEL: runtimeModels.haiku,
           ANTHROPIC_DEFAULT_SONNET_MODEL: runtimeModels.sonnet,
           ANTHROPIC_DEFAULT_OPUS_MODEL: runtimeModels.opus,
@@ -1473,17 +1527,14 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
     ))
   }
   const renderPresetButton = (preset: ProviderPreset) => (
-    <button
+    <SettingsPill
       key={preset.id}
+      tone="terracotta"
+      selected={selectedPreset.id === preset.id}
       onClick={() => handlePresetChange(preset)}
-      className={`px-3 py-1.5 text-xs font-medium rounded-full border transition-all ${
-        selectedPreset.id === preset.id
-          ? 'border-[var(--color-brand)] bg-[var(--color-surface-container-high)] text-[var(--color-brand)] shadow-[var(--shadow-focus-ring)]'
-          : 'border-[var(--color-border)] text-[var(--color-text-secondary)] hover:border-[var(--color-border-focus)] hover:bg-[var(--color-surface-hover)]'
-      }`}
     >
       {preset.name}
-    </button>
+    </SettingsPill>
   )
 
   const handleSubmit = async () => {
@@ -1593,7 +1644,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
       open={open}
       onClose={handleClose}
       title={mode === 'create' ? t('settings.providers.addTitle') : t('settings.providers.editTitle')}
-      width={720}
+      width={860}
       footer={
         <>
           <Button variant="secondary" onClick={handleClose} disabled={isSubmitting}>{t('common.cancel')}</Button>
@@ -1613,7 +1664,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
                 {regularPresets.map(renderPresetButton)}
               </div>
               {featuredPresets.length > 0 && (
-                <div className="flex flex-wrap gap-2 border-t border-[var(--color-border)]/60 pt-2">
+                <div className="flex flex-wrap gap-2 border-t border-[var(--color-border-separator)] pt-2">
                   {featuredPresets.map(renderPresetButton)}
                 </div>
               )}
@@ -1625,7 +1676,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
 
         <Input label={t('settings.providers.notes')} value={notes} onChange={(e) => setNotes(e.target.value)} placeholder={t('settings.providers.notesPlaceholder')} />
 
-        <Input label={t('settings.providers.baseUrl')} required value={baseUrl} onChange={(e) => handleBaseUrlChange(e.target.value)} placeholder={t('settings.providers.baseUrlPlaceholder')} />
+        <Input label={t('settings.providers.baseUrl')} required value={baseUrl} onChange={(e) => handleBaseUrlChange(e.target.value)} placeholder={t('settings.providers.baseUrlPlaceholder')} className="font-mono text-[13px]" />
 
         {/* API Format */}
         {(isCustom || mode === 'edit') ? (
@@ -1638,13 +1689,10 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
               width="100%"
               className="block w-full"
               trigger={
-                <button
-                  type="button"
-                  className="flex h-10 w-full items-center gap-3 rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-surface)] px-3 text-left text-sm text-[var(--color-text-primary)] outline-none transition-colors hover:border-[var(--color-border-focus)] hover:bg-[var(--color-surface-container-low)] focus-visible:border-[var(--color-border-focus)] focus-visible:shadow-[var(--shadow-focus-ring)]"
-                >
-                  <span className="min-w-0 flex-1 truncate">{selectedApiFormatLabel}</span>
+                <Button variant="secondary" size="md" block className="h-10 gap-3">
+                  <span className="min-w-0 flex-1 truncate text-left">{selectedApiFormatLabel}</span>
                   <span className="material-symbols-outlined flex-shrink-0 text-[18px] text-[var(--color-text-secondary)]">expand_more</span>
-                </button>
+                </Button>
               }
             />
             {apiFormat !== 'anthropic' && (
@@ -1670,13 +1718,10 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
               width="100%"
               className="block w-full"
               trigger={
-                <button
-                  type="button"
-                  className="flex min-h-10 w-full items-center gap-3 rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2 text-left text-sm text-[var(--color-text-primary)] outline-none transition-colors hover:border-[var(--color-border-focus)] hover:bg-[var(--color-surface-container-low)] focus-visible:border-[var(--color-border-focus)] focus-visible:shadow-[var(--shadow-focus-ring)]"
-                >
-                  <span className="min-w-0 flex-1 truncate">{selectedAuthStrategyLabel}</span>
+                <Button variant="secondary" size="md" block className="h-auto min-h-10 gap-3 py-2">
+                  <span className="min-w-0 flex-1 truncate text-left">{selectedAuthStrategyLabel}</span>
                   <span className="material-symbols-outlined flex-shrink-0 text-[18px] text-[var(--color-text-secondary)]">expand_more</span>
-                </button>
+                </Button>
               }
             />
           </div>
@@ -1741,16 +1786,15 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
               placeholder="sk-..."
               className="h-10 w-full rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-surface)] px-3 pr-10 text-sm text-[var(--color-text-primary)] outline-none transition-colors duration-150 placeholder:text-[var(--color-text-tertiary)] focus:border-[var(--color-border-focus)] focus:shadow-[var(--shadow-focus-ring)]"
             />
-            <button
-              type="button"
+            <IconButton
+              icon={showApiKey ? 'visibility_off' : 'visibility'}
+              label={t(showApiKey ? 'settings.providers.hideApiKey' : 'settings.providers.showApiKey')}
+              showTooltip={false}
+              size="sm"
+              tone="muted"
               onClick={() => setShowApiKey((visible) => !visible)}
-              aria-label={showApiKey ? 'Hide API Key' : 'Show API Key'}
-              className="absolute right-1.5 top-1/2 flex h-7 w-7 -translate-y-1/2 cursor-pointer items-center justify-center rounded-[var(--radius-sm)] text-[var(--color-text-tertiary)] transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)] focus:outline-none focus:shadow-[var(--shadow-focus-ring)]"
-            >
-              <span className="material-symbols-outlined text-[16px]">
-                {showApiKey ? 'visibility_off' : 'visibility'}
-              </span>
-            </button>
+              className="absolute right-1.5 top-1/2 -translate-y-1/2"
+            />
           </div>
         </div>
 
@@ -1772,7 +1816,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
                 type="button"
                 onClick={() => apiKeyUrl && openExternalUrl(apiKeyUrl)}
                 disabled={!apiKeyUrl}
-                className="group flex w-full cursor-pointer items-start gap-1.5 rounded-[var(--radius-sm)] border border-[var(--color-brand)]/25 bg-[var(--color-brand)]/8 px-2.5 py-1.5 text-left text-[11px] leading-5 text-[var(--color-text-primary)] transition-colors hover:border-[var(--color-brand)]/45 hover:bg-[var(--color-brand)]/12 focus:outline-none focus:shadow-[var(--shadow-focus-ring)] disabled:cursor-default disabled:hover:border-[var(--color-brand)]/25 disabled:hover:bg-[var(--color-brand)]/8"
+                className="group flex w-full cursor-pointer items-start gap-1.5 rounded-[var(--radius-sm)] border border-[var(--color-primary-fixed-dim)] bg-[var(--color-brand-soft)] px-2.5 py-1.5 text-left text-[11px] leading-5 text-[var(--color-text-primary)] transition-colors hover:border-[var(--color-brand)] hover:bg-[var(--color-brand-soft-hover)] focus:outline-none focus:shadow-[var(--shadow-focus-ring)] disabled:cursor-default disabled:hover:border-[var(--color-primary-fixed-dim)] disabled:hover:bg-[var(--color-brand-soft)]"
               >
                 <span className="material-symbols-outlined mt-0.5 text-[13px] text-[var(--color-brand)]">tips_and_updates</span>
                 <span>{promoText}</span>
@@ -2054,7 +2098,6 @@ export function GeneralSettings() {
     setAutoDreamEnabled,
     locale,
     setLocale,
-    theme,
     setTheme,
     chatSendBehavior,
     setChatSendBehavior,
@@ -2084,6 +2127,15 @@ export function GeneralSettings() {
     uiZoom,
     setUiZoom,
   } = useSettingsStore()
+  // Read the theme from the store that owns it. settingsStore keeps a copy for
+  // its own consumers, but that copy is only refreshed on an explicit setTheme
+  // — an OS flip updates uiStore alone and would leave this picker highlighting
+  // a theme that is no longer on screen.
+  const theme = useUIStore((s) => s.theme)
+  const followSystemTheme = useUIStore((s) => s.followSystemTheme)
+  const lightTheme = useUIStore((s) => s.lightTheme)
+  const darkTheme = useUIStore((s) => s.darkTheme)
+  const setFollowSystemTheme = useUIStore((s) => s.setFollowSystemTheme)
   const activeSessionId = useSessionStore((s) => s.activeSessionId)
   const sessions = useSessionStore((s) => s.sessions)
   const t = useTranslation()
@@ -2217,9 +2269,16 @@ export function GeneralSettings() {
 
   const THEMES: Array<{ value: ThemeMode; label: string }> = [
     { value: 'white', label: t('settings.general.appearance.white') },
-    { value: 'light', label: t('settings.general.appearance.light') },
+    { value: 'paper', label: t('settings.general.appearance.paper') },
+    { value: 'warm-classic', label: t('settings.general.appearance.warmClassic') },
+    { value: 'celadon', label: t('settings.general.appearance.celadon') },
     { value: 'dark', label: t('settings.general.appearance.dark') },
+    { value: 'ink-blue', label: t('settings.general.appearance.inkBlue') },
   ]
+  // Split by ground, in the order THEMES already lists them, so the two rows
+  // shown while following the system stay consistent with the flat picker.
+  const LIGHT_THEMES = THEMES.filter(({ value }) => isLightThemeMode(value))
+  const DARK_THEMES = THEMES.filter(({ value }) => isDarkThemeMode(value))
 
   const WEB_SEARCH_MODES: Array<{ value: WebSearchMode; label: string }> = [
     { value: 'auto', label: t('settings.general.webSearch.mode.auto') },
@@ -2497,7 +2556,7 @@ export function GeneralSettings() {
     <div className="mt-8">
       <div className="mb-3 flex items-end justify-between gap-3">
         <div className="min-w-0">
-          <h2 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">{t('settings.general.uiZoom')}</h2>
+          <h2 className="text-[16.5px] font-semibold leading-tight text-[var(--color-text-primary)] mb-1" style={{ fontFamily: 'var(--font-headline)' }}>{t('settings.general.uiZoom')}</h2>
           <p className="text-sm text-[var(--color-text-tertiary)]">{t('settings.general.uiZoomDescription')}</p>
           <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-[var(--color-text-tertiary)]">
             <span>{t('settings.general.uiZoomShortcutHint')}</span>
@@ -2527,11 +2586,12 @@ export function GeneralSettings() {
           </div>
         </div>
         <div className="flex flex-shrink-0 items-center gap-2">
-          <span className="min-w-[48px] rounded-md bg-[var(--color-surface-container-low)] px-2 py-1 text-center text-sm font-medium text-[var(--color-text-secondary)]">
+          <span className="min-w-[48px] rounded-[var(--radius-md)] bg-[var(--color-surface-container-low)] px-2 py-1 text-center text-sm font-medium text-[var(--color-text-secondary)]">
             {uiZoomPercent}%
           </span>
-          <button
-            type="button"
+          <Button
+            variant="secondary"
+            size="base"
             aria-label={t('settings.general.uiZoomReset')}
             title={t('settings.general.uiZoomReset')}
             onClick={() => {
@@ -2539,11 +2599,10 @@ export function GeneralSettings() {
               setUiZoomDraft(UI_ZOOM_DEFAULT)
               setUiZoom(UI_ZOOM_DEFAULT)
             }}
-            className="inline-flex h-8 items-center gap-1.5 rounded-md border border-[var(--color-border)] px-2 text-xs font-medium text-[var(--color-text-secondary)] transition-colors hover:border-[var(--color-border-focus)] hover:bg-[var(--color-surface-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-border-focus)]"
+            icon={<RotateCw className="h-3.5 w-3.5" aria-hidden="true" />}
           >
-            <RotateCw className="h-3.5 w-3.5" aria-hidden="true" />
             100%
-          </button>
+          </Button>
         </div>
       </div>
       <div
@@ -2596,48 +2655,100 @@ export function GeneralSettings() {
 
   return (
     <div className="max-w-xl">
+      {/* No page header here on purpose: the only title it could carry is the nav
+          label verbatim, with no description to add. The pane opens on its first
+          section instead. */}
       {/* Appearance selector */}
-      <h2 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">{t('settings.general.appearanceTitle')}</h2>
-      <p className="text-sm text-[var(--color-text-tertiary)] mb-3">{t('settings.general.appearanceDescription')}</p>
-      <div className="flex gap-2 mb-8">
-        {THEMES.map(({ value, label }) => (
-          <button
-            key={value}
-            onClick={() => void setTheme(value)}
-            aria-pressed={theme === value}
-            className={`flex-1 py-2 text-xs font-semibold rounded-lg border transition-all ${
-              theme === value
-                ? 'bg-[image:var(--gradient-btn-primary)] text-[var(--color-btn-primary-fg)] border-transparent shadow-[var(--shadow-button-primary)]'
-                : 'border-[var(--color-border)] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)]'
-            }`}
-          >
-            {label}
-          </button>
-        ))}
-      </div>
+      <SettingsSection
+        title={t('settings.general.appearanceTitle')}
+        description={t('settings.general.appearanceDescription')}
+      >
+        <div className="mb-4 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-3">
+          <Switch
+            checked={followSystemTheme}
+            onChange={setFollowSystemTheme}
+            label={t('settings.general.appearance.followSystem')}
+            description={t('settings.general.appearance.followSystemHint')}
+          />
+        </div>
+        {followSystemTheme ? (
+          // The OS decides which ground; what is left to choose is the palette
+          // on each one, so the picker splits into the two grounds.
+          <div className="flex flex-col gap-4">
+            <div>
+              <p className="mb-2 text-[12.5px] text-[var(--color-text-tertiary)]">
+                {t('settings.general.appearance.lightThemeLabel')}
+              </p>
+              <div className="flex flex-wrap gap-2">
+                {LIGHT_THEMES.map(({ value, label }) => (
+                  <SettingsPill
+                    key={value}
+                    selected={lightTheme === value}
+                    onClick={() => void setTheme(value)}
+                  >
+                    {label}
+                  </SettingsPill>
+                ))}
+              </div>
+            </div>
+            <div>
+              <p className="mb-2 text-[12.5px] text-[var(--color-text-tertiary)]">
+                {t('settings.general.appearance.darkThemeLabel')}
+              </p>
+              <div className="flex flex-wrap gap-2">
+                {DARK_THEMES.map(({ value, label }) => (
+                  <SettingsPill
+                    key={value}
+                    selected={darkTheme === value}
+                    onClick={() => void setTheme(value)}
+                  >
+                    {label}
+                  </SettingsPill>
+                ))}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="flex flex-wrap gap-2">
+            {THEMES.map(({ value, label }) => (
+              <SettingsPill
+                key={value}
+                selected={theme === value}
+                onClick={() => void setTheme(value)}
+              >
+                {label}
+              </SettingsPill>
+            ))}
+          </div>
+        )}
+      </SettingsSection>
 
       {/* Language selector */}
-      <h2 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">{t('settings.general.languageTitle')}</h2>
-      <p className="text-sm text-[var(--color-text-tertiary)] mb-3">{t('settings.general.languageDescription')}</p>
-      <div className="flex gap-2 mb-8">
-        {LANGUAGES.map(({ value, label }) => (
-          <button
-            key={value}
-            onClick={() => setLocale(value)}
-            className={`flex-1 py-2 text-xs font-semibold rounded-lg border transition-all ${
-              locale === value
-                ? 'bg-[var(--color-brand)] text-[var(--color-on-primary)] border-[var(--color-brand)]'
-                : 'border-[var(--color-border)] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)]'
-            }`}
-          >
-            {label}
-          </button>
-        ))}
-      </div>
+      <SettingsSection
+        title={t('settings.general.languageTitle')}
+        description={t('settings.general.languageDescription')}
+      >
+        <div className="flex flex-wrap gap-2">
+          {LANGUAGES.map(({ value, label }) => (
+            <SettingsPill
+              key={value}
+              selected={locale === value}
+              onClick={() => setLocale(value)}
+            >
+              {label}
+            </SettingsPill>
+          ))}
+        </div>
+      </SettingsSection>
 
       {/* Response Language */}
-      <h2 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">{t('settings.general.responseLangTitle')}</h2>
-      <p className="text-sm text-[var(--color-text-tertiary)] mb-3">{t('settings.general.responseLangDescription')}</p>
+      <h2
+        className="text-[16.5px] font-semibold leading-tight text-[var(--color-text-primary)] mb-1"
+        style={{ fontFamily: 'var(--font-headline)' }}
+      >
+        {t('settings.general.responseLangTitle')}
+      </h2>
+      <p className="text-[13px] leading-5 text-[var(--color-text-tertiary)] mb-3">{t('settings.general.responseLangDescription')}</p>
       <Dropdown<string>
         items={RESPONSE_LANGUAGES}
         value={responseLanguage}
@@ -2646,21 +2757,23 @@ export function GeneralSettings() {
         maxHeight={320}
         className="mb-8 block w-full"
         trigger={
-          <button
-            type="button"
+          <Button
+            variant="secondary"
+            size="md"
+            block
+            className="h-10 gap-3"
             aria-label={t('settings.general.responseLangTitle')}
-            className="flex h-10 w-full items-center gap-3 rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-surface)] px-3 text-left text-sm text-[var(--color-text-primary)] outline-none transition-colors hover:border-[var(--color-border-focus)] hover:bg-[var(--color-surface-container-low)] focus-visible:border-[var(--color-border-focus)] focus-visible:shadow-[var(--shadow-focus-ring)]"
           >
-            <span className="min-w-0 flex-1 truncate">{selectedResponseLanguageLabel}</span>
+            <span className="min-w-0 flex-1 truncate text-left">{selectedResponseLanguageLabel}</span>
             <span className="material-symbols-outlined flex-shrink-0 text-[18px] text-[var(--color-text-secondary)]">expand_more</span>
-          </button>
+          </Button>
         }
       />
 
       {/* Output style */}
-      <h2 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">{t('settings.general.outputStyleTitle')}</h2>
+      <h2 className="text-[16.5px] font-semibold leading-tight text-[var(--color-text-primary)] mb-1" style={{ fontFamily: 'var(--font-headline)' }}>{t('settings.general.outputStyleTitle')}</h2>
       <p className="text-sm text-[var(--color-text-tertiary)] mb-3">{t('settings.general.outputStyleDescription')}</p>
-      <div className="mb-8 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-4">
+      <Card radius="xl" surface="low" padding="none" className="mb-8 px-4 py-4">
         <Dropdown<string>
           items={outputStyleItems}
           value={outputStyle}
@@ -2669,14 +2782,16 @@ export function GeneralSettings() {
           maxHeight={360}
           className="block w-full"
           trigger={
-            <button
-              type="button"
+            <Button
+              variant="secondary"
+              size="md"
+              block
+              className="h-auto min-h-10 gap-3 py-2"
               aria-label={t('settings.general.outputStyleSelectLabel')}
               disabled={outputStylesLoading}
-              className="flex min-h-10 w-full items-center gap-3 rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2 text-left text-sm text-[var(--color-text-primary)] outline-none transition-colors hover:border-[var(--color-border-focus)] hover:bg-[var(--color-surface-container-low)] focus-visible:border-[var(--color-border-focus)] focus-visible:shadow-[var(--shadow-focus-ring)] disabled:cursor-not-allowed disabled:opacity-60"
+              icon={<span className="material-symbols-outlined flex-shrink-0 text-[18px] text-[var(--color-text-secondary)]">format_paint</span>}
             >
-              <span className="material-symbols-outlined flex-shrink-0 text-[18px] text-[var(--color-text-secondary)]">format_paint</span>
-              <span className="min-w-0 flex-1">
+              <span className="min-w-0 flex-1 text-left">
                 <span className="block truncate font-medium">
                   {outputStylesLoading
                     ? t('settings.general.outputStyleLoading')
@@ -2689,15 +2804,15 @@ export function GeneralSettings() {
                 )}
               </span>
               <span className="material-symbols-outlined flex-shrink-0 text-[18px] text-[var(--color-text-secondary)]">expand_more</span>
-            </button>
+            </Button>
           }
         />
         <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-[var(--color-text-tertiary)]">
-          <span className="inline-flex items-center rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1 font-medium text-[var(--color-text-secondary)]">
+          <span className="inline-flex items-center rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1 font-medium text-[var(--color-text-secondary)]">
             {outputStyleScopeLabel}
           </span>
           {selectedOutputStyle && (
-            <span className="inline-flex items-center rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1">
+            <span className="inline-flex items-center rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1">
               {getOutputStyleSourceLabel(selectedOutputStyle.source, t)}
             </span>
           )}
@@ -2711,12 +2826,12 @@ export function GeneralSettings() {
             {outputStyleError}
           </p>
         )}
-      </div>
+      </Card>
 
       <div className="mt-8">
-        <h2 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">{t('settings.general.defaultPermissionTitle')}</h2>
+        <h2 className="text-[16.5px] font-semibold leading-tight text-[var(--color-text-primary)] mb-1" style={{ fontFamily: 'var(--font-headline)' }}>{t('settings.general.defaultPermissionTitle')}</h2>
         <p className="text-sm text-[var(--color-text-tertiary)] mb-3">{t('settings.general.defaultPermissionDescription')}</p>
-        <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-4">
+        <Card radius="xl" surface="low" padding="none" className="px-4 py-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="min-w-0">
               <div className="text-sm font-medium text-[var(--color-text-primary)]">
@@ -2733,13 +2848,13 @@ export function GeneralSettings() {
               menuPlacement="bottom"
             />
           </div>
-        </div>
+        </Card>
       </div>
 
       <div className="mt-8">
-        <h2 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">{t('settings.general.thinkingTitle')}</h2>
+        <h2 className="text-[16.5px] font-semibold leading-tight text-[var(--color-text-primary)] mb-1" style={{ fontFamily: 'var(--font-headline)' }}>{t('settings.general.thinkingTitle')}</h2>
         <p className="text-sm text-[var(--color-text-tertiary)] mb-3">{t('settings.general.thinkingDescription')}</p>
-        <label className="relative flex items-start gap-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-3 cursor-pointer hover:border-[var(--color-border-focus)] transition-colors">
+        <label className="relative flex items-start gap-3 rounded-[var(--radius-xl)] border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-3 cursor-pointer hover:border-[var(--color-border-focus)] transition-colors">
           <input
             type="checkbox"
             aria-label={t('settings.general.thinkingEnabled')}
@@ -2760,9 +2875,9 @@ export function GeneralSettings() {
       </div>
 
       <div className="mt-8">
-        <h2 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">{t('settings.general.autoDreamTitle')}</h2>
+        <h2 className="text-[16.5px] font-semibold leading-tight text-[var(--color-text-primary)] mb-1" style={{ fontFamily: 'var(--font-headline)' }}>{t('settings.general.autoDreamTitle')}</h2>
         <p className="text-sm text-[var(--color-text-tertiary)] mb-3">{t('settings.general.autoDreamDescription')}</p>
-        <label className="relative flex items-start gap-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-3 cursor-pointer hover:border-[var(--color-border-focus)] transition-colors">
+        <label className="relative flex items-start gap-3 rounded-[var(--radius-xl)] border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-3 cursor-pointer hover:border-[var(--color-border-focus)] transition-colors">
           <input
             type="checkbox"
             aria-label={t('settings.general.autoDreamEnabled')}
@@ -2785,9 +2900,9 @@ export function GeneralSettings() {
       </div>
 
       <div className="mt-8">
-        <h2 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">{t('settings.general.traceTitle')}</h2>
+        <h2 className="text-[16.5px] font-semibold leading-tight text-[var(--color-text-primary)] mb-1" style={{ fontFamily: 'var(--font-headline)' }}>{t('settings.general.traceTitle')}</h2>
         <p className="text-sm text-[var(--color-text-tertiary)] mb-3">{t('settings.general.traceDescription')}</p>
-        <label className="relative flex items-start gap-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-3 cursor-pointer hover:border-[var(--color-border-focus)] transition-colors">
+        <label className="relative flex items-start gap-3 rounded-[var(--radius-xl)] border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-3 cursor-pointer hover:border-[var(--color-border-focus)] transition-colors">
           <input
             type="checkbox"
             aria-label={t('settings.general.traceEnabled')}
@@ -2804,7 +2919,7 @@ export function GeneralSettings() {
               {traceCapture.enabled ? t('settings.general.traceHintOn') : t('settings.general.traceHintOff')}
             </div>
             {traceCapture.storageDir && (
-              <div className="mt-2 truncate rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1 font-mono text-[11px] text-[var(--color-text-secondary)]">
+              <div className="mt-2 truncate rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1 font-mono text-[11px] text-[var(--color-text-secondary)]">
                 {traceCapture.storageDir}
               </div>
             )}
@@ -2813,9 +2928,9 @@ export function GeneralSettings() {
       </div>
 
       <div className="mt-8">
-        <h2 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">{t('settings.general.notificationsTitle')}</h2>
+        <h2 className="text-[16.5px] font-semibold leading-tight text-[var(--color-text-primary)] mb-1" style={{ fontFamily: 'var(--font-headline)' }}>{t('settings.general.notificationsTitle')}</h2>
         <p className="text-sm text-[var(--color-text-tertiary)] mb-3">{t('settings.general.notificationsDescription')}</p>
-        <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-3">
+        <Card radius="xl" surface="low" padding="none" className="px-4 py-3">
           <label className="relative flex items-start gap-3 cursor-pointer">
             <input
               type="checkbox"
@@ -2837,7 +2952,7 @@ export function GeneralSettings() {
             </div>
           </label>
           {desktopNotificationsEnabled && (
-            <div className="mt-3 flex items-center justify-between gap-3 border-t border-[var(--color-border)]/60 pt-3">
+            <div className="mt-3 flex items-center justify-between gap-3 border-t border-[var(--color-border-separator)] pt-3">
               <div className="min-w-0 text-xs text-[var(--color-text-tertiary)]">
                 {t('settings.general.notificationsStatus')}: {notificationStatusLabel[notificationPermission]}
               </div>
@@ -2856,20 +2971,20 @@ export function GeneralSettings() {
               )}
             </div>
           )}
-        </div>
+        </Card>
       </div>
 
       <div className="mt-8">
-        <h2 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">{t('settings.general.chatSendBehaviorTitle')}</h2>
+        <h2 className="text-[16.5px] font-semibold leading-tight text-[var(--color-text-primary)] mb-1" style={{ fontFamily: 'var(--font-headline)' }}>{t('settings.general.chatSendBehaviorTitle')}</h2>
         <p className="text-sm text-[var(--color-text-tertiary)] mb-3">{t('settings.general.chatSendBehaviorDescription')}</p>
-        <div className="grid grid-cols-2 gap-2 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-low)] p-2">
+        <Card radius="xl" surface="low" padding="none" className="grid grid-cols-2 gap-2 p-2">
           {CHAT_SEND_BEHAVIORS.map((option) => (
             <button
               key={option.value}
               type="button"
               onClick={() => void setChatSendBehavior(option.value)}
               aria-pressed={chatSendBehavior === option.value}
-              className={`rounded-lg border px-3 py-2 text-left transition-colors ${
+              className={`rounded-[var(--radius-lg)] border px-3 py-2 text-left transition-colors ${
                 chatSendBehavior === option.value
                   ? 'border-[var(--color-brand)] bg-[var(--color-surface-selected)] text-[var(--color-text-primary)]'
                   : 'border-[var(--color-border)] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)]'
@@ -2881,15 +2996,15 @@ export function GeneralSettings() {
               </div>
             </button>
           ))}
-        </div>
+        </Card>
       </div>
 
       {uiZoomSection}
 
       <div className="mt-8">
-        <h2 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">{t('settings.general.networkTitle')}</h2>
+        <h2 className="text-[16.5px] font-semibold leading-tight text-[var(--color-text-primary)] mb-1" style={{ fontFamily: 'var(--font-headline)' }}>{t('settings.general.networkTitle')}</h2>
         <p className="text-sm text-[var(--color-text-tertiary)] mb-3">{t('settings.general.networkDescription')}</p>
-        <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-4">
+        <Card radius="xl" surface="low" padding="none" className="px-4 py-4">
           <div className="grid grid-cols-2 gap-2">
             {NETWORK_PROXY_MODES.map((mode) => (
               <button
@@ -2903,7 +3018,7 @@ export function GeneralSettings() {
                   setNetworkSaveError(null)
                 }}
                 aria-pressed={networkDraft.proxy.mode === mode.value}
-                className={`rounded-lg border px-3 py-2 text-left transition-colors ${
+                className={`rounded-[var(--radius-lg)] border px-3 py-2 text-left transition-colors ${
                   networkDraft.proxy.mode === mode.value
                     ? 'border-[var(--color-brand)] bg-[var(--color-surface-selected)] text-[var(--color-text-primary)]'
                     : 'border-[var(--color-border)] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)]'
@@ -2944,7 +3059,7 @@ export function GeneralSettings() {
               <label htmlFor="network-timeout-seconds" className="text-sm font-medium text-[var(--color-text-primary)]">
                 {t('settings.general.networkTimeout')}
               </label>
-              <span className="rounded-md bg-[var(--color-surface)] px-2 py-1 text-xs font-medium text-[var(--color-text-secondary)]">
+              <span className="rounded-[var(--radius-md)] bg-[var(--color-surface)] px-2 py-1 text-xs font-medium text-[var(--color-text-secondary)]">
                 {t('settings.general.networkTimeoutValue', { seconds: String(timeoutSeconds) })}
               </span>
             </div>
@@ -3033,13 +3148,13 @@ export function GeneralSettings() {
               {networkSaveError}
             </p>
           )}
-        </div>
+        </Card>
       </div>
 
       <div className="mt-8">
-        <h2 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">{t('settings.general.webFetchPreflightTitle')}</h2>
+        <h2 className="text-[16.5px] font-semibold leading-tight text-[var(--color-text-primary)] mb-1" style={{ fontFamily: 'var(--font-headline)' }}>{t('settings.general.webFetchPreflightTitle')}</h2>
         <p className="text-sm text-[var(--color-text-tertiary)] mb-3">{t('settings.general.webFetchPreflightDescription')}</p>
-        <label className="relative flex items-start gap-3 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-3 cursor-pointer hover:border-[var(--color-border-focus)] transition-colors">
+        <label className="relative flex items-start gap-3 rounded-[var(--radius-xl)] border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-3 cursor-pointer hover:border-[var(--color-border-focus)] transition-colors">
           <input
             type="checkbox"
             aria-label={t('settings.general.webFetchPreflightEnabled')}
@@ -3060,15 +3175,15 @@ export function GeneralSettings() {
       </div>
 
       <div className="mt-8">
-        <h2 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">{t('settings.general.webSearchTitle')}</h2>
+        <h2 className="text-[16.5px] font-semibold leading-tight text-[var(--color-text-primary)] mb-1" style={{ fontFamily: 'var(--font-headline)' }}>{t('settings.general.webSearchTitle')}</h2>
         <p className="text-sm text-[var(--color-text-tertiary)] mb-3">{t('settings.general.webSearchDescription')}</p>
-        <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-4">
+        <Card radius="xl" surface="low" padding="none" className="px-4 py-4">
           <div className="grid grid-cols-5 gap-1.5 mb-4">
             {WEB_SEARCH_MODES.map(({ value, label }) => (
               <button
                 key={value}
                 onClick={() => setWebSearchDraft({ ...webSearchDraft, mode: value })}
-                className={`h-9 px-2 text-xs font-semibold rounded-lg border transition-all truncate ${
+                className={`h-9 px-2 text-xs font-semibold rounded-[var(--radius-lg)] border transition-all truncate ${
                   (webSearchDraft.mode ?? 'auto') === value
                     ? 'bg-[var(--color-brand)] text-[var(--color-on-primary)] border-[var(--color-brand)]'
                     : 'border-[var(--color-border)] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)]'
@@ -3149,15 +3264,15 @@ export function GeneralSettings() {
               </Button>
             </div>
           </div>
-        </div>
+        </Card>
       </div>
 
       {isDesktopRuntime() && (
         <div className="mt-8 border-t border-[var(--color-border)] pt-8">
-          <h2 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">{t('settings.general.storageTitle')}</h2>
+          <h2 className="text-[16.5px] font-semibold leading-tight text-[var(--color-text-primary)] mb-1" style={{ fontFamily: 'var(--font-headline)' }}>{t('settings.general.storageTitle')}</h2>
           <p className="text-sm text-[var(--color-text-tertiary)] mb-3">{t('settings.general.storageDescription')}</p>
 
-          <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-4">
+          <Card radius="xl" surface="low" padding="none" className="px-4 py-4">
             <div className="flex flex-col gap-3">
               <button
                 type="button"
@@ -3171,7 +3286,7 @@ export function GeneralSettings() {
                   }
                 }}
                 aria-pressed={appMode.mode === 'default' && !isEnvironmentConfigDir}
-                className={`flex items-start gap-3 rounded-lg border px-3 py-3 text-left transition-all ${
+                className={`flex items-start gap-3 rounded-[var(--radius-lg)] border px-3 py-3 text-left transition-all ${
                   appMode.mode === 'default' && !isEnvironmentConfigDir
                     ? 'border-[var(--color-brand)] bg-[var(--color-surface)] shadow-[var(--shadow-focus-ring)]'
                     : 'border-[var(--color-border)] bg-[var(--color-surface)] hover:border-[var(--color-border-focus)]'
@@ -3185,7 +3300,7 @@ export function GeneralSettings() {
               </button>
 
               <div
-                className={`rounded-lg border px-3 py-3 transition-all ${
+                className={`rounded-[var(--radius-lg)] border px-3 py-3 transition-all ${
                   appMode.mode === 'portable' && !isEnvironmentConfigDir
                     ? 'border-[var(--color-brand)] bg-[var(--color-surface)] shadow-[var(--shadow-focus-ring)]'
                     : 'border-[var(--color-border)] bg-[var(--color-surface)]'
@@ -3238,20 +3353,20 @@ export function GeneralSettings() {
             </div>
 
             {activeConfigDir && (
-              <div className="mt-3 rounded-lg border border-[var(--color-border)]/70 bg-[var(--color-surface)] px-3 py-2">
+              <div className="mt-3 rounded-[var(--radius-lg)] border border-[var(--color-border-separator)] bg-[var(--color-surface)] px-3 py-2">
                 <div className="text-[11px] font-medium uppercase tracking-wide text-[var(--color-text-tertiary)]">{t('settings.general.storageActiveDir')}</div>
                 <div className="mt-1 break-all font-mono text-xs text-[var(--color-text-secondary)]">{activeConfigDir}</div>
               </div>
             )}
 
             {isEnvironmentConfigDir && (
-              <div className="mt-3 rounded-lg border border-[var(--color-warning)] bg-[var(--color-warning)]/10 px-3 py-2 text-xs leading-5 text-[var(--color-text-secondary)]">
+              <div className="mt-3 rounded-[var(--radius-lg)] border border-[var(--color-warning)] bg-[var(--color-warning-container)] px-3 py-2 text-xs leading-5 text-[var(--color-on-warning-container)]">
                 {t('settings.general.storageEnvironmentHint')}
               </div>
             )}
 
             {appModeRequiresRestart && (
-              <div className="mt-3 rounded-lg border border-[var(--color-warning)] bg-[var(--color-warning)]/10 px-3 py-2 text-xs leading-5 text-[var(--color-text-secondary)]">
+              <div className="mt-3 rounded-[var(--radius-lg)] border border-[var(--color-warning)] bg-[var(--color-warning-container)] px-3 py-2 text-xs leading-5 text-[var(--color-on-warning-container)]">
                 {t('settings.general.storageRestartHint')}
               </div>
             )}
@@ -3265,7 +3380,7 @@ export function GeneralSettings() {
                 {modeError}
               </div>
             )}
-          </div>
+          </Card>
         </div>
       )}
 
@@ -3283,7 +3398,7 @@ export function GeneralSettings() {
                 : t('settings.general.storageSwitchDefaultBody')}
             </p>
             {pendingMode === 'portable' && pendingPortableDir && (
-              <div className="rounded-lg bg-[var(--color-surface-container-low)] px-3 py-2 font-mono text-xs break-all text-[var(--color-text-secondary)]">
+              <div className="rounded-[var(--radius-lg)] bg-[var(--color-surface-container-low)] px-3 py-2 font-mono text-xs break-all text-[var(--color-text-secondary)]">
                 {pendingPortableDir}
               </div>
             )}
@@ -3519,29 +3634,29 @@ function H5AccessSettings() {
   return (
     <div className="max-w-3xl">
       <section aria-labelledby="h5-access-title" role="region">
-        <div className="mb-5 flex items-start gap-3">
-          <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-container-low)] text-[var(--color-brand)]">
+        <div className="mb-6 flex items-start gap-3">
+          <div className="mt-1 flex h-10 w-10 shrink-0 items-center justify-center rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-[var(--color-surface-container-low)] text-[var(--color-brand)]">
             <QrCode className="h-5 w-5" aria-hidden="true" />
           </div>
           <div className="min-w-0">
             <h2
               id="h5-access-title"
-              className="text-base font-semibold text-[var(--color-text-primary)] mb-1"
-            >
+              className="text-[24px] font-semibold leading-tight text-[var(--color-text-primary)]"
+             style={{ fontFamily: 'var(--font-headline)' }}>
               {t('settings.general.h5AccessTitle')}
             </h2>
-            <p className="text-sm text-[var(--color-text-tertiary)]">
+            <p className="mt-1.5 text-[13.5px] leading-6 text-[var(--color-text-secondary)]">
               {t('settings.general.h5AccessDescription')}
             </p>
           </div>
         </div>
 
-        <div className="rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-4 py-4">
+        <Card radius="xl" surface="low" padding="none" className="px-4 py-4">
           <div className="flex items-start justify-between gap-4">
             <label className="flex min-w-0 items-start gap-3">
               <input
                 type="checkbox"
-                className="mt-1 h-4 w-4 rounded border-[var(--color-border)] accent-[var(--color-primary)]"
+                className="mt-1 h-4 w-4 rounded-[var(--radius-sm)] border-[var(--color-border)] accent-[var(--color-brand)]"
                 checked={h5Access.enabled}
                 disabled={h5ActionRunning}
                 aria-label={t('settings.general.h5AccessEnabled')}
@@ -3562,21 +3677,15 @@ function H5AccessSettings() {
                 </span>
               </span>
             </label>
-            <span
-              className={`shrink-0 rounded-full px-2 py-0.5 text-xs font-medium ${
-                h5Access.enabled
-                  ? 'bg-[var(--color-success)]/10 text-[var(--color-success)]'
-                  : 'bg-[var(--color-surface)] text-[var(--color-text-tertiary)] border border-[var(--color-border)]'
-              }`}
-            >
+            <Badge tone={h5Access.enabled ? 'success' : 'neutral'} size="sm" bordered={!h5Access.enabled}>
               {h5Access.enabled ? t('settings.general.h5AccessStatusEnabled') : t('settings.general.h5AccessDisabledValue')}
-            </span>
+            </Badge>
           </div>
 
           {h5AccessDiagnostics?.storedHostStaleness === 'unreachable' && h5AccessDiagnostics.storedPublicBaseUrl ? (
             <div
               data-testid="h5-access-stale-host-banner"
-              className="mt-4 rounded-lg border border-[var(--color-warning)]/40 bg-[var(--color-warning)]/10 px-3 py-3 text-xs leading-5 text-[var(--color-text-primary)]"
+              className="mt-4 rounded-[var(--radius-lg)] border border-[var(--color-warning)] bg-[var(--color-warning-container)] px-3 py-3 text-xs leading-5 text-[var(--color-on-warning-container)]"
             >
               <div className="font-semibold">
                 {t('settings.general.h5AccessStaleHostTitle')}
@@ -3611,7 +3720,7 @@ function H5AccessSettings() {
           {h5AccessDiagnostics?.storedHostStaleness === 'proxy' ? (
             <div
               data-testid="h5-access-proxy-note"
-              className="mt-4 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] px-3 py-2 text-xs leading-5 text-[var(--color-text-tertiary)]"
+              className="mt-4 rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] px-3 py-2 text-xs leading-5 text-[var(--color-text-tertiary)]"
             >
               {t('settings.general.h5AccessProxyNote')}
             </div>
@@ -3666,6 +3775,7 @@ function H5AccessSettings() {
               <Button
                 size="sm"
                 variant="secondary"
+                className="shrink-0 whitespace-nowrap"
                 onClick={() => void handleH5SettingsSave()}
                 disabled={!h5AccessDirty || h5FixedPortInvalid || h5GraceInvalid || h5ActionRunning}
                 aria-label={t('settings.general.h5AccessSave')}
@@ -3676,7 +3786,7 @@ function H5AccessSettings() {
             {h5FixedPortPendingRestart && (
               <div
                 data-testid="h5-access-fixed-port-restart-note"
-                className="rounded-lg border border-[var(--color-warning)]/40 bg-[var(--color-warning)]/10 px-3 py-2 text-xs leading-5 text-[var(--color-text-primary)]"
+                className="rounded-[var(--radius-lg)] border border-[var(--color-warning)] bg-[var(--color-warning-container)] px-3 py-2 text-xs leading-5 text-[var(--color-on-warning-container)]"
               >
                 {t('settings.general.h5AccessFixedPortRestartNote', {
                   fixedPort: String(h5Access.fixedPort),
@@ -3687,13 +3797,13 @@ function H5AccessSettings() {
           </div>
 
           {h5AccessUrl && (
-            <div className="mt-4 border-t border-[var(--color-border)]/60 pt-4">
+            <div className="mt-4 border-t border-[var(--color-border-separator)] pt-4">
               <div className="flex items-center gap-2">
                 <div className="flex-1 min-w-0">
                   <div className="text-xs uppercase tracking-[0.08em] text-[var(--color-text-tertiary)]">
                     {t('settings.general.h5AccessUrl')}
                   </div>
-                  <div className="mt-1 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2 text-sm text-[var(--color-text-primary)] break-all">
+                  <div className="mt-1 rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-code-bg)] px-3 py-2 font-mono text-[12.5px] leading-5 text-[var(--color-text-primary)] break-all">
                     {h5AccessUrl}
                   </div>
                 </div>
@@ -3712,9 +3822,9 @@ function H5AccessSettings() {
           )}
 
           {h5Access.enabled && h5AccessUrl && (
-            <div className="mt-4 border-t border-[var(--color-border)]/60 pt-4">
+            <div className="mt-4 border-t border-[var(--color-border-separator)] pt-4">
               <div className="flex flex-col gap-4 sm:flex-row">
-                <div className="flex h-48 w-48 shrink-0 items-center justify-center rounded-lg border border-[var(--color-border)] bg-white p-3">
+                <div className="flex h-48 w-48 shrink-0 items-center justify-center rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-white p-3">
                   {h5QrDataUrl ? (
                     <img
                       src={h5QrDataUrl}
@@ -3723,6 +3833,10 @@ function H5AccessSettings() {
                     />
                   ) : (
                     <div className="flex flex-col items-center gap-3 px-4 text-center">
+                      {/* Stock neutrals on purpose: the QR box is a hardcoded
+                          `bg-white` (scanners need the contrast), so this text
+                          must stay dark in all three themes. Theme tokens would
+                          go light-on-white under `data-theme="dark"`. */}
                       <QrCode className="h-12 w-12 text-neutral-400" aria-hidden="true" />
                       <p className="text-xs leading-5 text-neutral-500">
                         {t('settings.general.h5AccessQrEmptyHint')}
@@ -3740,7 +3854,7 @@ function H5AccessSettings() {
                       : t('settings.general.h5AccessQrRefreshHint')}
                   </p>
                   {h5LaunchUrl && (
-                    <div className="mt-3 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2 text-sm text-[var(--color-text-primary)] break-all">
+                    <div className="mt-3 rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-code-bg)] px-3 py-2 font-mono text-[12.5px] leading-5 text-[var(--color-text-primary)] break-all">
                       {h5LaunchUrl}
                     </div>
                   )}
@@ -3770,13 +3884,13 @@ function H5AccessSettings() {
           )}
 
           {h5Access.enabled && (
-            <div className="mt-4 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-3">
+            <div className="mt-4 rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-3">
               <div className="flex items-center justify-between gap-3">
                 <div className="min-w-0">
                   <div className="text-xs font-medium uppercase text-[var(--color-text-tertiary)]">
                     {t('settings.general.h5AccessTokenPreview')}
                   </div>
-                  <div className="mt-1 break-all text-sm text-[var(--color-text-primary)]">
+                  <div className="mt-1 break-all font-mono text-[12.5px] leading-5 text-[var(--color-text-primary)]">
                     {h5TokenVisible && h5Token
                       ? h5Token
                       : h5Access.tokenPreview || t('settings.general.h5AccessTokenNotAvailable')}
@@ -3814,7 +3928,7 @@ function H5AccessSettings() {
               {h5AccessError}
             </p>
           )}
-        </div>
+        </Card>
       </section>
 
       <ConfirmDialog
@@ -3838,7 +3952,7 @@ function SettingsCheckboxMark({ checked, disabled = false }: { checked: boolean;
   return (
     <span
       aria-hidden="true"
-      className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition-all peer-focus-visible:ring-2 peer-focus-visible:ring-[var(--color-brand)]/40 ${
+      className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-[var(--radius-md)] border transition-all peer-focus-visible:ring-2 peer-focus-visible:ring-[var(--color-border-focus)] ${
         checked
           ? 'border-[var(--color-brand)] bg-[var(--color-brand)] text-[var(--color-on-primary)] shadow-[var(--shadow-button-primary)]'
           : 'border-[var(--color-border-focus)] bg-[var(--color-surface)] text-transparent'
@@ -3867,12 +3981,10 @@ function SkillSettings() {
 
   return (
     <div className="w-full min-w-0">
-      <h2 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">
-        {t('settings.skills.title')}
-      </h2>
-      <p className="text-sm text-[var(--color-text-tertiary)] mb-4">
-        {t('settings.skills.description')}
-      </p>
+      <SettingsPageHeader
+        title={t('settings.skills.title')}
+        description={t('settings.skills.description')}
+      />
       <SkillList />
     </div>
   )
@@ -3892,12 +4004,10 @@ function PluginSettings() {
 
   return (
     <div className="w-full min-w-0">
-      <h2 className="text-base font-semibold text-[var(--color-text-primary)] mb-1">
-        {t('settings.plugins.title')}
-      </h2>
-      <p className="text-sm text-[var(--color-text-tertiary)] mb-4">
-        {t('settings.plugins.description')}
-      </p>
+      <SettingsPageHeader
+        title={t('settings.plugins.title')}
+        description={t('settings.plugins.description')}
+      />
       <PluginList />
     </div>
   )
@@ -4047,18 +4157,15 @@ function AboutSettings() {
   return (
     <div className="w-full min-w-0 max-w-2xl mx-auto flex flex-col items-center py-6">
       {/* Logo + App Name + Version */}
-      <img src={publicAssetPath('app-icon.png')} alt="Claude Code Haha" className="w-20 h-20 mb-4" />
-      <h1 className="text-xl font-bold text-[var(--color-text-primary)]">Claude Code Haha</h1>
+      <BrandSeal size="xl" className="mb-4" />
+      <h1 className="text-xl font-bold text-[var(--color-text-primary)]" style={{ fontFamily: 'var(--font-headline)' }}>Claude Code Haha</h1>
       {version && (
         <div className="mt-1 flex items-center gap-2 text-xs text-[var(--color-text-tertiary)]">
           <span>{t('settings.about.version')} {version}</span>
           <span className="text-[var(--color-border)]">·</span>
-          <button
-            onClick={() => openUrl(GITHUB_RELEASES)}
-            className="rounded-[var(--radius-sm)] text-[var(--color-text-accent)] transition-colors hover:text-[var(--color-brand)] focus:outline-none focus:shadow-[var(--shadow-focus-ring)]"
-          >
+          <Button variant="link" size="xs" onClick={() => openUrl(GITHUB_RELEASES)}>
             {t('settings.about.changelog')}
-          </button>
+          </Button>
         </div>
       )}
 
@@ -4066,7 +4173,7 @@ function AboutSettings() {
       <div className="mt-6 w-full">
         <button
           onClick={() => openUrl(GITHUB_REPO)}
-          className="w-full flex items-center gap-3 px-4 py-3 rounded-xl border border-[var(--color-border)] hover:bg-[var(--color-surface-hover)] transition-colors cursor-pointer"
+          className="w-full flex items-center gap-3 px-4 py-3 rounded-[var(--radius-xl)] border border-[var(--color-border)] hover:bg-[var(--color-surface-hover)] transition-colors cursor-pointer"
         >
           <img src={publicAssetPath('icons/github.svg')} alt="GitHub" className="w-5 h-5 opacity-70" />
           <div className="flex-1 text-left">
@@ -4076,7 +4183,7 @@ function AboutSettings() {
         </button>
       </div>
 
-      <div className="mt-4 w-full rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-low)] p-4">
+      <Card radius="xl" surface="low" padding="none" className="mt-4 w-full p-4">
         <div className="flex items-start justify-between gap-3">
           <div>
             <div className="text-sm font-medium text-[var(--color-text-primary)]">{t('settings.about.updates')}</div>
@@ -4094,7 +4201,7 @@ function AboutSettings() {
           </Button>
         </div>
 
-        <div className="mt-4 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-3">
+        <div className="mt-4 rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-3">
           <div className="flex items-center justify-between gap-3">
             <div>
               <div className="text-xs uppercase tracking-[0.14em] text-[var(--color-text-tertiary)]">
@@ -4127,11 +4234,11 @@ function AboutSettings() {
             </p>
           )}
 
-          <div className="mt-3 border-t border-[var(--color-border)]/60 pt-3">
+          <div className="mt-3 border-t border-[var(--color-border-separator)] pt-3">
             <button
               type="button"
               onClick={() => setShowUpdateProxyAdvanced((value) => !value)}
-              className="flex w-full items-center justify-between gap-3 rounded-md text-left text-xs font-medium text-[var(--color-text-secondary)] transition-colors hover:text-[var(--color-text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-border-focus)]"
+              className="flex w-full items-center justify-between gap-3 rounded-[var(--radius-md)] text-left text-xs font-medium text-[var(--color-text-secondary)] transition-colors hover:text-[var(--color-text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-border-focus)]"
               aria-expanded={showUpdateProxyAdvanced}
             >
               <span>{t('update.proxyAdvanced')}</span>
@@ -4152,7 +4259,7 @@ function AboutSettings() {
                         setUpdateProxySaveError(null)
                       }}
                       aria-pressed={updateProxyDraft.mode === mode.value}
-                      className={`rounded-lg border px-3 py-2 text-left transition-colors ${
+                      className={`rounded-[var(--radius-lg)] border px-3 py-2 text-left transition-colors ${
                         updateProxyDraft.mode === mode.value
                           ? 'border-[var(--color-brand)] bg-[var(--color-surface-selected)] text-[var(--color-text-primary)]'
                           : 'border-[var(--color-border)] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)]'
@@ -4219,7 +4326,7 @@ function AboutSettings() {
                     style={{ width: `${Math.min(progressPercent, 100)}%` }}
                   />
                 ) : (
-                  <div className="h-full w-1/3 rounded-full bg-[var(--color-text-accent)]/75 animate-pulse" />
+                  <div className="h-full w-1/3 rounded-full bg-[var(--color-text-accent)] animate-pulse" />
                 )}
               </div>
               {!hasKnownProgress && updateStatus === 'downloading' && downloadedBytes > 0 && (
@@ -4231,7 +4338,7 @@ function AboutSettings() {
           )}
 
           {releaseNotes && availableVersion && (
-            <div className="mt-3 rounded-lg bg-[var(--color-surface-container-low)] px-3 py-3">
+            <div className="mt-3 rounded-[var(--radius-lg)] bg-[var(--color-surface-container-low)] px-3 py-3">
               <div className="text-[11px] uppercase tracking-[0.14em] text-[var(--color-text-tertiary)]">
                 {t('update.releaseNotes')}
               </div>
@@ -4262,17 +4369,17 @@ function AboutSettings() {
             </div>
           )}
         </div>
-      </div>
+      </Card>
 
       {/* Divider */}
-      <div className="w-full border-t border-[var(--color-border)]/40 my-6" />
+      <div className="w-full border-t border-[var(--color-border-separator)] my-6" />
 
       {/* Author */}
       <div className="w-full">
         <h3 className="text-xs font-medium text-[var(--color-text-tertiary)] uppercase tracking-wider mb-3">{t('settings.about.author')}</h3>
         <button
           onClick={() => openUrl(AUTHOR_GITHUB)}
-          className="w-full flex items-center gap-3 px-4 py-2.5 rounded-lg hover:bg-[var(--color-surface-hover)] transition-colors cursor-pointer"
+          className="w-full flex items-center gap-3 px-4 py-2.5 rounded-[var(--radius-lg)] hover:bg-[var(--color-surface-hover)] transition-colors cursor-pointer"
         >
           <img src={publicAssetPath('icons/github.svg')} alt="GitHub" className="w-4 h-4 opacity-60" />
           <span className="text-sm text-[var(--color-text-primary)]">程序员阿江-Relakkes</span>
@@ -4288,7 +4395,7 @@ function AboutSettings() {
             <button
               key={link.name}
               onClick={() => openUrl(link.url)}
-              className="w-full flex items-center gap-3 px-4 py-2.5 rounded-lg hover:bg-[var(--color-surface-hover)] transition-colors cursor-pointer"
+              className="w-full flex items-center gap-3 px-4 py-2.5 rounded-[var(--radius-lg)] hover:bg-[var(--color-surface-hover)] transition-colors cursor-pointer"
             >
               <img src={publicAssetPath(link.icon)} alt={link.name} className="w-4 h-4 opacity-60" />
               <span className="text-sm text-[var(--color-text-primary)]">{link.label}</span>
@@ -4301,7 +4408,7 @@ function AboutSettings() {
       <div className="mt-6 w-full">
         <button
           onClick={() => openUrl(GITHUB_ISSUES)}
-          className="w-full flex items-center gap-3 px-4 py-3 rounded-xl border border-[var(--color-border)] hover:bg-[var(--color-surface-hover)] transition-colors cursor-pointer"
+          className="w-full flex items-center gap-3 px-4 py-3 rounded-[var(--radius-xl)] border border-[var(--color-border)] hover:bg-[var(--color-surface-hover)] transition-colors cursor-pointer"
         >
           <span className="material-symbols-outlined text-[20px] text-[var(--color-text-tertiary)]">feedback</span>
           <div className="flex-1 text-left">

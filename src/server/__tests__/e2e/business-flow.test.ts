@@ -75,6 +75,18 @@ async function startTestServer() {
   wsUrl = `ws://127.0.0.1:${server.port}`
 }
 
+async function stopTestServer() {
+  server?.stop(true)
+  const { stopServerRuntimeForShutdown } = await import('../../index.js')
+  await stopServerRuntimeForShutdown()
+  await fs.rm(tmpDir, {
+    recursive: true,
+    force: true,
+    maxRetries: process.platform === 'win32' ? 5 : 0,
+    retryDelay: 100,
+  })
+}
+
 async function api(method: string, urlPath: string, body?: unknown) {
   const res = await fetch(`${baseUrl}${urlPath}`, {
     method,
@@ -87,10 +99,7 @@ async function api(method: string, urlPath: string, body?: unknown) {
 
 describe('Business Flow: Scheduled Tasks', () => {
   beforeAll(startTestServer)
-  afterAll(async () => {
-    server?.stop()
-    await fs.rm(tmpDir, { recursive: true, force: true })
-  })
+  afterAll(stopTestServer)
 
   // ==========================================================================
   // 定时任务完整生命周期
@@ -207,10 +216,7 @@ describe('Business Flow: Scheduled Tasks', () => {
 
 describe('Business Flow: Permission Modes', () => {
   beforeAll(startTestServer)
-  afterAll(async () => {
-    server?.stop()
-    await fs.rm(tmpDir, { recursive: true, force: true })
-  })
+  afterAll(stopTestServer)
 
   const VALID_MODES = ['default', 'acceptEdits', 'plan', 'bypassPermissions', 'dontAsk', 'auto']
 
@@ -253,10 +259,7 @@ describe('Business Flow: Permission Modes', () => {
 
 describe('Business Flow: Agent Management', () => {
   beforeAll(startTestServer)
-  afterAll(async () => {
-    server?.stop()
-    await fs.rm(tmpDir, { recursive: true, force: true })
-  })
+  afterAll(stopTestServer)
 
   it('should start with shared active/all agent payload', async () => {
     const { data } = await api('GET', '/api/agents')
@@ -367,34 +370,32 @@ describe('Business Flow: Agent Management', () => {
 
 describe('Business Flow: Models & Effort', () => {
   beforeAll(startTestServer)
-  afterAll(async () => {
-    server?.stop()
-    await fs.rm(tmpDir, { recursive: true, force: true })
-  })
+  afterAll(stopTestServer)
 
   it('should return available fallback models', async () => {
     const { data } = await api('GET', '/api/models')
-    expect(data.models.length).toBe(3)
+    expect(data.models.length).toBe(4)
     const names = data.models.map((m: any) => m.name)
-    expect(names).toContain('Opus 4.7')
-    expect(names).toContain('Sonnet 4.6')
+    expect(names).toContain('Fable 5')
+    expect(names).toContain('Opus 4.8')
+    expect(names).toContain('Sonnet 5')
     expect(names).toContain('Haiku 4.5')
   })
 
   it('should default to Opus model', async () => {
     const { data } = await api('GET', '/api/models/current')
-    expect(data.model.id).toBe('claude-opus-4-7')
+    expect(data.model.id).toBe('claude-opus-4-8')
   })
 
-  it('should switch to Opus 4.7', async () => {
+  it('should switch to Opus 4.8', async () => {
     const { status } = await api('PUT', '/api/models/current', {
-      modelId: 'claude-opus-4-7',
+      modelId: 'claude-opus-4-8',
     })
     expect(status).toBe(200)
 
     const { data } = await api('GET', '/api/models/current')
-    expect(data.model.id).toBe('claude-opus-4-7')
-    expect(data.model.name).toBe('Opus 4.7')
+    expect(data.model.id).toBe('claude-opus-4-8')
+    expect(data.model.name).toBe('Opus 4.8')
   })
 
   it('should switch to Haiku 4.5', async () => {
@@ -455,10 +456,7 @@ describe('Business Flow: Models & Effort', () => {
 
 describe('Business Flow: Sessions & CLI Interop', () => {
   beforeAll(startTestServer)
-  afterAll(async () => {
-    server?.stop()
-    await fs.rm(tmpDir, { recursive: true, force: true })
-  })
+  afterAll(stopTestServer)
 
   let sessionId: string
 
@@ -581,10 +579,7 @@ describe('Business Flow: Search', () => {
     await fs.writeFile(path.join(testDir, 'utils.ts'), 'export function helper() { return 42 }\n')
     await fs.writeFile(path.join(testDir, 'config.json'), '{"port": 3456}\n')
   })
-  afterAll(async () => {
-    server?.stop()
-    await fs.rm(tmpDir, { recursive: true, force: true })
-  })
+  afterAll(stopTestServer)
 
   it('should find matches in workspace files', async () => {
     const { status, data } = await api('POST', '/api/search', {
@@ -624,10 +619,7 @@ describe('Business Flow: Search', () => {
 
 describe('Business Flow: WebSocket Chat', () => {
   beforeAll(startTestServer)
-  afterAll(async () => {
-    server?.stop()
-    await fs.rm(tmpDir, { recursive: true, force: true })
-  })
+  afterAll(stopTestServer)
 
   it('should establish WebSocket connection and receive connected event', async () => {
     const messages: any[] = []
@@ -763,10 +755,7 @@ describe('Business Flow: WebSocket Chat', () => {
 
 describe('Business Flow: Settings Persistence', () => {
   beforeAll(startTestServer)
-  afterAll(async () => {
-    server?.stop()
-    await fs.rm(tmpDir, { recursive: true, force: true })
-  })
+  afterAll(stopTestServer)
 
   it('should write and read complex settings', async () => {
     const settings = {
@@ -823,10 +812,7 @@ describe('Business Flow: Settings Persistence', () => {
 
 describe('Business Flow: Status & Diagnostics', () => {
   beforeAll(startTestServer)
-  afterAll(async () => {
-    server?.stop()
-    await fs.rm(tmpDir, { recursive: true, force: true })
-  })
+  afterAll(stopTestServer)
 
   it('should return health with uptime', async () => {
     const { data } = await api('GET', '/api/status')
@@ -863,10 +849,7 @@ describe('Business Flow: Status & Diagnostics', () => {
 
 describe('Business Flow: Error Handling', () => {
   beforeAll(startTestServer)
-  afterAll(async () => {
-    server?.stop()
-    await fs.rm(tmpDir, { recursive: true, force: true })
-  })
+  afterAll(stopTestServer)
 
   it('should return 404 for unknown API resource', async () => {
     const { status, data } = await api('GET', '/api/unknown')

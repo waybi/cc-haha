@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
     enabled: true,
     selectedPetId: 'dada-code',
     size: 112,
+    showTaskPanel: true,
     collapsed: false,
     motionEnabled: true,
     lastSessionId: 'session-running' as string | null,
@@ -19,6 +20,7 @@ const mocks = vi.hoisted(() => ({
   updatePetPreferences: vi.fn(),
   initializeDesktopServerUrl: vi.fn(),
   focusSession: vi.fn(),
+  focusMainWindow: vi.fn(),
   hidePet: vi.fn(),
   showContextMenu: vi.fn(),
   dragWindow: vi.fn(),
@@ -48,6 +50,7 @@ vi.mock('../../lib/desktopHost', () => ({
     pets: {
       list: vi.fn(async () => ({ pets: [], errors: [] })),
       focusSession: mocks.focusSession,
+      focusMainWindow: mocks.focusMainWindow,
       hide: mocks.hidePet,
       showContextMenu: mocks.showContextMenu,
       dragWindow: mocks.dragWindow,
@@ -126,6 +129,7 @@ describe('PetApp', () => {
     mocks.preferences.enabled = true
     mocks.preferences.selectedPetId = 'dada-code'
     mocks.preferences.size = 112
+    mocks.preferences.showTaskPanel = true
     mocks.preferences.collapsed = false
     mocks.preferences.motionEnabled = true
     mocks.preferences.lastSessionId = 'session-running'
@@ -141,6 +145,7 @@ describe('PetApp', () => {
     mocks.fetchSessions.mockResolvedValue(undefined)
     mocks.showContextMenu.mockResolvedValue(true)
     mocks.dragWindow.mockResolvedValue(undefined)
+    mocks.focusMainWindow.mockResolvedValue(undefined)
     mocks.getChatStatus.mockImplementation(async (sessionId: string) => ({
       state: sessionId === 'session-running' ? 'thinking' : 'idle',
       activityState: sessionId === 'session-running' ? 'running' : 'idle',
@@ -152,6 +157,65 @@ describe('PetApp', () => {
   })
 
   afterEach(() => cleanup())
+
+  it('hides the task panel by preference even while work is active', async () => {
+    mocks.preferences.showTaskPanel = false
+    render(<PetApp />)
+
+    expect(await screen.findByRole('button', { name: 'pet.window.interact' })).toBeInTheDocument()
+    await waitFor(() => {
+      expect(mocks.getChatStatus).toHaveBeenCalledWith('session-running', expect.any(AbortSignal))
+    })
+    expect(screen.queryByRole('list')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('pet.window.sessionCount:1')).not.toBeInTheDocument()
+    await waitFor(() => {
+      expect(mocks.setInteractiveRegions.mock.calls.at(-1)?.[0]).toHaveLength(2)
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'pet.window.expandTasks:1' }))
+    expect(mocks.updatePetPreferences).toHaveBeenCalledWith({ showTaskPanel: true })
+    expect(await screen.findByRole('list')).toBeInTheDocument()
+  })
+
+  it('hides the task panel when no task is active even if the preference is enabled', async () => {
+    mocks.chats = {
+      'session-running': chat('idle', 'The build is done.'),
+      'session-idle': chat('idle', 'The atlas is ready.'),
+    }
+    mocks.getChatStatus.mockResolvedValue({ state: 'idle', activityState: 'idle' })
+    render(<PetApp />)
+
+    expect(await screen.findByRole('button', { name: 'pet.window.interact' })).toBeInTheDocument()
+    await waitFor(() => {
+      expect(mocks.getChatStatus).toHaveBeenCalledTimes(2)
+    })
+    expect(screen.queryByText('pet.window.noSessions')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('pet.window.sessionCount:0')).not.toBeInTheDocument()
+    await waitFor(() => {
+      expect(mocks.setInteractiveRegions.mock.calls.at(-1)?.[0]).toHaveLength(1)
+    })
+  })
+
+  it('hides the whole task surface when an older server reports only completed review markers', async () => {
+    mocks.chats = {
+      'session-running': chat('idle', 'The build is done.'),
+      'session-idle': chat('idle', 'The atlas is ready.'),
+    }
+    mocks.getChatStatus.mockResolvedValue({ state: 'idle', activityState: 'review' })
+    render(<PetApp />)
+
+    expect(await screen.findByRole('button', { name: 'pet.window.interact' })).toBeInTheDocument()
+    await waitFor(() => {
+      expect(mocks.getChatStatus).toHaveBeenCalledTimes(2)
+    })
+    expect(screen.queryByRole('list')).not.toBeInTheDocument()
+    expect(screen.queryByText('Build pet window')).not.toBeInTheDocument()
+    expect(screen.queryByText('Review animation')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('pet.window.expandTasks:2')).not.toBeInTheDocument()
+    await waitFor(() => {
+      expect(mocks.setInteractiveRegions.mock.calls.at(-1)?.[0]).toHaveLength(1)
+    })
+  })
 
   it('shows only active session work and opens the task from the whole row', async () => {
     render(<PetApp />)
@@ -177,24 +241,21 @@ describe('PetApp', () => {
     expect(mocks.focusSession).toHaveBeenCalledWith('session-running')
   })
 
-  it('shows a vertical list for every non-idle session when expanded', async () => {
+  it('hides legacy review sessions while keeping real active work visible', async () => {
     mocks.getChatStatus.mockImplementation(async (sessionId: string) => ({
       state: 'thinking',
       activityState: sessionId === 'session-idle' ? 'review' : 'running',
     }))
     render(<PetApp />)
 
-    const reviewRow = await screen.findByRole('button', {
-      name: 'Review animation, pet.window.status.review',
+    await screen.findByRole('button', {
+      name: 'Build pet window, pet.window.status.running',
     })
-    expect(screen.getAllByRole('listitem')).toHaveLength(2)
-
-    fireEvent.click(reviewRow)
-    expect(mocks.focusSession).toHaveBeenCalledWith('session-idle')
+    expect(screen.getAllByRole('listitem')).toHaveLength(1)
+    expect(screen.queryByText('Review animation')).not.toBeInTheDocument()
   })
 
-  it('keeps one compact session row collapsed and expands from the chevron without navigating', async () => {
-    mocks.preferences.collapsed = true
+  it('shows every active task and returns the card to its badge from the chevron', async () => {
     mocks.sessions = [
       session('session-running', 'Build pet window', '2026-07-19T12:01:00Z'),
       session('session-second', 'Polish animation', '2026-07-19T12:00:00Z'),
@@ -209,45 +270,44 @@ describe('PetApp', () => {
     expect(await screen.findByRole('button', {
       name: 'Build pet window, pet.window.status.running',
     })).toBeInTheDocument()
-    expect(screen.queryByRole('button', {
+    expect(screen.getByRole('button', {
       name: 'Polish animation, pet.window.status.running',
-    })).not.toBeInTheDocument()
+    })).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', {
-      name: 'pet.window.expand pet.window.sessionCount:2',
+      name: 'pet.window.hideTasks:2',
     }))
 
     expect(mocks.focusSession).not.toHaveBeenCalled()
-    expect(mocks.updatePetPreferences).toHaveBeenCalledWith({ collapsed: false })
-    expect(await screen.findByRole('button', {
-      name: 'Polish animation, pet.window.status.running',
-    })).toBeInTheDocument()
-    expect(screen.getAllByRole('listitem')).toHaveLength(2)
+    expect(mocks.updatePetPreferences).toHaveBeenCalledWith({ showTaskPanel: false })
+    expect(screen.queryByRole('list')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'pet.window.expandTasks:2' })).toBeInTheDocument()
   })
 
-  it('collapses to the compact row while keeping both pet regions interactive', async () => {
+  it('hides the card while keeping the mascot and task badge interactive', async () => {
     render(<PetApp />)
     await screen.findByRole('button', {
       name: 'Build pet window, pet.window.status.running',
     })
     await waitFor(() => {
       expect(mocks.setInteractiveRegions).toHaveBeenCalledWith(expect.any(Array))
-      expect(mocks.setInteractiveRegions.mock.calls.at(-1)?.[0]).toHaveLength(2)
+      expect(mocks.setInteractiveRegions.mock.calls.at(-1)?.[0]).toHaveLength(3)
     })
 
     fireEvent.click(screen.getByRole('button', {
-      name: 'pet.window.collapse pet.window.sessionCount:1',
+      name: 'pet.window.hideTasks:1',
     }))
 
-    expect(mocks.updatePetPreferences).toHaveBeenCalledWith({ collapsed: true })
+    expect(mocks.updatePetPreferences).toHaveBeenCalledWith({ showTaskPanel: false })
     expect(mocks.hidePet).not.toHaveBeenCalled()
-    expect(screen.queryByRole('textbox', { name: 'pet.window.followUp' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('list')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'pet.window.expandTasks:1' })).toBeInTheDocument()
     await waitFor(() => {
       expect(mocks.setInteractiveRegions.mock.calls.at(-1)?.[0]).toHaveLength(2)
     })
   })
 
-  it('keeps a short mascot pointer gesture as a normal pet interaction', async () => {
+  it('focuses the main desktop window after a short mascot pointer gesture', async () => {
     render(<PetApp />)
     const mascot = await screen.findByRole('button', { name: 'pet.window.interact' })
     mascot.setPointerCapture = vi.fn()
@@ -278,6 +338,7 @@ describe('PetApp', () => {
     fireEvent.click(mascot)
 
     expect(mocks.dragWindow).not.toHaveBeenCalled()
+    expect(mocks.focusMainWindow).toHaveBeenCalledTimes(1)
     expect(mocks.updatePetPreferences).not.toHaveBeenCalledWith({ collapsed: true })
     expect(mascot.querySelector('[data-pet-state="waving"]')).toBeInTheDocument()
     expect(mascot.setPointerCapture).toHaveBeenCalledWith(7)
@@ -331,6 +392,7 @@ describe('PetApp', () => {
       [{ phase: 'end', x: 530, y: 440 }],
     ]))
     expect(mascot).toHaveAttribute('data-dragging', 'false')
+    expect(mocks.focusMainWindow).not.toHaveBeenCalled()
     expect(mocks.updatePetPreferences).not.toHaveBeenCalledWith({ collapsed: true })
     expect(mascot.setPointerCapture).toHaveBeenCalledWith(9)
     expect(mascot.releasePointerCapture).toHaveBeenCalledWith(9)
@@ -408,7 +470,7 @@ describe('PetApp', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('pet.window.saveError')
     expect(mocks.hidePet).not.toHaveBeenCalled()
     expect(screen.getByRole('button', {
-      name: 'pet.window.collapse pet.window.sessionCount:1',
+      name: 'pet.window.hideTasks:1',
     })).toBeInTheDocument()
   })
 })

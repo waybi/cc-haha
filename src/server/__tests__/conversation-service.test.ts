@@ -215,7 +215,28 @@ describe('ConversationService', () => {
     expect(env.CLAUDE_COWORK_MEMORY_PATH_OVERRIDE).toBe(
       `${path.join(tmpDir, 'projects', 'D--workspace-code-myself-code-cc-haha', 'memory')}${path.sep}`,
     )
-    await expect(fs.stat(path.dirname(env.CLAUDE_CODE_DIAGNOSTICS_FILE))).resolves.toBeTruthy()
+    const diagnosticsDirectory = await fs.stat(path.dirname(env.CLAUDE_CODE_DIAGNOSTICS_FILE))
+    expect(diagnosticsDirectory).toBeTruthy()
+    if (process.platform !== 'win32') {
+      expect(diagnosticsDirectory.mode & 0o777).toBe(0o700)
+    }
+  })
+
+  test('omits CLI diagnostics when its managed directory resolves through a symlink', async () => {
+    if (process.platform === 'win32') return
+    const unrelatedDir = path.join(tmpDir, 'unrelated-cli-diagnostics')
+    const unrelatedDiagnosticsDir = path.join(unrelatedDir, 'diagnostics')
+    await fs.mkdir(unrelatedDiagnosticsDir, { recursive: true, mode: 0o755 })
+    await fs.mkdir(path.join(tmpDir, 'cc-haha'), { recursive: true })
+    await fs.rm(path.join(tmpDir, 'cc-haha'), { recursive: true, force: true })
+    await fs.symlink(unrelatedDir, path.join(tmpDir, 'cc-haha'), 'dir')
+
+    const service = new ConversationService() as any
+    const env = (await service.buildChildEnv('/tmp')) as Record<string, string>
+
+    expect(env.CLAUDE_CODE_DIAGNOSTICS_FILE).toBeUndefined()
+    expect((await fs.stat(unrelatedDiagnosticsDir)).mode & 0o777).toBe(0o755)
+    await expect(fs.stat(path.join(unrelatedDiagnosticsDir, 'cli-diagnostics.jsonl'))).rejects.toThrow()
   })
 
   test('buildChildEnv injects stream watchdog + overall max-duration so a trickling provider stream cannot hang the desktop forever (#766)', async () => {
@@ -310,36 +331,39 @@ describe('ConversationService', () => {
     expect(env.CLAUDE_COWORK_MEMORY_PATH_OVERRIDE).not.toContain('myself_code')
   })
 
-  test('buildChildEnv inherits exported terminal shell variables for desktop CLI sessions', async () => {
-    const shellPath = path.join(tmpDir, 'zsh')
-    const nodeBin = path.join(tmpDir, 'node-bin')
-    const nvmDir = path.join(tmpDir, '.nvm')
-    await fs.mkdir(nodeBin, { recursive: true })
-    await fs.mkdir(nvmDir, { recursive: true })
-    await writeFakeZsh(shellPath)
-    await fs.writeFile(
-      path.join(tmpDir, '.zshrc'),
-      [
-        `export NVM_DIR="${nvmDir}"`,
-        `export PATH="${nodeBin}:$PATH"`,
-        '',
-      ].join('\n'),
-    )
+  test.skipIf(process.platform === 'win32')(
+    'buildChildEnv inherits exported terminal shell variables for desktop CLI sessions',
+    async () => {
+      const shellPath = path.join(tmpDir, 'zsh')
+      const nodeBin = path.join(tmpDir, 'node-bin')
+      const nvmDir = path.join(tmpDir, '.nvm')
+      await fs.mkdir(nodeBin, { recursive: true })
+      await fs.mkdir(nvmDir, { recursive: true })
+      await writeFakeZsh(shellPath)
+      await fs.writeFile(
+        path.join(tmpDir, '.zshrc'),
+        [
+          `export NVM_DIR="${nvmDir}"`,
+          `export PATH="${nodeBin}:$PATH"`,
+          '',
+        ].join('\n'),
+      )
 
-    delete process.env.CC_HAHA_DISABLE_TERMINAL_SHELL_ENV
-    process.env.HOME = tmpDir
-    process.env.SHELL = shellPath
-    process.env.PATH = '/usr/bin:/bin'
-    delete process.env.ZDOTDIR
-    resetTerminalShellEnvironmentCacheForTests()
+      delete process.env.CC_HAHA_DISABLE_TERMINAL_SHELL_ENV
+      process.env.HOME = tmpDir
+      process.env.SHELL = shellPath
+      process.env.PATH = '/usr/bin:/bin'
+      delete process.env.ZDOTDIR
+      resetTerminalShellEnvironmentCacheForTests()
 
-    const service = new ConversationService() as any
-    const env = (await service.buildChildEnv(tmpDir)) as Record<string, string>
+      const service = new ConversationService() as any
+      const env = (await service.buildChildEnv(tmpDir)) as Record<string, string>
 
-    expect(env.NVM_DIR).toBe(nvmDir)
-    expect(env.PATH.split(path.delimiter)[0]).toBe(nodeBin)
-    expect(env.PATH.split(path.delimiter)).toContain('/usr/bin')
-  })
+      expect(env.NVM_DIR).toBe(nvmDir)
+      expect(env.PATH.split(path.delimiter)[0]).toBe(nodeBin)
+      expect(env.PATH.split(path.delimiter)).toContain('/usr/bin')
+    },
+  )
 
   test('strips inherited provider env when desktop provider config exists', async () => {
     const ccHahaDir = path.join(tmpDir, 'cc-haha')
@@ -815,10 +839,10 @@ describe('ConversationService', () => {
   test('buildChildEnv clears stale api key for bearer-token providers', async () => {
     const providerService = new ProviderService()
     const provider = await providerService.addProvider({
-      presetId: 'jiekouai',
-      name: 'Jiekou',
+      presetId: 'shengsuanyun',
+      name: 'ShengSuanYun',
       apiKey: 'provider-key',
-      baseUrl: 'https://api.jiekou.ai/anthropic',
+      baseUrl: 'https://router.shengsuanyun.com/api',
       apiFormat: 'anthropic',
       models: {
         main: 'claude-sonnet-4-6',
@@ -834,7 +858,7 @@ describe('ConversationService', () => {
       model: 'claude-sonnet-4-6',
     })) as Record<string, string>
 
-    expect(env.ANTHROPIC_BASE_URL).toBe('https://api.jiekou.ai/anthropic')
+    expect(env.ANTHROPIC_BASE_URL).toBe('https://router.shengsuanyun.com/api')
     expect(env.ANTHROPIC_AUTH_TOKEN).toBe('provider-key')
     expect(env.ANTHROPIC_API_KEY).toBe('')
     expect(env.ANTHROPIC_MODEL).toBe('claude-sonnet-4-6')

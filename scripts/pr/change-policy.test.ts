@@ -33,6 +33,7 @@ describe('evaluateChangePolicy', () => {
   test('keeps docs-only changes on the docs lane', () => {
     const result = evaluateChangePolicy([
       'docs/index.md',
+      'site/src/App.tsx',
       'README.md',
     ])
 
@@ -128,7 +129,7 @@ describe('evaluateChangePolicy', () => {
     const result = evaluateChangePolicy([
       '.github/CODEOWNERS',
       '.github/copilot-instructions.md',
-      'docs/guide/contributing.md',
+      'docs/internals/contributing.md',
     ])
 
     expect(result.checks.policy).toBe(true)

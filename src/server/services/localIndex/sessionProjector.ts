@@ -30,7 +30,11 @@ import type {
   TranscriptProjection,
 } from './types.js'
 
-export const SESSION_SUMMARY_PARSER_VERSION = 2
+// Bump whenever the reducer's output changes for input it has already seen: a mismatch against a
+// source's stored version makes `detectSourceChange` return `rebuild`, which is the only thing
+// that refreshes already-indexed transcripts.
+// 3: usage is deduplicated per (message.id, requestId), and sessions carry active working time.
+export const SESSION_SUMMARY_PARSER_VERSION = 3
 
 export type SessionSourceCandidate = {
   path: string

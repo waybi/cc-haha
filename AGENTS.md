@@ -18,7 +18,7 @@ Rules closer to the code take precedence. Before editing `.github/`, `src/`, `de
 - `src/`: CLI, Ink UI, commands, services, tools, shared runtime utilities, and the local API/WebSocket server.
 - `desktop/`: React desktop UI, Electron host, native/sidecar resources, and desktop build scripts.
 - `adapters/`: Telegram, Feishu, WeChat, DingTalk, and shared IM adapter utilities.
-- `docs/` and `docs/en/`: VitePress documentation; keep Chinese and English counterparts aligned when both exist.
+- `site/`: React documentation site and build tooling. `docs/` and `docs/en/` are its Chinese and English Markdown content sources; keep counterparts aligned when both exist.
 - `.github/workflows/`, `scripts/pr/`, and `scripts/quality-gate/`: CI routing and quality policy.
 - `release-notes/`, `scripts/release.ts`, and `.github/workflows/release-desktop.yml`: desktop release automation.
 
@@ -61,7 +61,7 @@ Additional invariants:
 
 ## Deeper Guides
 
-- Contributor workflow and quality lanes: `CONTRIBUTING.md` and `docs/guide/contributing.md`
+- Contributor workflow and quality lanes: `CONTRIBUTING.md` and `docs/internals/contributing.md`
 - Package scripts and path routing: `package.json` and `scripts/pr/change-policy.ts`
 - PR evidence contract: `.github/pull_request_template.md`
 - Desktop release and auto-update runbook: `docs/desktop/10-release-auto-update.md`

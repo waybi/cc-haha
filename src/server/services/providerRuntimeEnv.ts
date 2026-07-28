@@ -36,6 +36,10 @@ export const MANAGED_PROVIDER_ENV_KEYS = [
   'ENABLE_TOOL_SEARCH',
   'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS',
   'ANTHROPIC_MODEL',
+  'ANTHROPIC_DEFAULT_FABLE_MODEL',
+  'ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION',
+  'ANTHROPIC_DEFAULT_FABLE_MODEL_NAME',
+  'ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES',
   'ANTHROPIC_DEFAULT_HAIKU_MODEL',
   'ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES',
   'ANTHROPIC_DEFAULT_SONNET_MODEL',
@@ -67,6 +71,7 @@ function isProviderModels(value: unknown): value is SavedProvider['models'] {
   return (
     isRecord(value) &&
     typeof value.main === 'string' &&
+    (value.fable === undefined || typeof value.fable === 'string') &&
     typeof value.haiku === 'string' &&
     typeof value.sonnet === 'string' &&
     typeof value.opus === 'string'
@@ -128,6 +133,7 @@ export function normalizeModelMapping(models: SavedProvider['models']): SavedPro
   const main = models.main.trim()
   return {
     main,
+    ...(models.fable?.trim() ? { fable: models.fable.trim() } : {}),
     haiku: models.haiku.trim() || main,
     sonnet: models.sonnet.trim() || main,
     opus: models.opus.trim() || main,
@@ -159,6 +165,7 @@ function applyModel1mSupportMapping(
 ): SavedProvider['models'] {
   return {
     main: applyModel1mSupport(models.main, model1mSupport?.main),
+    ...(models.fable ? { fable: models.fable.trim() } : {}),
     haiku: applyModel1mSupport(models.haiku, model1mSupport?.haiku),
     sonnet: applyModel1mSupport(models.sonnet, model1mSupport?.sonnet),
     opus: applyModel1mSupport(models.opus, model1mSupport?.opus),
@@ -309,6 +316,9 @@ function getProviderCapabilityEnv(
   if (provider.presetId === 'custom') {
     const capabilities = getCustomProviderModelCapabilities(provider, models)
     return {
+      ...(models.fable
+        ? { ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES: capabilities }
+        : {}),
       ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES: capabilities,
       ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES: capabilities,
       ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES: capabilities,
@@ -409,6 +419,9 @@ export function buildProviderManagedEnv(
     ANTHROPIC_BASE_URL: baseUrl,
     ...buildProviderAuthEnv(provider, presetDefaultEnv, needsProxy),
     ANTHROPIC_MODEL: runtimeModels.main,
+    ...(runtimeModels.fable && {
+      ANTHROPIC_DEFAULT_FABLE_MODEL: runtimeModels.fable,
+    }),
     ANTHROPIC_DEFAULT_HAIKU_MODEL: runtimeModels.haiku,
     ANTHROPIC_DEFAULT_SONNET_MODEL: runtimeModels.sonnet,
     ANTHROPIC_DEFAULT_OPUS_MODEL: runtimeModels.opus,

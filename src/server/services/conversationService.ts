@@ -35,6 +35,12 @@ import {
   buildClaudeCliArgs,
   resolveClaudeCliLauncher,
 } from '../../utils/desktopBundledCli.js'
+import {
+  PLAN_REJECTION_MESSAGE,
+  PLAN_REJECTION_WITH_REASON_PREFIX,
+  REJECT_MESSAGE,
+  REJECT_MESSAGE_WITH_REASON_PREFIX,
+} from '../../constants/messages.js'
 import { getClaudeConfigHomeDir } from '../../utils/envUtils.js'
 import { findCanonicalGitRoot } from '../../utils/git.js'
 import { sanitizePath } from '../../utils/path.js'
@@ -77,6 +83,30 @@ export const DESKTOP_CLI_GRACEFUL_SHUTDOWN_TIMEOUT_MS = 6_000
 export function cliExitSeverity(code: number | null): 'info' | 'error' {
   if (code === 0 || code === null || code === 143 || code === 137) return 'info'
   return 'error'
+}
+
+/**
+ * Builds the denial text the CLI hands to the model as tool_result content.
+ *
+ * The model reads this verbatim, so it has to carry the instruction the desktop
+ * UI can't: a plain tool denial means "stop and wait for me", while a rejected
+ * plan means "keep planning". Both renderers (the CLI's
+ * renderToolUseRejectedMessage, the desktop's extractPlanPreview) read the plan
+ * from the tool input, so nothing here needs to echo the plan back.
+ */
+export function buildDenyMessage(
+  toolName: string | undefined,
+  denyMessage: string | undefined,
+): string {
+  const feedback = denyMessage?.trim()
+  if (toolName === 'ExitPlanMode') {
+    return feedback
+      ? `${PLAN_REJECTION_WITH_REASON_PREFIX}${feedback}`
+      : PLAN_REJECTION_MESSAGE
+  }
+  return feedback
+    ? `${REJECT_MESSAGE_WITH_REASON_PREFIX}${feedback}`
+    : REJECT_MESSAGE
 }
 
 export function buildConversationCliSpawnOptions(
@@ -629,12 +659,16 @@ export class ConversationService {
             }
           : {
               behavior: 'deny',
-              message: denyMessage || 'User denied via UI',
-              // Rejecting ExitPlanMode means "keep planning"; other desktop
-              // denials stop the current agent turn and wait for user input.
-              ...(pendingRequest?.toolName !== 'ExitPlanMode'
-                ? { interrupt: true }
-                : {}),
+              // No `interrupt`: the denial travels back to the model as a
+              // tool_result so it can acknowledge the rejection and stop on its
+              // own. Aborting the turn instead (#1051) kept the model from ever
+              // seeing the denial, so a rejected tool ended the turn silently.
+              // REJECT_MESSAGE carries the "STOP and wait for the user"
+              // instruction that the abort used to enforce; 'User denied via UI'
+              // was a debug string the model had no way to act on.
+              // ExitPlanMode is the exception — rejecting it means "keep
+              // planning", so the model is told to revise rather than stop.
+              message: buildDenyMessage(pendingRequest?.toolName, denyMessage),
             },
       },
     })
@@ -645,13 +679,21 @@ export class ConversationService {
     this.trackPendingPermissionModeChange(sessionId, mode, 1)
 
     let confirmationSettled = false
-    let confirmationTimeout: ReturnType<typeof setTimeout>
-    let handleOutput: (msg: any) => void
+    let confirmationTimeout: ReturnType<typeof setTimeout> | undefined
+    let handleOutput: ((msg: any) => void) | undefined
+    let rejectConfirmation: ((reason?: unknown) => void) | undefined
     const cleanupConfirmation = () => {
-      clearTimeout(confirmationTimeout)
-      this.removeOutputCallback(sessionId, handleOutput)
+      if (confirmationTimeout !== undefined) clearTimeout(confirmationTimeout)
+      if (handleOutput) this.removeOutputCallback(sessionId, handleOutput)
+    }
+    const cancelConfirmation = (reason: unknown) => {
+      if (confirmationSettled) return
+      confirmationSettled = true
+      cleanupConfirmation()
+      rejectConfirmation?.(reason)
     }
     const confirmation = new Promise<void>((resolve, reject) => {
+      rejectConfirmation = reject
       handleOutput = (msg: any) => {
         if (
           msg?.type !== 'system' ||
@@ -665,12 +707,6 @@ export class ConversationService {
         cleanupConfirmation()
         resolve()
       }
-
-      confirmationTimeout = setTimeout(() => {
-        confirmationSettled = true
-        cleanupConfirmation()
-        reject(new Error(`Timed out waiting for permission mode confirmation: ${mode}`))
-      }, timeoutMs)
       this.onOutput(sessionId, handleOutput)
     })
     // requestControl can reject before the confirmation promise is awaited.
@@ -678,15 +714,22 @@ export class ConversationService {
     void confirmation.catch(() => undefined)
 
     try {
+      const startedAt = Date.now()
       await this.requestControl(sessionId, {
         subtype: 'set_permission_mode',
         mode,
       }, timeoutMs)
+      if (!confirmationSettled) {
+        const remainingMs = Math.max(1, timeoutMs - (Date.now() - startedAt))
+        confirmationTimeout = setTimeout(() => {
+          cancelConfirmation(new Error(`Timed out waiting for permission mode confirmation: ${mode}`))
+        }, remainingMs)
+      }
       await confirmation
 
       return this.sessions.has(sessionId)
     } catch (err) {
-      if (!confirmationSettled) cleanupConfirmation()
+      cancelConfirmation(err)
       throw err
     } finally {
       this.trackPendingPermissionModeChange(sessionId, mode, -1)
@@ -736,10 +779,12 @@ export class ConversationService {
   private async waitForControlChannelReady(
     sessionId: string,
     timeoutMs: number,
+    signal?: AbortSignal,
   ): Promise<void> {
     const startedAt = Date.now()
 
     while (Date.now() - startedAt < timeoutMs) {
+      if (signal?.aborted) throw controlRequestAbortReason(signal)
       const session = this.sessions.get(sessionId)
       if (!session) {
         throw new Error('CLI session is not running')
@@ -747,7 +792,7 @@ export class ConversationService {
       if (this.isControlChannelReady(session)) {
         return
       }
-      await new Promise((resolve) => setTimeout(resolve, CONTROL_READY_POLL_MS))
+      await waitForControlPoll(CONTROL_READY_POLL_MS, signal)
     }
 
     throw new Error('Timed out waiting for CLI control channel to become ready')
@@ -757,25 +802,34 @@ export class ConversationService {
     sessionId: string,
     request: Record<string, unknown>,
     timeoutMs = 10_000,
+    signal?: AbortSignal,
   ): Promise<Record<string, unknown>> {
+    if (signal?.aborted) {
+      return Promise.reject(controlRequestAbortReason(signal))
+    }
     if (!this.sessions.has(sessionId)) {
       return Promise.reject(new Error('CLI session is not running'))
     }
 
     const startedAt = Date.now()
-    await this.waitForControlChannelReady(sessionId, timeoutMs)
+    await this.waitForControlChannelReady(sessionId, timeoutMs, signal)
     const responseTimeoutMs = Math.max(1, timeoutMs - (Date.now() - startedAt))
     const requestId = crypto.randomUUID()
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        this.removeOutputCallback(sessionId, handleOutput)
-        reject(new Error(`Timed out waiting for ${String(request.subtype ?? 'control')} response`))
-      }, responseTimeoutMs)
+      let settled = false
+      let timeout: ReturnType<typeof setTimeout>
 
       const finish = (fn: () => void) => {
+        if (settled) return
+        settled = true
         clearTimeout(timeout)
+        signal?.removeEventListener('abort', handleAbort)
         this.removeOutputCallback(sessionId, handleOutput)
         fn()
+      }
+
+      const handleAbort = () => {
+        finish(() => reject(controlRequestAbortReason(signal!)))
       }
 
       const handleOutput = (msg: any) => {
@@ -798,7 +852,17 @@ export class ConversationService {
         ))
       }
 
+      timeout = setTimeout(() => {
+        finish(() => reject(new Error(
+          `Timed out waiting for ${String(request.subtype ?? 'control')} response`,
+        )))
+      }, responseTimeoutMs)
       this.onOutput(sessionId, handleOutput)
+      signal?.addEventListener('abort', handleAbort, { once: true })
+      if (signal?.aborted) {
+        handleAbort()
+        return
+      }
       const sent = this.sendSdkMessage(sessionId, {
         type: 'control_request',
         request_id: requestId,
@@ -1336,6 +1400,10 @@ export class ConversationService {
       'ANTHROPIC_AUTH_TOKEN',
       'ENABLE_TOOL_SEARCH',
       'ANTHROPIC_MODEL',
+      'ANTHROPIC_DEFAULT_FABLE_MODEL',
+      'ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION',
+      'ANTHROPIC_DEFAULT_FABLE_MODEL_NAME',
+      'ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES',
       'ANTHROPIC_DEFAULT_HAIKU_MODEL',
       'ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES',
       'ANTHROPIC_DEFAULT_SONNET_MODEL',
@@ -1403,11 +1471,13 @@ export class ConversationService {
         cleanEnv.ANTHROPIC_MODEL,
     )
 
-    const cliDiagnosticsPath = diagnosticsService.getCliDiagnosticsPath()
+    let cliDiagnosticsPath: string | undefined
     try {
-      fs.mkdirSync(path.dirname(cliDiagnosticsPath), { recursive: true })
+      await diagnosticsService.prepareCliDiagnosticsStorage()
+      cliDiagnosticsPath = diagnosticsService.getCliDiagnosticsPath()
     } catch {
-      // Diagnostics must never block session startup.
+      // Diagnostics must never block session startup or point the child at an
+      // unsafe path when private storage could not be prepared.
     }
 
     return {
@@ -1444,7 +1514,7 @@ export class ConversationService {
       // forever while the UI shows "running" (#766). It can also double-run
       // tools (upstream inc-4258).
       CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK: cleanEnv.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK || '1',
-      CLAUDE_CODE_DIAGNOSTICS_FILE: cliDiagnosticsPath,
+      ...(cliDiagnosticsPath ? { CLAUDE_CODE_DIAGNOSTICS_FILE: cliDiagnosticsPath } : {}),
       CLAUDE_COWORK_MEMORY_PATH_OVERRIDE: this.resolveDesktopAutoMemoryPath(workDir),
       CALLER_DIR: workDir,
       PWD: workDir,
@@ -1600,6 +1670,10 @@ export class ConversationService {
         'ANTHROPIC_AUTH_TOKEN',
         'ENABLE_TOOL_SEARCH',
         'ANTHROPIC_MODEL',
+        'ANTHROPIC_DEFAULT_FABLE_MODEL',
+        'ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION',
+        'ANTHROPIC_DEFAULT_FABLE_MODEL_NAME',
+        'ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES',
         'ANTHROPIC_DEFAULT_HAIKU_MODEL',
         'ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES',
         'ANTHROPIC_DEFAULT_SONNET_MODEL',
@@ -2163,6 +2237,29 @@ export class ConversationService {
     const url = new URL(sdkUrl)
     return url.searchParams.get('token') || ''
   }
+}
+
+function controlRequestAbortReason(signal: AbortSignal): Error {
+  if (signal.reason instanceof Error) return signal.reason
+  return new DOMException('The operation was aborted', 'AbortError')
+}
+
+function waitForControlPoll(timeoutMs: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, timeoutMs))
+  if (signal.aborted) return Promise.reject(controlRequestAbortReason(signal))
+
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      signal.removeEventListener('abort', handleAbort)
+      resolve()
+    }, timeoutMs)
+    const handleAbort = () => {
+      clearTimeout(timeout)
+      reject(controlRequestAbortReason(signal))
+    }
+    signal.addEventListener('abort', handleAbort, { once: true })
+    if (signal.aborted) handleAbort()
+  })
 }
 
 function normalizeSessionPermissionUpdates(

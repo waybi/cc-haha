@@ -68,7 +68,7 @@ vi.mock('../api/providers', () => ({
 }))
 
 vi.mock('../lib/desktopNotifications', () => desktopNotificationsMock)
-vi.mock('../components/chat/clipboard', () => clipboardMock)
+vi.mock('@/lib/clipboard', () => clipboardMock)
 vi.mock('@tauri-apps/api/core', () => tauriCoreMock)
 vi.mock('@tauri-apps/plugin-dialog', () => tauriDialogMock)
 vi.mock('@tauri-apps/plugin-process', () => tauriProcessMock)
@@ -207,7 +207,6 @@ describe('Settings > General tab', () => {
 
     useSettingsStore.setState({
       locale: 'en',
-      theme: 'light',
       permissionMode: 'default',
       autoModeOptInAccepted: false,
       thinkingEnabled: true,
@@ -258,7 +257,7 @@ describe('Settings > General tab', () => {
         useSettingsStore.setState({ autoDreamEnabled: enabled })
       }),
       setTheme: vi.fn().mockImplementation(async (theme: ThemeMode) => {
-        useSettingsStore.setState({ theme })
+        useUIStore.setState({ theme })
       }),
       setPermissionMode: vi.fn().mockImplementation(async (permissionMode: PermissionMode) => {
         useSettingsStore.setState({ permissionMode })
@@ -348,7 +347,16 @@ describe('Settings > General tab', () => {
       updateH5AccessSettings: vi.fn(),
     })
 
-    useUIStore.setState({ activeSettingsTab: 'providers', pendingSettingsTab: null, toasts: [] })
+    useUIStore.setState({
+      activeSettingsTab: 'providers',
+      pendingSettingsTab: null,
+      toasts: [],
+      // Fresh installs follow the system, which narrows the theme picker to
+      // its light half. Tests that exercise the full picker opt out here and
+      // the follow-the-system cases turn it back on.
+      followSystemTheme: false,
+      lightTheme: 'white',
+    })
     useUpdateStore.setState({
       status: 'idle',
       availableVersion: null,
@@ -387,29 +395,128 @@ describe('Settings > General tab', () => {
     expect(screen.getByLabelText('Skip WebFetch domain preflight')).toBeInTheDocument()
   })
 
-  it('offers the pure white appearance theme', () => {
+  it('offers all six palettes, paper grounds before ink ones', () => {
     render(<Settings />)
 
     fireEvent.click(screen.getByText('General'))
-    const pureWhite = screen.getByRole('button', { name: 'Pure White' })
-    const warmClassic = screen.getByRole('button', { name: 'Warm Classic' })
-    const dark = screen.getByRole('button', { name: 'Dark' })
+    // The picker order is load-bearing: the four paper grounds come first, then
+    // the two ink ones, so the list reads light-to-dark rather than shuffled.
+    const order = ['Pure White', 'Paper', 'Warm Classic', 'Celadon', 'Ink Night', 'Ink Blue']
+      .map((name) => screen.getByRole('button', { name }))
 
-    expect((pureWhite.compareDocumentPosition(warmClassic) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0).toBe(true)
-    expect((warmClassic.compareDocumentPosition(dark) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0).toBe(true)
+    for (const [index, chip] of order.slice(0, -1).entries()) {
+      const next = order[index + 1]!
+      expect(
+        (chip.compareDocumentPosition(next) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0,
+        `${order[index + 1]} should follow ${order[index]}`,
+      ).toBe(true)
+    }
+
     fireEvent.click(screen.getByRole('button', { name: 'Pure White' }))
-
     expect(useSettingsStore.getState().setTheme).toHaveBeenCalledWith('white')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Ink Blue' }))
+    expect(useSettingsStore.getState().setTheme).toHaveBeenCalledWith('ink-blue')
+  })
+
+  it('gives the settings rail the handoff width and a rounded selected item', () => {
+    useUIStore.setState({ activeSettingsTab: 'general', pendingSettingsTab: null })
+    render(<Settings />)
+
+    const activeItem = screen.getByRole('button', { name: 'General' })
+    // Selection is a rounded ground inside the rail, not a full-bleed band:
+    // the rail is padded, so a square highlight would touch the divider.
+    expect(activeItem.className).toContain('rounded-[var(--radius-md)]')
+    expect(activeItem.className).toContain('bg-[var(--color-surface-hover)]')
+    expect(activeItem).toHaveAttribute('aria-current', 'page')
+
+    const rail = activeItem.parentElement?.parentElement
+    expect(rail?.className).toContain('w-[220px]')
   })
 
   it('marks the pure white appearance theme as selected', () => {
-    useSettingsStore.setState({ theme: 'white' })
+    useUIStore.setState({ theme: 'white' })
     render(<Settings />)
 
     fireEvent.click(screen.getByText('General'))
 
     expect(screen.getByRole('button', { name: 'Pure White' })).toHaveAttribute('aria-pressed', 'true')
     expect(screen.getByRole('button', { name: 'Warm Classic' })).toHaveAttribute('aria-pressed', 'false')
+  })
+
+  it('offers a switch for following the system appearance', () => {
+    render(<Settings />)
+
+    fireEvent.click(screen.getByText('General'))
+
+    const followSwitch = screen.getByRole('switch', { name: 'Follow the system' })
+    expect(followSwitch).not.toBeChecked()
+
+    fireEvent.click(followSwitch)
+
+    expect(useUIStore.getState().followSystemTheme).toBe(true)
+  })
+
+  it('splits the picker into one row per ground while following the system', () => {
+    // The OS picks the ground; what is left to choose is the palette on each
+    // one, so both rows are offered rather than only the light half.
+    useUIStore.setState({ followSystemTheme: true, lightTheme: 'celadon', darkTheme: 'ink-blue', theme: 'ink-blue' })
+    render(<Settings />)
+
+    fireEvent.click(screen.getByText('General'))
+
+    expect(screen.getByText('Use in light mode')).toBeInTheDocument()
+    expect(screen.getByText('Use in dark mode')).toBeInTheDocument()
+    for (const label of ['Pure White', 'Paper', 'Warm Classic', 'Celadon', 'Ink Night', 'Ink Blue']) {
+      expect(screen.getByRole('button', { name: label }), label).toBeInTheDocument()
+    }
+  })
+
+  it('marks each ground preference rather than the applied palette', () => {
+    // Evening: the app is on ink-blue, but the light row is asking which
+    // palette to return to in the morning — that is warm classic, not ink-blue.
+    useUIStore.setState({ followSystemTheme: true, lightTheme: 'warm-classic', darkTheme: 'ink-blue', theme: 'ink-blue' })
+    render(<Settings />)
+
+    fireEvent.click(screen.getByText('General'))
+
+    expect(screen.getByRole('button', { name: 'Warm Classic' })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('button', { name: 'Ink Blue' })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('button', { name: 'Pure White' })).toHaveAttribute('aria-pressed', 'false')
+    expect(screen.getByRole('button', { name: 'Ink Night' })).toHaveAttribute('aria-pressed', 'false')
+  })
+
+  it('hides the light-half hint when not following the system', () => {
+    render(<Settings />)
+
+    fireEvent.click(screen.getByText('General'))
+
+    expect(screen.queryByText('Use in light mode')).not.toBeInTheDocument()
+  })
+
+  it('highlights the theme on screen after the OS flipped it and the switch is released', () => {
+    // Going through the real transition, not a hand-set state: the OS turned
+    // dark during the session, then the user releases the switch to freeze it.
+    // The picker must point at the palette that is actually rendered.
+    useUIStore.setState({
+      followSystemTheme: true,
+      lightTheme: 'white',
+      darkTheme: 'ink-blue',
+      theme: 'white',
+    })
+    render(<Settings />)
+    fireEvent.click(screen.getByText('General'))
+
+    act(() => {
+      // Stand in for the OS flip the media-query listener would deliver.
+      useUIStore.setState({ theme: 'ink-blue' })
+    })
+    act(() => {
+      useUIStore.getState().setFollowSystemTheme(false)
+    })
+
+    expect(screen.getByRole('button', { name: 'Ink Blue' })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('button', { name: 'Pure White' })).toHaveAttribute('aria-pressed', 'false')
   })
 
   it('keeps UI zoom below system notifications because it is a secondary setting', () => {
@@ -883,7 +990,7 @@ describe('Settings > General tab', () => {
     const trigger = screen.getByRole('button', { name: 'Response Language' })
     expect(trigger).toHaveTextContent('Default (English)')
     fireEvent.click(trigger)
-    fireEvent.click(screen.getByRole('button', { name: '中文 (Chinese)' }))
+    fireEvent.click(screen.getByRole('option', { name: '中文 (Chinese)' }))
 
     expect(useSettingsStore.getState().setResponseLanguage).toHaveBeenCalledWith('chinese')
   })
@@ -1576,6 +1683,18 @@ describe('Settings > Providers tab', () => {
     providerStoreState.hasLoadedProviders = true
   })
 
+  it('outlines the default provider in terracotta rather than the focus color', () => {
+    providerStoreState.activeId = 'provider-1'
+    render(<Settings />)
+
+    const card = screen.getByTestId('provider-provider-1')
+    // 1.5px so the default row reads as chosen at a glance without the heavier
+    // ring the focus border gave it, which collided with the real focus ring.
+    expect(card.className).toContain('border-[1.5px]')
+    expect(card.className).toContain('border-[var(--color-primary-fixed-dim)]')
+    expect(card.className).not.toContain('border-[var(--color-border-focus)]')
+  })
+
   it('does not query official OAuth status before providers finish loading', () => {
     providerStoreState.providers = []
     providerStoreState.activeId = null
@@ -1724,8 +1843,9 @@ describe('Settings > Providers tab', () => {
     expect(within(dialog).queryByRole('combobox')).not.toBeInTheDocument()
 
     fireEvent.click(within(dialog).getByRole('button', { name: /Anthropic Messages \(native\)/i }))
-    fireEvent.click(within(dialog).getByRole('button', { name: /OpenAI Responses API \(proxy\)/i }))
+    fireEvent.click(within(dialog).getByRole('option', { name: /OpenAI Responses API \(proxy\)/i }))
 
+    // The panel is closed now; this finds the trigger, which reflects the pick.
     expect(within(dialog).getByRole('button', { name: /OpenAI Responses API \(proxy\)/i })).toBeInTheDocument()
     expect(within(dialog).getByText('Requests will be translated via the local proxy')).toBeInTheDocument()
   })
@@ -1906,6 +2026,20 @@ describe('Settings > Providers tab', () => {
     expect(providerStoreState.testConfig).not.toHaveBeenCalledWith(expect.objectContaining({
       modelId: 'deepseek-v4-pro',
     }))
+
+    fireEvent.click(within(dialog).getByRole('button', { name: /Save|Add|保存|添加/i }))
+
+    await waitFor(() => {
+      expect(providerStoreState.createProvider).toHaveBeenCalledWith(expect.objectContaining({
+        models: expect.objectContaining({
+          fable: 'Qwen3Coder',
+          main: 'claude-sonnet-4-6',
+          haiku: 'claude-haiku-4-5',
+          sonnet: 'claude-sonnet-4-6',
+          opus: 'claude-opus-4-8',
+        }),
+      }))
+    })
   })
 
   it('keeps the provider form locked while save is in flight', async () => {

@@ -82,6 +82,7 @@ describe('providerRuntimeEnv', () => {
           apiFormat: 'anthropic',
           models: {
             main: 'active-main',
+            fable: 'active-fable',
             haiku: '',
             sonnet: 'active-sonnet',
             opus: '',
@@ -98,6 +99,9 @@ describe('providerRuntimeEnv', () => {
       ANTHROPIC_AUTH_TOKEN: 'sk-active',
       ENABLE_TOOL_SEARCH: 'true',
       ANTHROPIC_MODEL: 'active-main',
+      ANTHROPIC_DEFAULT_FABLE_MODEL: 'active-fable',
+      ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES:
+        'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
       ANTHROPIC_DEFAULT_HAIKU_MODEL: 'active-main',
       ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES:
         'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',

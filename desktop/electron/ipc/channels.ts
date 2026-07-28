@@ -12,6 +12,8 @@ export const ELECTRON_IPC_CHANNELS = {
   petsList: 'desktop:pets:list',
   petsCreateFromImage: 'desktop:pets:create-from-image',
   petsCreateFromAtlas: 'desktop:pets:create-from-atlas',
+  petsPickSourceSheet: 'desktop:pets:pick-source-sheet',
+  petsCreateFromAtlasBytes: 'desktop:pets:create-from-atlas-bytes',
   petsOpenFolder: 'desktop:pets:open-folder',
   petsShow: 'desktop:pets:show',
   petsHide: 'desktop:pets:hide',
@@ -19,6 +21,7 @@ export const ELECTRON_IPC_CHANNELS = {
   petsDragWindow: 'desktop:pets:drag-window',
   petsSetIgnoreMouseEvents: 'desktop:pets:set-ignore-mouse-events',
   petsSetInteractiveRegions: 'desktop:pets:set-interactive-regions',
+  petsFocusMainWindow: 'desktop:pets:focus-main-window',
   petsFocusSession: 'desktop:pets:focus-session',
   dialogOpen: 'desktop:dialog:open',
   dialogSave: 'desktop:dialog:save',
@@ -58,6 +61,7 @@ export const ELECTRON_IPC_CHANNELS = {
   appModeRestart: 'desktop:app-mode:restart',
   adaptersRestartSidecar: 'desktop:adapters:restart-sidecar',
   zoomSet: 'desktop:zoom:set',
+  appearanceSetApplied: 'desktop:appearance:set-applied',
 } as const
 
 export const ELECTRON_EVENT_CHANNELS = {

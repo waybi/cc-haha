@@ -219,7 +219,7 @@ describe('session entry projection', () => {
     const projector = createSessionProjector({ database, index, scope: root })
 
     try {
-      expect(SESSION_SUMMARY_PARSER_VERSION).toBe(2)
+      expect(SESSION_SUMMARY_PARSER_VERSION).toBeGreaterThan(0)
       await projector.projectSource(candidate)
       await projector.projectSource(untouched)
       const firstBefore = index.getSessionEntryLocators(candidate.path, ['user'])

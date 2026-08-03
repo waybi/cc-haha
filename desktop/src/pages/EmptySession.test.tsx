@@ -643,7 +643,6 @@ describe('EmptySession', () => {
     expect(useSessionRuntimeStore.getState().selections['draft-session']).toEqual({
       providerId: 'provider-explicit',
       modelId: 'model-explicit',
-      effortLevel: 'max',
     })
     expect(useSessionRuntimeStore.getState().selections['__draft__']).toBeUndefined()
     expect(mocks.wsSend.mock.calls.slice(0, 2)).toEqual([
@@ -653,7 +652,6 @@ describe('EmptySession', () => {
           type: 'set_runtime_config',
           providerId: 'provider-explicit',
           modelId: 'model-explicit',
-          effortLevel: 'max',
         },
       ],
       ['draft-session', { type: 'prewarm_session' }],
@@ -712,6 +710,7 @@ describe('EmptySession', () => {
     expect(useSessionRuntimeStore.getState().selections['draft-session']).toEqual({
       providerId: 'provider-minimax',
       modelId: 'MiniMax-M3[1m]',
+      effortLevel: 'max',
     })
     expect(mocks.wsSend.mock.calls.slice(0, 3)).toEqual([
       [
@@ -720,6 +719,7 @@ describe('EmptySession', () => {
           type: 'set_runtime_config',
           providerId: 'provider-minimax',
           modelId: 'MiniMax-M3[1m]',
+          effortLevel: 'max',
         },
       ],
       ['draft-session', { type: 'prewarm_session' }],

@@ -93,15 +93,15 @@ describe('bundled provider presets', () => {
     expect(selectableIds).toContain('custom')
   })
 
-  it('keeps the retired 接口AI preset resolvable but not selectable', () => {
+  it('keeps the 接口AI preset selectable with this fork referral metadata', () => {
     const jiekouai = BUNDLED_PROVIDER_PRESETS.find((preset) => preset.id === 'jiekouai')
 
-    expect(jiekouai?.deprecated).toBe(true)
-    expect(jiekouai?.apiKeyUrl).toBeUndefined()
-    expect(jiekouai?.promoText).toBeUndefined()
-    expect(jiekouai?.featured).toBeUndefined()
+    expect(jiekouai?.deprecated).toBeUndefined()
+    expect(jiekouai?.apiKeyUrl).toBe('https://jiekou.ai/referral?invited_code=OBNU3K')
+    expect(jiekouai?.promoText).toContain('官方 8 折')
+    expect(jiekouai?.featured).toBe(true)
 
     expect(selectableProviderPresets(BUNDLED_PROVIDER_PRESETS).map((p) => p.id))
-      .not.toContain('jiekouai')
+      .toContain('jiekouai')
   })
 })

@@ -1,6 +1,6 @@
 import type { ModelInfo } from '../types/settings'
 
-export const OFFICIAL_DEFAULT_MODEL_ID = 'claude-opus-4-8'
+export const OFFICIAL_DEFAULT_MODEL_ID = 'claude-opus-4-6'
 
 export const OFFICIAL_MODELS: ModelInfo[] = [
   {
@@ -10,8 +10,8 @@ export const OFFICIAL_MODELS: ModelInfo[] = [
     context: '1m',
   },
   {
-    id: 'claude-opus-4-8',
-    name: 'Opus 4.8',
+    id: 'claude-opus-4-6',
+    name: 'Opus 4.6',
     description: 'Best for complex agentic coding and enterprise work',
     context: '1m',
     defaultReasoningEffort: 'high',

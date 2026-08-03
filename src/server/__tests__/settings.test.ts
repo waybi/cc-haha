@@ -719,8 +719,8 @@ describe('Models API', () => {
         context: '1m',
       },
       {
-        id: 'claude-opus-4-8',
-        name: 'Opus 4.8',
+        id: 'claude-opus-4-6',
+        name: 'Opus 4.6',
         description: 'Best for complex agentic coding and enterprise work',
         context: '1m',
         defaultReasoningEffort: 'high',
@@ -920,7 +920,7 @@ describe('Models API', () => {
 
     expect(res.status).toBe(200)
     const body = await res.json()
-    expect(body.model.id).toBe('claude-opus-4-8')
+    expect(body.model.id).toBe('claude-opus-4-6')
   })
 
   it('GET /api/models/current should respect env-configured default model when no provider is active', async () => {

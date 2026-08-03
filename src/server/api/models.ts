@@ -46,8 +46,8 @@ const DEFAULT_MODELS = [
     context: '1m',
   },
   {
-    id: 'claude-opus-4-8',
-    name: 'Opus 4.8',
+    id: 'claude-opus-4-6',
+    name: 'Opus 4.6',
     description: 'Best for complex agentic coding and enterprise work',
     context: '1m',
     defaultReasoningEffort: 'high',
@@ -71,7 +71,7 @@ const DEFAULT_MODELS = [
 
 const EFFORT_LEVELS = ['low', 'medium', 'high', 'max'] as const
 
-const DEFAULT_MODEL = 'claude-opus-4-8'
+const DEFAULT_MODEL = 'claude-opus-4-6'
 const DEFAULT_EFFORT = 'max'
 
 const settingsService = new SettingsService()

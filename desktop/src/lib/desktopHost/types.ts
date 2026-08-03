@@ -2,6 +2,7 @@ import type {
   AppMode as SettingsAppMode,
   AppModeConfig as SettingsAppModeConfig,
 } from '../../types/settings'
+import type { Locale } from '../../i18n/locale'
 
 export type DesktopHostKind = 'browser' | 'electron'
 
@@ -148,8 +149,24 @@ export type PreviewCaptureMessage = {
 
 export type PreviewPickerMessage = {
   v: 1
-  type: 'enter-picker' | 'exit-picker'
-}
+} & (
+  | {
+      type: 'enter-picker'
+      mode?: 'single' | 'batch'
+      label?: number
+      copy?: {
+        cancel: string
+        send: string
+        queueAndContinue: string
+        add: string
+        descriptionPlaceholder: string
+      }
+    }
+  | { type: 'exit-picker' }
+  | { type: 'undo-selection'; itemId: string }
+  | { type: 'clear-selection-draft' }
+  | { type: 'commit-selection-draft' }
+)
 
 export type PreviewHostMessage = PreviewCaptureMessage | PreviewPickerMessage
 
@@ -229,6 +246,18 @@ export type DesktopPetWindowDrag = {
   y: number
 }
 
+/**
+ * Which side of the mascot the host wants the activity panel drawn on.
+ *
+ * The mascot is clamped to the display edge through the window's transparent
+ * padding, so at the top of the screen the panel that shares that padding ends
+ * up behind the menu bar. Only the host knows the window position and the work
+ * area, so it decides and the renderer follows.
+ */
+export type DesktopPetPanelPlacement = {
+  vertical: 'above' | 'below'
+}
+
 export type AppModeConfig = SettingsAppModeConfig
 
 export type AppModeSetInput = {
@@ -246,6 +275,10 @@ export type DesktopHost = {
   }
   app: {
     getVersion(): Promise<string>
+    getLocalePreference(): Promise<Locale | null>
+    setLocalePreference(locale: Locale): Promise<void>
+    getPreferredSystemLanguages(): Promise<string[]>
+    onLocaleChanged(handler: (locale: Locale) => void): Promise<DesktopHostUnlisten>
   }
   commands: {
     invoke<T>(command: string, args?: Record<string, unknown>): Promise<T>
@@ -282,13 +315,18 @@ export type DesktopHost = {
     show(): Promise<void>
     hide(): Promise<void>
     showContextMenu(closeLabel: string): Promise<boolean>
-    dragWindow(payload: DesktopPetWindowDrag): Promise<void>
+    dragWindow(payload: DesktopPetWindowDrag): Promise<DesktopPetPanelPlacement>
     setIgnoreMouseEvents(ignore: boolean): Promise<void>
-    setInteractiveRegions(regions: DesktopPetInteractiveRegion[]): Promise<void>
+    setInteractiveRegions(
+      regions: DesktopPetInteractiveRegion[],
+    ): Promise<DesktopPetPanelPlacement>
     focusMainWindow(): Promise<void>
     focusSession(sessionId: string): Promise<void>
     onNavigateSession(handler: (sessionId: string) => void): Promise<DesktopHostUnlisten>
     onVisibilityChanged(handler: (visible: boolean) => void): Promise<DesktopHostUnlisten>
+    onPanelPlacementChanged(
+      handler: (placement: DesktopPetPanelPlacement) => void,
+    ): Promise<DesktopHostUnlisten>
   }
   dialogs: {
     open(options?: DialogOpenOptions): Promise<string | string[] | null>

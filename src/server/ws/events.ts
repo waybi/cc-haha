@@ -53,13 +53,15 @@ export type AttachmentRef = {
 // Server → Client
 // ============================================================================
 
+export const RUNTIME_CONFIG_APPLIED_EVENT = 'runtime_config_applied' as const
+
 export type ServerMessage =
   | { type: 'connected'; sessionId: string }
   | { type: 'session_state'; turnState: 'running' | 'idle' }
-  | { type: 'content_start'; blockType: 'text' | 'tool_use'; toolName?: string; toolUseId?: string; parentToolUseId?: string }
+  | { type: 'content_start'; blockType: 'text' | 'tool_use'; toolName?: string; toolUseId?: string; originalToolUseId?: string; parentToolUseId?: string }
   | { type: 'content_delta'; text?: string; toolInput?: string }
-  | { type: 'tool_use_complete'; toolName: string; toolUseId: string; input: unknown; parentToolUseId?: string }
-  | { type: 'tool_result'; toolUseId: string; content: unknown; isError: boolean; parentToolUseId?: string }
+  | { type: 'tool_use_complete'; toolName: string; toolUseId: string; originalToolUseId?: string; input: unknown; parentToolUseId?: string }
+  | { type: 'tool_result'; toolUseId: string; originalToolUseId?: string; content: unknown; isError: boolean; parentToolUseId?: string }
   | {
       type: 'permission_request'
       requestId: string
@@ -89,6 +91,12 @@ export type ServerMessage =
   | { type: 'message_complete'; usage: TokenUsage }
   | { type: 'thinking'; text: string }
   | { type: 'status'; state: ChatState; verb?: string; attemptStart?: boolean }
+  | {
+      type: typeof RUNTIME_CONFIG_APPLIED_EVENT
+      providerId: string | null
+      modelId: string
+      effortLevel?: string
+    }
   // CLI 是权限模式的唯一真相来源。当 CLI 内部 mode 变化（如 ExitPlanMode 后
   // 恢复到进入 plan 前的模式、Shift+Tab 切换）时，把新模式回传给前端，让桌面端
   // 选择器与 CLI 保持同步，而不是停留在本地影子值上。

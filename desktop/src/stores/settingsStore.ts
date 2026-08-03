@@ -36,23 +36,18 @@ import {
   readStoredAppZoomLevel,
 } from '../lib/appZoom'
 import { useUIStore } from './uiStore'
+import {
+  applyDocumentLocale,
+  getInitialLocale,
+  LOCALE_STORAGE_KEY,
+  subscribeLocaleChanges,
+} from '../i18n/locale'
 
-const LOCALE_STORAGE_KEY = 'cc-haha-locale'
 export const UI_ZOOM_MIN = MIN_APP_ZOOM
 export const UI_ZOOM_MAX = MAX_APP_ZOOM
 export const UI_ZOOM_STEP = APP_ZOOM_CONTROL_STEP
 export const UI_ZOOM_DEFAULT = DEFAULT_APP_ZOOM
 let desktopNotificationsSaveQueue: Promise<void> = Promise.resolve()
-
-const VALID_LOCALES: readonly Locale[] = ['en', 'zh', 'zh-TW', 'jp', 'kr']
-
-function getStoredLocale(): Locale {
-  try {
-    const stored = localStorage.getItem(LOCALE_STORAGE_KEY)
-    if (stored && (VALID_LOCALES as readonly string[]).includes(stored)) return stored as Locale
-  } catch { /* localStorage unavailable */ }
-  return 'zh'
-}
 
 type SettingsStore = {
   permissionMode: PermissionMode
@@ -178,6 +173,9 @@ const DEFAULT_TRACE_CAPTURE_SETTINGS: TraceCaptureSettings = {
   storageDir: '',
 }
 
+const initialLocale = getInitialLocale()
+applyDocumentLocale(initialLocale)
+
 export const useSettingsStore = create<SettingsStore>((set, get) => ({
   permissionMode: 'default',
   currentModel: null,
@@ -187,7 +185,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   autoModeOptInAccepted: false,
   availableModels: [],
   activeProviderName: null,
-  locale: getStoredLocale(),
+  locale: initialLocale,
   chatSendBehavior: 'enter',
   outputStyle: DEFAULT_OUTPUT_STYLE,
   outputStyles: DEFAULT_OUTPUT_STYLE_OPTIONS,
@@ -344,7 +342,11 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
   setLocale: (locale) => {
     set({ locale })
+    applyDocumentLocale(locale)
     try { localStorage.setItem(LOCALE_STORAGE_KEY, locale) } catch { /* noop */ }
+    void getDesktopHost().app.setLocalePreference(locale).catch((error) => {
+      console.error('[desktop] Failed to persist locale preference', error)
+    })
   },
 
   // Kept as the Settings page's entry point; uiStore owns the state.
@@ -621,6 +623,11 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     }
   },
 }))
+
+subscribeLocaleChanges((locale) => {
+  useSettingsStore.setState({ locale })
+  applyDocumentLocale(locale)
+})
 
 function normalizeWebSearchSettings(settings: WebSearchSettings | undefined): WebSearchSettings {
   return {

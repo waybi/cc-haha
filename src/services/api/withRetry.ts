@@ -6,7 +6,10 @@ import {
   APIUserAbortError,
 } from '@anthropic-ai/sdk'
 import type { QuerySource } from 'src/constants/querySource.js'
-import type { SystemAPIErrorMessage } from 'src/types/message.js'
+import type {
+  AssistantMessage,
+  SystemAPIErrorMessage,
+} from 'src/types/message.js'
 import { isAwsCredentialsProviderError } from 'src/utils/aws.js'
 import { logForDebugging } from 'src/utils/debug.js'
 import { logError } from 'src/utils/log.js'
@@ -43,7 +46,10 @@ import {
   checkMockRateLimitError,
   isMockRateLimitError,
 } from '../rateLimitMocking.js'
-import { REPEATED_529_ERROR_MESSAGE } from './errors.js'
+import {
+  isContextOverflowErrorText,
+  REPEATED_529_ERROR_MESSAGE,
+} from './errors.js'
 import { extractConnectionErrorDetails } from './errorUtils.js'
 
 const abortError = () => new APIUserAbortError()
@@ -175,9 +181,16 @@ export class FallbackTriggeredError extends Error {
  * path can surface a faithful API-error message.
  */
 export class RetriableStreamError extends Error {
-  constructor(public readonly originalError: unknown) {
+  public readonly bufferedMessages: readonly AssistantMessage[]
+
+  constructor(
+    public readonly originalError: unknown,
+    bufferedMessages: readonly AssistantMessage[] = [],
+  ) {
     super(errorMessage(originalError))
     this.name = 'RetriableStreamError'
+    this.bufferedMessages = bufferedMessages
+    Object.defineProperty(this, 'bufferedMessages', { enumerable: false })
     if (originalError instanceof Error && originalError.stack) {
       this.stack = originalError.stack
     }
@@ -515,16 +528,13 @@ export async function* withRetry<T>(
             )
             throw error
           }
-          // Ensure we have enough tokens for thinking + at least 1 output token
-          const minRequired =
-            (retryContext.thinkingConfig.type === 'enabled'
-              ? retryContext.thinkingConfig.budgetTokens
-              : 0) + 1
-          const adjustedMaxTokens = Math.max(
-            FLOOR_OUTPUT_TOKENS,
-            availableContext,
-            minRequired,
-          )
+          const adjustedMaxTokens = availableContext
+          if (
+            retryContext.maxTokensOverride !== undefined &&
+            adjustedMaxTokens >= retryContext.maxTokensOverride
+          ) {
+            throw new CannotRetryError(error, retryContext)
+          }
           retryContext.maxTokensOverride = adjustedMaxTokens
 
           logEvent('tengu_max_tokens_context_overflow_adjustment', {
@@ -883,6 +893,12 @@ function shouldRetry(error: APIError): boolean {
   // Clear API key cache on 401 and allow retry.
   // OAuth token handling is done in the main retry loop via handleOAuth401Error.
   if (error.status === 401) {
+    // Some gateways wrap context-overflow rejections in a 401 (#1162).
+    // Retrying just replays the same oversized prompt — fail fast so the
+    // overflow surfaces and compaction can react instead.
+    if (isContextOverflowErrorText(error.message)) {
+      return false
+    }
     clearApiKeyHelperCache()
     return true
   }

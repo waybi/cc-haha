@@ -10,7 +10,7 @@ import { useTranslation } from '../../i18n'
 import type { TranslationKey } from '../../i18n'
 import { SETTINGS_TAB_ID, useTabStore } from '../../stores/tabStore'
 import { useUIStore } from '../../stores/uiStore'
-import type { AgentTaskNotification, UIMessage } from '../../types/chat'
+import type { AgentTaskNotification, BackgroundAgentTask, UIMessage } from '../../types/chat'
 import { AGENT_LIFECYCLE_TYPES } from '../../types/team'
 
 type ToolCall = Extract<UIMessage, { type: 'tool_use' }>
@@ -30,6 +30,21 @@ type MemoryToolActivity = {
   files: MemoryToolFile[]
 }
 
+/**
+ * Wall-clock gap between the tool_use and its tool_result, used for the "524ms"
+ * badge (#1149). The CLI does not report a real execution duration over the wire
+ * — BashProgress never leaves the ink renderer — so this is the transcript
+ * timestamp delta and therefore includes any permission-approval wait.
+ */
+export function toolCallDurationMs(
+  toolCall: Pick<ToolCall, 'timestamp'>,
+  result?: Pick<ToolResult, 'timestamp'>,
+): number | undefined {
+  if (!result) return undefined
+  const elapsed = result.timestamp - toolCall.timestamp
+  return Number.isFinite(elapsed) && elapsed >= 0 ? elapsed : undefined
+}
+
 function useExpandableCardState() {
   const [expanded, setExpanded] = useState(false)
 
@@ -46,6 +61,7 @@ type Props = {
   resultMap: Map<string, ToolResult>
   childToolCallsByParent: Map<string, ToolCall[]>
   agentTaskNotifications: Record<string, AgentTaskNotification>
+  agentTaskStatuses?: Record<string, BackgroundAgentTask['status']>
   showOpenRun?: boolean
   /** When true, the last tool is still executing. */
   isStreaming?: boolean
@@ -130,6 +146,7 @@ export const ToolCallGroup = memo(function ToolCallGroup({
   resultMap,
   childToolCallsByParent,
   agentTaskNotifications,
+  agentTaskStatuses,
   showOpenRun = true,
   isStreaming,
 }: Props) {
@@ -153,6 +170,7 @@ export const ToolCallGroup = memo(function ToolCallGroup({
             resultMap={resultMap}
             childToolCallsByParent={childToolCallsByParent}
             agentTaskNotifications={agentTaskNotifications}
+            agentTaskStatuses={agentTaskStatuses}
             showOpenRun={showOpenRun}
             isStreaming={isStreaming}
           />
@@ -168,6 +186,7 @@ export const ToolCallGroup = memo(function ToolCallGroup({
       resultMap={resultMap}
       childToolCallsByParent={childToolCallsByParent}
       agentTaskNotifications={agentTaskNotifications}
+      agentTaskStatuses={agentTaskStatuses}
       showOpenRun={showOpenRun}
       isStreaming={isStreaming}
     />
@@ -180,6 +199,7 @@ function ToolCallGroupContent({
   resultMap,
   childToolCallsByParent,
   agentTaskNotifications,
+  agentTaskStatuses,
   showOpenRun = true,
   isStreaming,
 }: Props) {
@@ -193,8 +213,8 @@ function ToolCallGroupContent({
         resultMap={resultMap}
         childToolCallsByParent={childToolCallsByParent}
         agentTaskNotifications={agentTaskNotifications}
+        agentTaskStatuses={agentTaskStatuses}
         showOpenRun={showOpenRun}
-        isStreaming={isStreaming}
       />
     )
   }
@@ -347,8 +367,8 @@ function AgentToolGroup({
   resultMap,
   childToolCallsByParent,
   agentTaskNotifications,
+  agentTaskStatuses,
   showOpenRun = true,
-  isStreaming,
 }: Props) {
   const { expanded, toggleExpanded } = useExpandableCardState()
   const t = useTranslation()
@@ -357,9 +377,8 @@ function AgentToolGroup({
       hasResult: resultMap.has(toolCall.toolUseId),
       isError: !!resultMap.get(toolCall.toolUseId)?.isError,
       isLaunchResult: isAgentLaunchResult(resultMap.get(toolCall.toolUseId)?.content),
-      isStreaming: !!isStreaming && !resultMap.has(toolCall.toolUseId),
       childCount: (childToolCallsByParent.get(toolCall.toolUseId) ?? []).length,
-      taskStatus: agentTaskNotifications[toolCall.toolUseId]?.status,
+      taskStatus: agentTaskNotifications[toolCall.toolUseId]?.status ?? agentTaskStatuses?.[toolCall.toolUseId],
     }),
   )
   const isAnyRunning = statuses.some((status) => status === 'running' || status === 'starting')
@@ -415,8 +434,8 @@ function AgentToolGroup({
                   resultMap={resultMap}
                   childToolCallsByParent={childToolCallsByParent}
                   agentTaskNotification={agentTaskNotifications[toolCall.toolUseId]}
+                  agentTaskStatus={agentTaskStatuses?.[toolCall.toolUseId]}
                   showOpenRun={showOpenRun}
-                  isStreaming={isStreaming && !resultMap.has(toolCall.toolUseId)}
                 />
               </div>
             ))}
@@ -483,16 +502,16 @@ function AgentCallCard({
   resultMap,
   childToolCallsByParent,
   agentTaskNotification,
+  agentTaskStatus,
   showOpenRun = true,
-  isStreaming = false,
 }: {
   sessionId?: string | null
   toolCall: ToolCall
   resultMap: Map<string, ToolResult>
   childToolCallsByParent: Map<string, ToolCall[]>
   agentTaskNotification?: AgentTaskNotification
+  agentTaskStatus?: BackgroundAgentTask['status']
   showOpenRun?: boolean
-  isStreaming?: boolean
 }) {
   const [expanded, setExpanded] = useState(false)
   const [previewOpen, setPreviewOpen] = useState(false)
@@ -508,9 +527,8 @@ function AgentCallCard({
     hasResult: !!result,
     isError: !!result?.isError,
     isLaunchResult,
-    isStreaming,
     childCount: childToolCalls.length,
-    taskStatus: agentTaskNotification?.status,
+    taskStatus: agentTaskNotification?.status ?? agentTaskStatus,
   })
   const statusTone = getAgentStatusTone(status)
   const statusLabel = getAgentStatusLabel(status, t)
@@ -683,6 +701,7 @@ function ToolCallTree({
         isPending={toolCall.isPending}
         status={toolCall.status}
         partialInput={toolCall.partialInput}
+        durationMs={toolCallDurationMs(toolCall, result)}
       />
       {childToolCalls.length > 0 && (
         <div className={compact ? 'ml-4 border-l border-[var(--color-border)] pl-3' : 'mb-2 ml-16 border-l border-[var(--color-border)] pl-3'}>
@@ -808,29 +827,28 @@ function extractLineHint(text: string): string | undefined {
 }
 
 type AgentStatus = 'starting' | 'running' | 'done' | 'failed' | 'stopped'
-type AgentTaskStatus = AgentTaskNotification['status']
+type AgentTaskStatus = AgentTaskNotification['status'] | BackgroundAgentTask['status']
 
 function getAgentStatus({
   hasResult,
   isError,
   isLaunchResult,
-  isStreaming,
   childCount,
   taskStatus,
 }: {
   hasResult: boolean
   isError: boolean
   isLaunchResult: boolean
-  isStreaming: boolean
   childCount: number
   taskStatus?: AgentTaskStatus
 }): AgentStatus {
   if (taskStatus === 'failed') return 'failed'
   if (taskStatus === 'stopped') return 'stopped'
   if (taskStatus === 'completed') return 'done'
+  if (taskStatus === 'running') return 'running'
   if (hasResult && isError && !isLaunchResult) return 'failed'
   if (hasResult && !isLaunchResult) return 'done'
-  if (isStreaming || childCount > 0 || isLaunchResult) return 'running'
+  if (childCount > 0 || isLaunchResult) return 'running'
   return 'starting'
 }
 

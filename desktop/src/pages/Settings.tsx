@@ -36,12 +36,26 @@ import {
 } from '@/components/settings/SettingsSection'
 import { Dropdown } from '@/components/ui/Dropdown'
 import { Switch } from '@/components/ui/Switch'
+import { Tooltip } from '@/components/ui/Tooltip'
 import { PermissionModeSelector } from '../components/controls/PermissionModeSelector'
 import { isDarkThemeMode, isLightThemeMode } from '../types/settings'
 import type { ThemeMode, UpdateProxyMode, NetworkProxyMode, WebSearchMode, AppMode, ChatSendBehavior, OutputStyleSource } from '../types/settings'
 import type { Locale } from '../i18n'
-import type { SavedProvider, UpdateProviderInput, ProviderTestResult, ModelMapping, Model1mSupport, ApiFormat, ProviderAuthStrategy } from '../types/provider'
+import type { SavedProvider, UpdateProviderInput, ProviderTestResult, ModelMapping, Model1mSupport, ApiFormat, ProviderAuthStrategy, ProviderModelInfo, ProviderModelsErrorCode } from '../types/provider'
+import { groupProviderModels, providerModelsErrorKey } from '../lib/providerModels'
+import {
+  apply1mSupportToContextInput,
+  apply1mSupportToContextInputs,
+  getAutoCompactWindowErrorKey,
+  getModelContextWindowErrorKey,
+  MODEL_SLOTS,
+  parseAutoCompactWindowInput,
+  parseModelContextWindowsInput,
+  type ModelContextInputs,
+  type ModelSlot,
+} from '../lib/providerModelContext'
 import type { ProviderPreset } from '../types/providerPreset'
+import { normalizeProviderBaseUrl, presetMatchesBaseUrl, selectableProviderPresets } from '../config/providerPresets'
 import { AdapterSettings } from './AdapterSettings'
 import { useSessionStore } from '../stores/sessionStore'
 import { MarkdownRenderer } from '../components/markdown/MarkdownRenderer'
@@ -64,6 +78,7 @@ import { ClaudeOfficialLogin } from '../components/settings/ClaudeOfficialLogin'
 import { ChatGPTOfficialLogin } from '../components/settings/ChatGPTOfficialLogin'
 import { GrokOfficialLogin } from '../components/settings/GrokOfficialLogin'
 import { AgentManager } from '../components/settings/AgentManager'
+import { CcSwitchImportModal } from '../components/settings/CcSwitchImportModal'
 import {
   BUILT_IN_PROVIDER_IDS,
   CLAUDE_OFFICIAL_PROVIDER_ID,
@@ -228,8 +243,17 @@ export function Settings() {
         {/* Tab navigation */}
         {/* Narrow enough that the rail is not a gutter of dead space, wide
             enough that the longest label in any locale — the Japanese
-            "コンピューター操作" — still clears the truncation on TabButton. */}
-        <div className="w-[220px] flex-shrink-0 flex flex-col overflow-y-auto border-r border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-3 py-4">
+            "コンピューター操作" — still clears the truncation on TabButton.
+
+            Paper, separated by the rule, the way every other secondary panel
+            in the app is (the workbench, the diff split). It used to be
+            `--color-surface-container-low`, which is the same value the tab
+            strip's trough resolves to — so the Settings tab, the one tab whose
+            content this rail *is*, was the only selected tab in the app whose
+            paper fill met a different colour at its bottom edge. It read as a
+            white card stranded on a grey panel. Nothing else changed to fix
+            it: the tab is right, this was the odd one out. */}
+        <div className="w-[220px] flex-shrink-0 flex flex-col overflow-y-auto border-r border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-4">
           <div className="flex-1 flex flex-col gap-0.5">
             <TabButton icon="dns" label={t('settings.tab.providers')} active={activeTab === 'providers'} onClick={() => setActiveTab('providers')} />
             <TabButton icon="tune" label={t('settings.tab.general')} active={activeTab === 'general'} onClick={() => setActiveTab('general')} />
@@ -293,7 +317,9 @@ function TabButton({ icon, label, active, onClick }: { icon: string; label: stri
       ref={ref}
       onClick={onClick}
       aria-current={active ? 'page' : undefined}
-      className={`w-full flex items-center gap-3 rounded-[var(--radius-md)] px-3 py-2 text-[13.5px] text-left transition-[background-color,color] duration-150 ease-out focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-border-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--color-surface-container-low)] ${
+      // `ring-offset` has to name the rail's own fill — it is painted, not
+      // transparent, so it tracks whatever the rail is.
+      className={`w-full flex items-center gap-3 rounded-[var(--radius-md)] px-3 py-2 text-[13.5px] text-left transition-[background-color,color] duration-150 ease-out focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-border-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--color-surface)] ${
         active
           ? 'bg-[var(--color-surface-hover)] text-[var(--color-text-primary)] font-medium'
           : 'text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)]'
@@ -403,6 +429,7 @@ function ProviderSettings() {
   const t = useTranslation()
   const [editingProvider, setEditingProvider] = useState<SavedProvider | null>(null)
   const [showCreateModal, setShowCreateModal] = useState(false)
+  const [showCcSwitchImport, setShowCcSwitchImport] = useState(false)
   const [pendingDeleteProvider, setPendingDeleteProvider] = useState<SavedProvider | null>(null)
   const [isDeletingProvider, setIsDeletingProvider] = useState(false)
   const [testResults, setTestResults] = useState<Record<string, { loading: boolean; result?: ProviderTestResult }>>({})
@@ -489,13 +516,23 @@ function ProviderSettings() {
         title={t('settings.providers.title')}
         description={t('settings.providers.description')}
         action={(
-          <Button
-            size="base"
-            onClick={() => setShowCreateModal(true)}
-            icon={<span className="material-symbols-outlined text-[16px]">add</span>}
-          >
-            {t('settings.providers.addProvider')}
-          </Button>
+          <>
+            <Button
+              variant="secondary"
+              size="base"
+              onClick={() => setShowCcSwitchImport(true)}
+              icon={<span className="material-symbols-outlined text-[16px]">download</span>}
+            >
+              {t('settings.providers.ccSwitch.importButton')}
+            </Button>
+            <Button
+              size="base"
+              onClick={() => setShowCreateModal(true)}
+              icon={<span className="material-symbols-outlined text-[16px]">add</span>}
+            >
+              {t('settings.providers.addProvider')}
+            </Button>
+          </>
         )}
       />
 
@@ -656,6 +693,11 @@ function ProviderSettings() {
         <ProviderFormModal key={editingProvider.id} open={true} onClose={() => setEditingProvider(null)} mode="edit" provider={editingProvider} presets={presets} />
       )}
 
+      {/* cc-switch import — conditionally rendered so the scan reruns each time */}
+      {showCcSwitchImport && (
+        <CcSwitchImportModal open={true} onClose={() => setShowCcSwitchImport(false)} />
+      )}
+
       <ConfirmDialog
         open={pendingDeleteProvider !== null}
         onClose={() => {
@@ -785,10 +827,6 @@ function requirePreset(preset: ProviderPreset | undefined): ProviderPreset {
 const AUTO_COMPACT_WINDOW_ENV_KEY = 'CLAUDE_CODE_AUTO_COMPACT_WINDOW'
 const MODEL_CONTEXT_WINDOWS_ENV_KEY = 'CLAUDE_CODE_MODEL_CONTEXT_WINDOWS'
 const DISABLE_EXPERIMENTAL_BETAS_ENV_KEY = 'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS'
-const MODEL_CONTEXT_WINDOW_MIN = 16000
-const MODEL_CONTEXT_WINDOW_MAX = 10000000
-const MODEL_1M_CONTEXT_WINDOW = 1000000
-const MODEL_SLOTS = ['main', 'haiku', 'sonnet', 'opus'] as const
 const DEFAULT_MODEL_1M_SUPPORT: Model1mSupport = {
   main: false,
   haiku: false,
@@ -797,8 +835,6 @@ const DEFAULT_MODEL_1M_SUPPORT: Model1mSupport = {
 }
 const DEFAULT_PROVIDER_AUTH_STRATEGY: ProviderAuthStrategy = 'auth_token'
 const AUTH_ENV_KEYS = new Set(['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN'])
-type ModelSlot = typeof MODEL_SLOTS[number]
-type ModelContextInputs = Record<ModelSlot, string>
 
 function formatContextWindow(value: number): string {
   return value.toLocaleString('en-US')
@@ -860,30 +896,11 @@ function inferAuthStrategyFromEnv(env: Record<string, string>): ProviderAuthStra
   return null
 }
 
-function parseAutoCompactWindowInput(value: string): number | undefined {
-  const trimmed = value.trim()
-  if (!trimmed) return undefined
-  const parsed = Number(trimmed)
-  if (!Number.isInteger(parsed)) return undefined
-  if (parsed < MODEL_CONTEXT_WINDOW_MIN || parsed > MODEL_CONTEXT_WINDOW_MAX) return undefined
-  return parsed
-}
-
-function getAutoCompactWindowErrorKey(value: string): 'number' | 'range' | null {
-  const trimmed = value.trim()
-  if (!trimmed) return null
-  const parsed = Number(trimmed)
-  if (!Number.isInteger(parsed)) return 'number'
-  if (parsed < MODEL_CONTEXT_WINDOW_MIN || parsed > MODEL_CONTEXT_WINDOW_MAX) return 'range'
-  return null
-}
-
-function parseModelContextWindowsInput(value: string): number | undefined {
-  return parseAutoCompactWindowInput(value)
-}
-
-function getModelContextWindowErrorKey(value: string): 'number' | 'range' | null {
-  return getAutoCompactWindowErrorKey(value)
+function getPresetContextInputValue(model: string | undefined, preset: ProviderPreset): string {
+  const trimmedModel = model?.trim()
+  if (!trimmedModel) return ''
+  const value = preset.modelContextWindows?.[trimmedModel]
+  return value !== undefined ? String(value) : ''
 }
 
 function getModelContextInputValue(
@@ -893,8 +910,9 @@ function getModelContextInputValue(
 ): string {
   const trimmedModel = model?.trim()
   if (!trimmedModel) return ''
-  const value = provider?.modelContextWindows?.[trimmedModel] ?? preset.modelContextWindows?.[trimmedModel]
-  return value !== undefined ? String(value) : ''
+  const saved = provider?.modelContextWindows?.[trimmedModel]
+  if (saved !== undefined) return String(saved)
+  return getPresetContextInputValue(trimmedModel, preset)
 }
 
 function getModelContextInputs(
@@ -974,31 +992,6 @@ function applyModel1mSupportMapping(
 
 function hasAnyModel1mSupport(model1mSupport: Model1mSupport): boolean {
   return MODEL_SLOTS.some((slot) => model1mSupport[slot])
-}
-
-function shouldFill1mContextWindow(value: string): boolean {
-  const parsed = parseModelContextWindowsInput(value)
-  return parsed === undefined || parsed < MODEL_1M_CONTEXT_WINDOW
-}
-
-function apply1mSupportToContextInput(
-  inputs: ModelContextInputs,
-  slot: ModelSlot,
-  enabled: boolean,
-): ModelContextInputs {
-  if (!enabled || !shouldFill1mContextWindow(inputs[slot])) return inputs
-  return { ...inputs, [slot]: String(MODEL_1M_CONTEXT_WINDOW) }
-}
-
-function apply1mSupportToContextInputs(
-  inputs: ModelContextInputs,
-  model1mSupport: Model1mSupport,
-): ModelContextInputs {
-  let nextInputs = inputs
-  for (const slot of MODEL_SLOTS) {
-    nextInputs = apply1mSupportToContextInput(nextInputs, slot, model1mSupport[slot])
-  }
-  return nextInputs
 }
 
 function normalizeModelMapping(models: ModelMapping): ModelMapping {
@@ -1256,22 +1249,26 @@ function openExternalUrl(url: string) {
 }
 
 function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderFormProps) {
-  const { createProvider, updateProvider, testConfig } = useProviderStore()
+  const { createProvider, updateProvider, testConfig, fetchModels } = useProviderStore()
   const fetchSettings = useSettingsStore((s) => s.fetchAll)
   const t = useTranslation()
 
   const fallbackPreset = buildFallbackPreset(provider)
   const loadedPresets = presets.filter((p) => p.id !== 'official')
+  // Keeps retired presets, so editing a provider already saved against one still
+  // resolves the preset behind its presetId instead of falling back.
   const availablePresets = loadedPresets.length > 0 ? loadedPresets : [fallbackPreset]
-  const regularPresets = availablePresets.filter((p) => !p.featured)
-  const featuredPresets = availablePresets.filter((p) => p.featured)
+  // Retired presets must never be offered when adding a provider.
+  const selectablePresets = selectableProviderPresets(availablePresets)
+  const regularPresets = selectablePresets.filter((p) => !p.featured)
+  const featuredPresets = selectablePresets.filter((p) => p.featured)
   const presetDefaultEnvKeys = useMemo(
     () => presets.flatMap((preset) => Object.keys(preset.defaultEnv ?? {})),
     [presets],
   )
   const initialPreset = provider
     ? availablePresets.find((p) => p.id === provider.presetId) ?? fallbackPreset
-    : availablePresets[0] ?? fallbackPreset
+    : selectablePresets[0] ?? fallbackPreset
   const initialModels = stripModel1mMarkers(provider?.models ?? initialPreset.defaultModels)
   const initialModel1mSupport = getInitialModel1mSupport(
     provider?.models ?? initialPreset.defaultModels,
@@ -1304,10 +1301,31 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [testResult, setTestResult] = useState<ProviderTestResult | null>(null)
   const [isTesting, setIsTesting] = useState(false)
+  const [fetchedModels, setFetchedModels] = useState<ProviderModelInfo[] | null>(null)
+  const [modelsErrorCode, setModelsErrorCode] = useState<ProviderModelsErrorCode | null>(null)
+  const [modelsErrorMessage, setModelsErrorMessage] = useState<string | null>(null)
+  const [isFetchingModels, setIsFetchingModels] = useState(false)
+  const modelsRequestRef = useRef(0)
   const [settingsJson, setSettingsJson] = useState('')
   const [settingsJsonError, setSettingsJsonError] = useState<string | null>(null)
   const jsonPastedRef = useRef(false)
+  const settingsJsonUserEditedRef = useRef(false)
   const providerProxyBaseUrl = useMemo(() => getProviderProxyBaseUrl(), [])
+  const currentProviderSettings = {
+    selectedPreset,
+    baseUrl,
+    apiFormat,
+    authStrategy,
+    apiKey,
+    models,
+    model1mSupport,
+    modelContextInputs,
+    autoCompactWindow,
+    toolSearchEnabled,
+    disableExperimentalBetas,
+  }
+  const providerSettingsRef = useRef(currentProviderSettings)
+  providerSettingsRef.current = currentProviderSettings
 
   // Load current settings.json and merge provider env vars
   useEffect(() => {
@@ -1316,8 +1334,24 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
       jsonPastedRef.current = false
       return
     }
+    let cancelled = false
     import('../api/providers').then(({ providersApi }) => {
+      if (cancelled) return
       providersApi.getSettings().then((settings) => {
+        if (cancelled || settingsJsonUserEditedRef.current) return
+        const {
+          selectedPreset,
+          baseUrl,
+          apiFormat,
+          authStrategy,
+          apiKey,
+          models,
+          model1mSupport,
+          modelContextInputs,
+          autoCompactWindow,
+          toolSearchEnabled,
+          disableExperimentalBetas,
+        } = providerSettingsRef.current
         const needsProxy = apiFormat !== 'anthropic'
         const autoCompactWindowEnv = autoCompactWindow.trim()
         const modelContextWindows = buildModelContextWindows(models, modelContextInputs)
@@ -1349,13 +1383,33 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
         }
         setSettingsJson(JSON.stringify(merged, null, 2))
       }).catch(() => {
-        setSettingsJson(JSON.stringify({}, null, 2))
+        if (!cancelled && !settingsJsonUserEditedRef.current) {
+          setSettingsJson((current) => current.trim() ? current : JSON.stringify({}, null, 2))
+        }
       })
     })
+    return () => {
+      cancelled = true
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedPreset.id, providerProxyBaseUrl])
 
+  // A fetched list only describes the endpoint and key it came from. cc-switch
+  // shipped this without a guard and kept offering the previous provider's
+  // models after the user pasted a new key, which reads as the picker lying.
+  useEffect(() => {
+    // Bumping the token also disowns a probe that is still in flight: it walks
+    // up to three candidate endpoints at 15s each, so it can easily outlive the
+    // edit and re-fill the picker with the previous credentials' models.
+    modelsRequestRef.current += 1
+    setFetchedModels(null)
+    setModelsErrorCode(null)
+    setModelsErrorMessage(null)
+    setIsFetchingModels(false)
+  }, [baseUrl, apiKey])
+
   const handlePresetChange = (preset: ProviderPreset) => {
+    settingsJsonUserEditedRef.current = false
     setSelectedPreset(preset)
     setName(preset.name)
     setBaseUrl(preset.baseUrl)
@@ -1382,11 +1436,35 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
   const autoCompactWindowErrorKey = getAutoCompactWindowErrorKey(autoCompactWindow)
   const modelContextWindowErrorSlots = MODEL_SLOTS.filter((slot) => getModelContextWindowErrorKey(modelContextInputs[slot]))
   const canSubmit = name.trim() && baseUrl.trim() && (mode === 'edit' || !requiresApiKey || apiKey.trim()) && models.main.trim() && !settingsJsonError && !autoCompactWindowErrorKey && modelContextWindowErrorSlots.length === 0
-  const apiKeyUrl = selectedPreset.apiKeyUrl?.trim()
-  const promoText = selectedPreset.promoText?.trim()
+  const normalizedBaseUrl = normalizeProviderBaseUrl(baseUrl)
+  const isPresetDefaultEndpoint = normalizedBaseUrl === normalizeProviderBaseUrl(selectedPreset.baseUrl)
+  const apiKeyUrl = isPresetDefaultEndpoint ? selectedPreset.apiKeyUrl?.trim() : undefined
+  const promoText = isPresetDefaultEndpoint ? selectedPreset.promoText?.trim() : undefined
   const displayedSettingsJson = showApiKey
     ? settingsJson
     : maskSettingsJsonSecrets(settingsJson)
+  const regionalEndpointItems = (selectedPreset.regionalEndpoints ?? []).map((endpoint) => ({
+    value: endpoint.baseUrl,
+    label: endpoint.region === 'cn_zh'
+      ? t('settings.providers.regionChina')
+      : endpoint.region === 'global_en'
+        ? t('settings.providers.regionGlobal')
+        : endpoint.region,
+    description: endpoint.baseUrl,
+    icon: (
+      <span className="material-symbols-outlined text-[17px]">
+        {endpoint.region === 'cn_zh' ? 'location_on' : endpoint.region === 'global_en' ? 'public' : 'link'}
+      </span>
+    ),
+  }))
+  const selectedRegionalEndpointUrl = regionalEndpointItems.find(
+    (option) => normalizeProviderBaseUrl(option.value) === normalizedBaseUrl,
+  )?.value ?? ''
+  // A hand-typed or pasted baseUrl may match no regional endpoint; the old
+  // native select went blank there, but the Dropdown trigger needs real text.
+  const selectedRegionalEndpointLabel = regionalEndpointItems.find(
+    (item) => item.value === selectedRegionalEndpointUrl,
+  )?.label ?? t('settings.providers.regionCustom')
   const apiFormatItems = [
     {
       value: 'anthropic' as const,
@@ -1499,6 +1577,9 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
       nextInputs,
       slot,
       nextModel1mSupport[slot],
+      // The field was just re-derived for the new model id, so there is nothing
+      // left over from a previous 1M tick to revert.
+      nextInputs[slot],
     )
     setModels(nextModels)
     setModel1mSupport(nextModel1mSupport)
@@ -1510,7 +1591,15 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
   }
   const handleModel1mSupportChange = (slot: ModelSlot, enabled: boolean) => {
     const nextModel1mSupport = { ...model1mSupport, [slot]: enabled }
-    const nextInputs = apply1mSupportToContextInput(modelContextInputs, slot, enabled)
+    // Rolls back to the preset window rather than the saved provider one: a
+    // provider saved while the box was ticked already holds the 1,000,000 the
+    // user is now taking back.
+    const nextInputs = apply1mSupportToContextInput(
+      modelContextInputs,
+      slot,
+      enabled,
+      getPresetContextInputValue(models[slot], selectedPreset),
+    )
     setModel1mSupport(nextModel1mSupport)
     setModelContextInputs(nextInputs)
     setSettingsJson((current) => updateSettingsJsonModelContextWindows(
@@ -1526,6 +1615,58 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
       buildModelContextWindows(models, nextInputs),
     ))
   }
+  const canFetchModels = Boolean(baseUrl.trim() && apiKey.trim())
+  const handleFetchModels = async () => {
+    if (!canFetchModels || isFetchingModels) return
+    const requestId = modelsRequestRef.current + 1
+    modelsRequestRef.current = requestId
+    setIsFetchingModels(true)
+    setModelsErrorCode(null)
+    setModelsErrorMessage(null)
+    try {
+      // Upstream failures arrive as a resolved `ok: false`, so the catch below
+      // only covers our own server being unreachable.
+      const result = await fetchModels({ baseUrl: baseUrl.trim(), apiKey: apiKey.trim() })
+      // The form moved on while we were probing — this answer describes a base
+      // URL or key the user no longer has typed in.
+      if (modelsRequestRef.current !== requestId) return
+      if (result.ok) {
+        setFetchedModels(result.models)
+      } else {
+        setFetchedModels(null)
+        setModelsErrorCode(result.errorCode)
+        setModelsErrorMessage(result.message?.trim() || null)
+      }
+    } catch {
+      if (modelsRequestRef.current !== requestId) return
+      setFetchedModels(null)
+      setModelsErrorCode('unknown')
+      setModelsErrorMessage(null)
+    } finally {
+      // The config-change effect already cleared the flag for a discarded
+      // request; clearing it again here would race a newer fetch.
+      if (modelsRequestRef.current === requestId) setIsFetchingModels(false)
+    }
+  }
+  const modelsErrorText = modelsErrorCode ? t(providerModelsErrorKey(modelsErrorCode)) : null
+  // The server keeps the upstream's own wording, which is the only thing that
+  // separates a 200-cloaked auth failure (智谱 answers `{"msg":"身份验证失败。"}`
+  // with HTTP 200, classified `not-supported`) from a provider that genuinely
+  // publishes no model list. Display-only: nothing branches on this text.
+  const modelsErrorUpstream = modelsErrorMessage && modelsErrorMessage !== modelsErrorText
+    ? modelsErrorMessage
+    : null
+  const modelPickerItems = useMemo(
+    () => groupProviderModels(
+      fetchedModels ?? [],
+      t('settings.providers.fetchModelsGroupOther'),
+    ).flatMap((group) => group.models.map((model) => ({
+      value: model.id,
+      label: model.id,
+      description: group.group,
+    }))),
+    [fetchedModels, t],
+  )
   const renderPresetButton = (preset: ProviderPreset) => (
     <SettingsPill
       key={preset.id}
@@ -1614,12 +1755,13 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
     setTestResult(null)
     try {
       let result: ProviderTestResult
-      if (mode === 'edit' && provider && !apiKey.trim()) {
+      const savedConfigUnchanged = mode === 'edit' && provider && !apiKey.trim() &&
+        baseUrl.trim() === provider.baseUrl.trim() &&
+        apiFormat === provider.apiFormat &&
+        authStrategy === provider.authStrategy
+      if (savedConfigUnchanged && provider) {
         result = await useProviderStore.getState().testProvider(provider.id, {
-          baseUrl: baseUrl.trim(),
           modelId: models.main.trim(),
-          apiFormat,
-          authStrategy,
         })
       } else {
         if (requiresApiKey && !apiKey.trim()) return
@@ -1675,6 +1817,26 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
         <Input label={t('settings.providers.name')} required value={name} onChange={(e) => setName(e.target.value)} placeholder={t('settings.providers.namePlaceholder')} />
 
         <Input label={t('settings.providers.notes')} value={notes} onChange={(e) => setNotes(e.target.value)} placeholder={t('settings.providers.notesPlaceholder')} />
+
+        {regionalEndpointItems.length > 1 && (
+          <div>
+            <label className="text-sm font-medium text-[var(--color-text-primary)] mb-1 block">{t('settings.providers.endpointRegion')}</label>
+            <Dropdown<string>
+              items={regionalEndpointItems}
+              value={selectedRegionalEndpointUrl}
+              onChange={handleBaseUrlChange}
+              label={t('settings.providers.endpointRegion')}
+              width="100%"
+              className="block w-full"
+              trigger={
+                <Button variant="secondary" size="md" block className="h-10 gap-3">
+                  <span className="min-w-0 flex-1 truncate text-left">{selectedRegionalEndpointLabel}</span>
+                  <span className="material-symbols-outlined flex-shrink-0 text-[18px] text-[var(--color-text-secondary)]">expand_more</span>
+                </Button>
+              }
+            />
+          </div>
+        )}
 
         <Input label={t('settings.providers.baseUrl')} required value={baseUrl} onChange={(e) => handleBaseUrlChange(e.target.value)} placeholder={t('settings.providers.baseUrlPlaceholder')} className="font-mono text-[13px]" />
 
@@ -1830,7 +1992,37 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
 
         {/* Model Mapping */}
         <div>
-          <label className="text-sm font-medium text-[var(--color-text-primary)] mb-2 block">{t('settings.providers.modelMapping')}</label>
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <label className="text-sm font-medium text-[var(--color-text-primary)]">{t('settings.providers.modelMapping')}</label>
+            <Button
+              variant="secondary"
+              size="base"
+              onClick={handleFetchModels}
+              disabled={!canFetchModels}
+              loading={isFetchingModels}
+              icon={<span className="material-symbols-outlined text-[15px]">cloud_download</span>}
+            >
+              {t('settings.providers.fetchModels')}
+            </Button>
+          </div>
+          {!canFetchModels ? (
+            <p className="mb-2 text-[11px] text-[var(--color-text-tertiary)]">{t('settings.providers.fetchModelsHint')}</p>
+          ) : modelsErrorCode ? (
+            <div role="alert" className="mb-2 flex flex-col gap-0.5">
+              <p className="text-[11px] text-[var(--color-error)]">{modelsErrorText}</p>
+              {modelsErrorUpstream && (
+                <p className="break-words text-[11px] text-[var(--color-text-tertiary)]">
+                  {t('settings.providers.fetchModelsErrorUpstream')} {modelsErrorUpstream}
+                </p>
+              )}
+            </div>
+          ) : fetchedModels && fetchedModels.length === 0 ? (
+            <p className="mb-2 text-[11px] text-[var(--color-text-tertiary)]">{t('settings.providers.fetchModelsEmpty')}</p>
+          ) : fetchedModels ? (
+            <p className="mb-2 text-[11px] text-[var(--color-text-secondary)]">
+              {t('settings.providers.fetchModelsLoaded', { count: fetchedModels.length })}
+            </p>
+          ) : null}
           <div className="grid grid-cols-2 gap-2">
             {MODEL_SLOTS.map((slot) => {
               const labelKey = slot === 'main'
@@ -1841,29 +2033,50 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
                     ? 'settings.providers.sonnetModel'
                     : 'settings.providers.opusModel'
               const label = t(labelKey)
+              const pickLabel = t('settings.providers.fetchModelsPick', { label })
               return (
                 <div key={slot} className="min-w-0">
-                  <Input
-                    label={label}
-                    required={slot === 'main'}
-                    value={models[slot]}
-                    onChange={(e) => handleModelChange(slot, e.target.value)}
-                    placeholder={slot === 'main' ? t('settings.providers.modelIdPlaceholder') : t('settings.providers.sameAsMain')}
-                  />
-                  <label className="mt-1 inline-flex h-6 w-fit cursor-pointer items-center gap-1.5 rounded-[var(--radius-sm)] px-1 text-xs text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)]">
-                    <input
-                      type="checkbox"
-                      checked={model1mSupport[slot]}
-                      onChange={(e) => handleModel1mSupportChange(slot, e.target.checked)}
-                      aria-label={`1M support: ${slot}`}
-                      className="h-3.5 w-3.5 rounded border-[var(--color-border)] text-[var(--color-brand)] accent-[var(--color-brand)] focus:ring-[var(--color-brand)]"
+                  <div className="flex items-end gap-1.5">
+                    <Input
+                      containerClassName="min-w-0 flex-1"
+                      label={label}
+                      required={slot === 'main'}
+                      value={models[slot]}
+                      onChange={(e) => handleModelChange(slot, e.target.value)}
+                      placeholder={slot === 'main' ? t('settings.providers.modelIdPlaceholder') : t('settings.providers.sameAsMain')}
                     />
-                    <span>{t('settings.providers.model1mSupportShort')}</span>
-                  </label>
+                    {/* The picker only supplements the field — the id stays typeable. */}
+                    {modelPickerItems.length > 0 && (
+                      <Dropdown<string>
+                        items={modelPickerItems}
+                        value={models[slot]}
+                        onChange={(value) => handleModelChange(slot, value)}
+                        label={pickLabel}
+                        align="right"
+                        maxHeight={260}
+                        trigger={<IconButton icon="expand_more" label={pickLabel} size="xl" tone="secondary" bordered />}
+                      />
+                    )}
+                  </div>
+                  <Tooltip content={t('settings.providers.model1mSupportTooltip')} placement="bottom-start">
+                    <label className="mt-1 inline-flex h-6 w-fit cursor-pointer items-center gap-1.5 rounded-[var(--radius-sm)] px-1 text-xs text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)]">
+                      <input
+                        type="checkbox"
+                        checked={model1mSupport[slot]}
+                        onChange={(e) => handleModel1mSupportChange(slot, e.target.checked)}
+                        aria-label={`1M support: ${slot}`}
+                        className="h-3.5 w-3.5 rounded border-[var(--color-border)] text-[var(--color-brand)] accent-[var(--color-brand)] focus:ring-[var(--color-brand)]"
+                      />
+                      <span>{t('settings.providers.model1mSupportShort')}</span>
+                    </label>
+                  </Tooltip>
                 </div>
               )
             })}
           </div>
+          <p className="mt-2 text-[11px] leading-5 text-[var(--color-text-tertiary)]">
+            {t('settings.providers.model1mSupportHint')}
+          </p>
         </div>
 
         <div className="rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-surface-container-low)]">
@@ -1985,6 +2198,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
           <textarea
             value={displayedSettingsJson}
             onChange={(e) => {
+              settingsJsonUserEditedRef.current = true
               const raw = e.target.value
               try {
                 const parsed = restoreSettingsJsonSecrets(JSON.parse(raw), settingsJson, apiKey)
@@ -1993,13 +2207,16 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
                 // Auto-fill form fields from parsed JSON env
                 const env = parsed.env as Record<string, string> | undefined
                 if (env) {
-                  if (env.ANTHROPIC_BASE_URL) {
-                    setBaseUrl(env.ANTHROPIC_BASE_URL)
+                  const baseUrl = env.ANTHROPIC_BASE_URL
+                  if (baseUrl) {
+                    setBaseUrl(baseUrl)
                     // Auto-switch to matching preset or Custom
                     if (mode === 'create') {
-                      const matchedPreset = availablePresets.find((p) => p.id !== 'custom' && p.baseUrl === env.ANTHROPIC_BASE_URL)
+                      const matchedPreset = selectablePresets.find(
+                        (preset) => preset.id !== 'custom' && presetMatchesBaseUrl(preset, baseUrl),
+                      )
                       const targetPreset = requirePreset(
-                        matchedPreset ?? availablePresets.find((p) => p.id === 'custom'),
+                        matchedPreset ?? selectablePresets.find((p) => p.id === 'custom'),
                       )
                       if (targetPreset.id !== selectedPreset.id) {
                         jsonPastedRef.current = true

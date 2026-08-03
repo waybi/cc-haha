@@ -203,8 +203,18 @@ const updateCheckOptions: Validator = value => {
   return value.proxy === undefined || (typeof value.proxy === 'string' && value.proxy.trim().length > 0)
 }
 
+const localePreference: Validator = value =>
+  value === 'en'
+  || value === 'zh'
+  || value === 'zh-TW'
+  || value === 'jp'
+  || value === 'kr'
+
 export const ELECTRON_IPC_VALIDATORS = {
   [ELECTRON_IPC_CHANNELS.appGetVersion]: noPayload,
+  [ELECTRON_IPC_CHANNELS.appGetLocalePreference]: noPayload,
+  [ELECTRON_IPC_CHANNELS.appSetLocalePreference]: localePreference,
+  [ELECTRON_IPC_CHANNELS.appGetPreferredSystemLanguages]: noPayload,
   [ELECTRON_IPC_CHANNELS.runtimeGetServerUrl]: noPayload,
   [ELECTRON_IPC_CHANNELS.runtimeGetLocalAccessToken]: noPayload,
   [ELECTRON_IPC_CHANNELS.runtimeGetPetAccessToken]: noPayload,
@@ -274,6 +284,8 @@ const allowedChannels = new Set<ElectronIpcChannel>(
 )
 
 const petWindowChannels = new Set<ElectronIpcChannel>([
+  ELECTRON_IPC_CHANNELS.appGetLocalePreference,
+  ELECTRON_IPC_CHANNELS.appGetPreferredSystemLanguages,
   ELECTRON_IPC_CHANNELS.runtimeGetServerUrl,
   ELECTRON_IPC_CHANNELS.runtimeGetPetAccessToken,
   ELECTRON_IPC_CHANNELS.petsList,

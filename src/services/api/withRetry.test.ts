@@ -3,6 +3,7 @@ import type Anthropic from '@anthropic-ai/sdk'
 import { APIConnectionError, APIError } from '@anthropic-ai/sdk'
 import { _resetKeepAliveForTesting, getProxyFetchOptions } from '../../utils/proxy.js'
 import {
+  CannotRetryError,
   getMaxStreamTransientRetries,
   isRetryableStreamError,
   isRetryableStreamTransportError,
@@ -52,6 +53,145 @@ describe('withRetry stale connections', () => {
     expect(attempts).toBe(2)
     expect(getProxyFetchOptions().keepalive).toBe(false)
     _resetKeepAliveForTesting()
+  })
+})
+
+describe('withRetry context overflow recovery', () => {
+  test('uses the available context even when the thinking budget is larger', async () => {
+    const overrides: Array<number | undefined> = []
+    const overflowMessage =
+      'input length and `max_tokens` exceed context limit: 190000 + 20000 > 200000'
+    const overflow = new APIError(
+      400,
+      {
+        type: 'error',
+        error: {
+          type: 'invalid_request_error',
+          message: overflowMessage,
+        },
+      },
+      overflowMessage,
+      undefined,
+    )
+
+    const generator = withRetry(
+      async () => ({} as Anthropic),
+      async (_client, attempt, context) => {
+        overrides.push(context.maxTokensOverride)
+        if (attempt === 1) {
+          throw overflow
+        }
+        return 'ok'
+      },
+      {
+        model: 'claude-opus-4-7',
+        thinkingConfig: { type: 'enabled', budgetTokens: 20_000 },
+        maxRetries: 1,
+      },
+    )
+
+    let finalValue: string | undefined
+    for (;;) {
+      const next = await generator.next()
+      if (next.done) {
+        finalValue = next.value
+        break
+      }
+    }
+
+    expect(finalValue).toBe('ok')
+    expect(overrides).toEqual([undefined, 9_000])
+  })
+
+  test('stops when the provider repeats the same overflow after adjustment', async () => {
+    let attempts = 0
+    const overflowMessage =
+      'input length and `max_tokens` exceed context limit: 190000 + 20000 > 200000'
+    const overflow = new APIError(
+      400,
+      {
+        type: 'error',
+        error: {
+          type: 'invalid_request_error',
+          message: overflowMessage,
+        },
+      },
+      overflowMessage,
+      undefined,
+    )
+
+    const generator = withRetry(
+      async () => ({} as Anthropic),
+      async () => {
+        attempts += 1
+        throw overflow
+      },
+      {
+        model: 'claude-opus-4-7',
+        thinkingConfig: { type: 'disabled' },
+        maxRetries: 5,
+      },
+    )
+
+    let thrown: unknown
+    try {
+      while (!(await generator.next()).done) {
+        // Drain retry status messages until the generator terminates.
+      }
+    } catch (error) {
+      thrown = error
+    }
+
+    expect(thrown).toBeInstanceOf(CannotRetryError)
+    expect((thrown as CannotRetryError).originalError).toBe(overflow)
+    expect((thrown as CannotRetryError).retryContext.maxTokensOverride).toBe(
+      9_000,
+    )
+    expect(attempts).toBe(2)
+  })
+})
+
+describe('context overflow wrapped in 401 (#1162)', () => {
+  test('does not retry when a gateway reports overflow as a 401', async () => {
+    let attempts = 0
+    const message = 'k3-256k supports only 256K context.'
+    const overflow401 = new APIError(
+      401,
+      {
+        type: 'error',
+        error: { type: 'authentication_error', message },
+      },
+      message,
+      undefined,
+    )
+
+    const generator = withRetry(
+      async () => ({} as Anthropic),
+      async () => {
+        attempts += 1
+        throw overflow401
+      },
+      {
+        model: 'k3-256k',
+        thinkingConfig: { type: 'disabled' },
+        maxRetries: 5,
+      },
+    )
+
+    let thrown: unknown
+    try {
+      while (!(await generator.next()).done) {
+        // Drain retry status messages until the generator terminates.
+      }
+    } catch (error) {
+      thrown = error
+    }
+
+    // Retrying replays the same oversized prompt — it must fail fast instead
+    // of burning through 10 attempts against an unrecoverable rejection.
+    expect(thrown).toBeInstanceOf(CannotRetryError)
+    expect((thrown as CannotRetryError).originalError).toBe(overflow401)
+    expect(attempts).toBe(1)
   })
 })
 

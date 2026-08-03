@@ -68,6 +68,7 @@ import type {
 } from './localIndex/sessionIndex.js'
 import type { LocalIndexStatus } from './localIndex/types.js'
 import { diagnosticsService } from './diagnosticsService.js'
+import { isForkInheritedUsageRecord } from '../../utils/usageAccounting.js'
 
 // ============================================================================
 // Types
@@ -286,6 +287,7 @@ type RawEntry = {
   parent_tool_use_id?: string | null
   isSidechain?: boolean
   isMeta?: boolean
+  forkedFrom?: unknown
   cwd?: string
   message?: {
     role?: string
@@ -440,6 +442,17 @@ function getSharedSessionMutationState(
 
 export class SessionService {
   private providerService = new ProviderService()
+  private readonly pendingTaskNotificationWrites = new Map<
+    string,
+    Set<{
+      controller: AbortController
+      promise: Promise<void>
+      notification: SessionTaskNotification
+      persisted: boolean
+    }>
+  >()
+  private readonly taskNotificationMutationEpochs = new Map<string, number>()
+  private readonly clearingTaskNotificationSessions = new Set<string>()
 
   private readonly localIndexGateway: LocalIndexGateway
   private readonly now: () => number
@@ -1254,8 +1267,20 @@ export class SessionService {
     }
   }
 
-  private async appendJsonlEntry(filePath: string, entry: Record<string, unknown>): Promise<void> {
+  private async appendJsonlEntry(
+    filePath: string,
+    entry: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<void> {
     const line = JSON.stringify(entry) + '\n'
+    if (signal) {
+      await fs.writeFile(filePath, line, {
+        encoding: 'utf-8',
+        flag: 'a',
+        signal,
+      })
+      return
+    }
     await fs.appendFile(filePath, line, 'utf-8')
   }
 
@@ -1481,7 +1506,9 @@ export class SessionService {
       type = 'system'
     }
 
-    const usage = normalizeMessageUsage(msg.usage)
+    const usage = isForkInheritedUsageRecord(entry)
+      ? undefined
+      : normalizeMessageUsage(msg.usage)
 
     return {
       id: entry.uuid || crypto.randomUUID(),
@@ -1784,10 +1811,18 @@ export class SessionService {
     return (content as ContentBlock[]).map((block) => {
       if (!block || typeof block !== 'object') return block
       if (block.type === 'tool_use' && typeof block.id === 'string') {
-        return { ...block, id: `${namespace}/${block.id}` }
+        return {
+          ...block,
+          id: `${namespace}/${block.id}`,
+          original_tool_use_id: block.id,
+        }
       }
       if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
-        return { ...block, tool_use_id: `${namespace}/${block.tool_use_id}` }
+        return {
+          ...block,
+          tool_use_id: `${namespace}/${block.tool_use_id}`,
+          original_tool_use_id: block.tool_use_id,
+        }
       }
       return block
     })
@@ -2546,6 +2581,7 @@ export class SessionService {
 
     for (const entry of entries) {
       currentRuntimeHint = this.applyRuntimeContextMetadata(currentRuntimeHint, entry)
+      if (isForkInheritedUsageRecord(entry)) continue
       const usage = entry.message?.usage
       const model = entry.message?.model
       if (!usage || typeof model !== 'string') continue
@@ -2782,6 +2818,10 @@ export class SessionService {
         cacheReadInputTokens,
         cacheCreationInputTokens,
       }
+
+      // Inherited fork history still describes the current context, but its API usage belongs to
+      // the source session and must not be included in this fork's cumulative usage or cost.
+      if (isForkInheritedUsageRecord(entry)) return
 
       if (
         inputTokens === 0 &&
@@ -3712,58 +3752,83 @@ export class SessionService {
     fallbackWorkDir?: string,
     preservedPermissionMode?: string,
   ): Promise<void> {
-    let found = await this.findSessionFile(sessionId)
-    if (!found && fallbackWorkDir) {
-      const resolvedPath = path.resolve(normalizeDriveRootPathForPlatform(fallbackWorkDir))
-      const absWorkDir = await fs.realpath(resolvedPath).catch(() => resolvedPath)
-      const dirPath = path.join(this.getProjectsDir(), this.sanitizePath(absWorkDir))
-      await fs.mkdir(dirPath, { recursive: true })
-      found = {
-        filePath: path.join(dirPath, `${sessionId}.jsonl`),
-        projectDir: this.sanitizePath(absWorkDir),
+    const nextEpoch = (this.taskNotificationMutationEpochs.get(sessionId) ?? 0) + 1
+    this.taskNotificationMutationEpochs.set(sessionId, nextEpoch)
+    this.clearingTaskNotificationSessions.add(sessionId)
+    const pendingWrites = [...(this.pendingTaskNotificationWrites.get(sessionId) ?? [])]
+    for (const pending of pendingWrites) pending.controller.abort()
+
+    try {
+      await Promise.allSettled(pendingWrites.map((pending) => pending.promise))
+
+      let found = await this.findSessionFile(sessionId)
+      if (!found && fallbackWorkDir) {
+        const resolvedPath = path.resolve(normalizeDriveRootPathForPlatform(fallbackWorkDir))
+        const absWorkDir = await fs.realpath(resolvedPath).catch(() => resolvedPath)
+        const dirPath = path.join(this.getProjectsDir(), this.sanitizePath(absWorkDir))
+        await fs.mkdir(dirPath, { recursive: true })
+        found = {
+          filePath: path.join(dirPath, `${sessionId}.jsonl`),
+          projectDir: this.sanitizePath(absWorkDir),
+        }
       }
-    }
-    if (!found) {
-      throw ApiError.notFound(`Session not found: ${sessionId}`)
-    }
+      if (!found) {
+        throw ApiError.notFound(`Session not found: ${sessionId}`)
+      }
 
-    const entries = await this.readJsonlFile(found.filePath)
-    const workDir = this.resolveWorkDirFromEntries(entries, found.projectDir) || fallbackWorkDir || process.cwd()
-    const repository = this.resolveRepositoryFromEntries(entries)
-    const permissionMode = (
-      preservedPermissionMode &&
-      VALID_SESSION_PERMISSION_MODES.has(preservedPermissionMode)
-    )
-      ? preservedPermissionMode
-      : this.resolvePermissionModeFromEntries(entries)
-    const now = new Date().toISOString()
+      const entries = await this.readJsonlFile(found.filePath)
+      const workDir = this.resolveWorkDirFromEntries(entries, found.projectDir) || fallbackWorkDir || process.cwd()
+      const repository = this.resolveRepositoryFromEntries(entries)
+      const permissionMode = (
+        preservedPermissionMode &&
+        VALID_SESSION_PERMISSION_MODES.has(preservedPermissionMode)
+      )
+        ? preservedPermissionMode
+        : this.resolvePermissionModeFromEntries(entries)
+      const now = new Date().toISOString()
 
-    const initialEntry = {
-      type: 'file-history-snapshot',
-      messageId: crypto.randomUUID(),
-      snapshot: {
+      const initialEntry = {
+        type: 'file-history-snapshot',
         messageId: crypto.randomUUID(),
-        trackedFileBackups: {},
+        snapshot: {
+          messageId: crypto.randomUUID(),
+          trackedFileBackups: {},
+          timestamp: now,
+        },
+        isSnapshotUpdate: false,
+      }
+
+      const metaEntry = {
+        type: 'session-meta',
+        isMeta: true,
+        workDir,
+        repository,
+        ...(permissionMode ? { permissionMode } : {}),
         timestamp: now,
-      },
-      isSnapshotUpdate: false,
-    }
+      }
 
-    const metaEntry = {
-      type: 'session-meta',
-      isMeta: true,
-      workDir,
-      repository,
-      ...(permissionMode ? { permissionMode } : {}),
-      timestamp: now,
+      await fs.writeFile(
+        found.filePath,
+        `${JSON.stringify(initialEntry)}\n${JSON.stringify(metaEntry)}\n`,
+        'utf-8',
+      )
+      this.invalidateSessionListCache()
+    } catch (error) {
+      // Clear aborts old-generation appends so none can land after a successful
+      // transcript replacement. If replacement itself fails, restore any
+      // terminal notification that the barrier interrupted; otherwise a
+      // previously persisted running Agent can reappear after restart.
+      this.clearingTaskNotificationSessions.delete(sessionId)
+      await Promise.allSettled(
+        pendingWrites
+          .filter((pending) => !pending.persisted)
+          .map((pending) =>
+            this.appendSessionTaskNotification(sessionId, pending.notification)),
+      )
+      throw error
+    } finally {
+      this.clearingTaskNotificationSessions.delete(sessionId)
     }
-
-    await fs.writeFile(
-      found.filePath,
-      `${JSON.stringify(initialEntry)}\n${JSON.stringify(metaEntry)}\n`,
-      'utf-8',
-    )
-    this.invalidateSessionListCache()
   }
 
   async appendSessionMetadata(
@@ -3979,17 +4044,50 @@ export class SessionService {
       notification.timestamp ?? new Date(this.now()).toISOString(),
     )
     if (!normalized) return
+    if (this.clearingTaskNotificationSessions.has(sessionId)) return
 
-    const found = await this.findSessionFile(sessionId)
-    if (!found) return
+    const epoch = this.taskNotificationMutationEpochs.get(sessionId) ?? 0
+    const controller = new AbortController()
+    const pending = {
+      controller,
+      promise: Promise.resolve(),
+      notification: normalized,
+      persisted: false,
+    }
+    const write = (async () => {
+      const found = await this.findSessionFile(sessionId)
+      if (
+        !found ||
+        controller.signal.aborted ||
+        this.clearingTaskNotificationSessions.has(sessionId) ||
+        (this.taskNotificationMutationEpochs.get(sessionId) ?? 0) !== epoch
+      ) {
+        return
+      }
 
-    await this.appendJsonlEntry(found.filePath, {
-      type: PERSISTED_TASK_NOTIFICATION_ENTRY_TYPE,
-      isMeta: true,
-      taskNotification: normalized,
-      timestamp: normalized.timestamp,
-    })
-    this.invalidateSessionListCache()
+      await this.appendJsonlEntry(found.filePath, {
+        type: PERSISTED_TASK_NOTIFICATION_ENTRY_TYPE,
+        isMeta: true,
+        taskNotification: normalized,
+        timestamp: normalized.timestamp,
+      }, controller.signal)
+      pending.persisted = true
+      this.invalidateSessionListCache()
+    })()
+    pending.promise = write
+
+    let writes = this.pendingTaskNotificationWrites.get(sessionId)
+    if (!writes) {
+      writes = new Set()
+      this.pendingTaskNotificationWrites.set(sessionId, writes)
+    }
+    writes.add(pending)
+    try {
+      await write
+    } finally {
+      writes.delete(pending)
+      if (writes.size === 0) this.pendingTaskNotificationWrites.delete(sessionId)
+    }
   }
 
   async getSessionTaskNotifications(

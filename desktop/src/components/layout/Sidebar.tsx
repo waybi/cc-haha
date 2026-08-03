@@ -672,7 +672,7 @@ export function Sidebar({ isMobile = false, onRequestClose }: SidebarProps) {
       <div
         data-testid="sidebar-title-region"
         data-desktop-drag-region
-        className={`sidebar-title-region px-3 pb-2 ${isDesktopRuntime && !isWindows ? 'pt-[44px]' : 'pt-3'}`}
+        className={`px-3 pb-2 ${isDesktopRuntime && !isWindows ? 'pt-[44px]' : 'pt-3'}`}
       >
         <div className={`flex ${expanded ? 'items-center justify-between gap-3' : 'flex-col items-center gap-2'}`}>
           {/* The mark only stands in for the wordmark on the rail. Expanded,
@@ -686,21 +686,15 @@ export function Sidebar({ isMobile = false, onRequestClose }: SidebarProps) {
               Collapsed, the mark is centered on the rail instead. */}
           <div className={`flex min-w-0 items-center ${expanded ? 'gap-2.5 pl-3' : 'justify-center'}`}>
             {!expanded ? <BrandSeal size="sm" /> : null}
-            {/* Two forms of one wordmark. Drag the sidebar under ~256px and
-                "Claude Code Haha" stops fitting; rather than clip it mid-letter
-                the header falls back to the short form the repo already goes
-                by. The swap is a container query on the title region — see
-                `.sidebar-wordmark-*` in globals.css. */}
+            {/* One form, at every width. The header used to carry "Claude Code
+                Haha" and swap to this below ~230px of title region, which meant
+                the app answered to two names depending on how the sidebar was
+                dragged. It goes by the short one. */}
             <span
               className={`sidebar-copy ${expanded ? 'sidebar-copy--visible' : 'sidebar-copy--hidden'} text-base font-bold tracking-tight text-[var(--color-text-primary)]`}
               style={{ fontFamily: 'var(--font-headline)' }}
             >
-              <span className="sidebar-wordmark-long">
-                Claude Code <span className="text-[var(--color-brand)]">Haha</span>
-              </span>
-              <span className="sidebar-wordmark-short">
-                cc-<span className="text-[var(--color-brand)]">haha</span>
-              </span>
+              cc-<span className="text-[var(--color-brand)]">haha</span>
             </span>
           </div>
           <div className={`flex items-center ${expanded ? 'gap-1.5' : 'flex-col gap-2'}`}>
@@ -1053,7 +1047,7 @@ export function Sidebar({ isMobile = false, onRequestClose }: SidebarProps) {
                       </div>
                     </div>
                     {!projectCollapsed && (
-                      <div className="mt-0.5 pl-6">
+                      <div className="mt-0.5 pl-5">
                         <div
                           className={hasInternalScroll ? 'max-h-[420px] overflow-y-auto pr-1' : undefined}
                           data-testid={`sidebar-project-session-list-${domSafeProjectKey(project.key)}`}
@@ -1092,7 +1086,7 @@ export function Sidebar({ isMobile = false, onRequestClose }: SidebarProps) {
                                   }}
                                   onContextMenu={(e) => handleContextMenu(e, session.id)}
                                   className={`
-                                    group/session w-full rounded-[var(--radius-md)] px-2.5 ${isMobile ? 'py-3' : 'py-1.5'} text-left text-[13px] transition-[background,filter,color,box-shadow] duration-200
+                                    group/session w-full rounded-[var(--radius-md)] px-2 ${isMobile ? 'py-3' : 'py-1.5'} text-left text-[13px] transition-[background,filter,color,box-shadow] duration-200
                                     focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-border-focus)] focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--color-surface-sidebar)]
                                     ${selectedSessionIds.has(session.id)
                                       ? 'sidebar-session-row--selected bg-[var(--color-sidebar-item-active)] text-[var(--color-text-primary)] shadow-[var(--shadow-card)]'
@@ -1106,7 +1100,7 @@ export function Sidebar({ isMobile = false, onRequestClose }: SidebarProps) {
                                   aria-pressed={isBatchMode ? selectedSessionIds.has(session.id) : undefined}
                                   title={session.title || 'Untitled'}
                                 >
-                                  <span className="flex min-w-0 items-center gap-2">
+                                  <span className="flex min-w-0 items-center gap-1.5">
                                     {isBatchMode ? (
                                       <span
                                         className={`flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-[5px] border transition-colors ${
@@ -2006,7 +2000,7 @@ function SessionRowMeta({
 
   return (
     <span
-      className="ml-auto flex h-5 min-w-[78px] flex-shrink-0 items-center justify-end gap-1.5 text-[10px] font-medium tabular-nums text-[var(--color-text-tertiary)]"
+      className="ml-auto flex h-5 flex-shrink-0 items-center justify-end gap-1.5 whitespace-nowrap text-[10px] font-medium tabular-nums text-[var(--color-text-tertiary)]"
       title={updatedLabel}
     >
       {isRunning && (

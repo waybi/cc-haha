@@ -275,7 +275,9 @@ describe('ConversationService', () => {
       const nonSdkEnv = (await service.buildChildEnv('/tmp')) as Record<string, string>
 
       expect(sdkEnv.CLAUDE_CODE_EAGER_FLUSH).toBe('1')
+      expect(sdkEnv.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS).toBe('1')
       expect(nonSdkEnv.CLAUDE_CODE_EAGER_FLUSH).toBeUndefined()
+      expect(nonSdkEnv.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS).toBeUndefined()
 
       process.env.CLAUDE_CODE_EAGER_FLUSH = '0'
       resetTerminalShellEnvironmentCacheForTests()
@@ -542,6 +544,57 @@ describe('ConversationService', () => {
     expect(JSON.parse(sent[0]!).type).toBe('update_environment_variables')
     expect(JSON.parse(sent[0]!).variables.CLAUDE_CODE_OAUTH_TOKEN).toBe('fresh-after-wake-token')
     expect(JSON.parse(sent[1]!).type).toBe('user')
+  })
+
+  test('sendMessage does not enqueue a user turn after its owner is cancelled', async () => {
+    const service = new ConversationService() as any
+    const sent: string[] = []
+    installNetworkTestSession(service, 'cancelled-user-turn', sent)
+    let canSend = true
+    let committed = false
+
+    const pendingSend = service.sendMessage(
+      'cancelled-user-turn',
+      'Do not enqueue this after Stop',
+      undefined,
+      {
+        canSend: () => canSend,
+        messageUuid: 'cancelled-turn-uuid',
+        onCommitted: () => {
+          committed = true
+        },
+      },
+    )
+    canSend = false
+
+    expect(await pendingSend).toBe(false)
+    expect(committed).toBe(false)
+    expect(sent.map((line) => JSON.parse(line).type)).not.toContain('user')
+  })
+
+  test('sendMessage commits the caller UUID with the SDK user payload', async () => {
+    const service = new ConversationService() as any
+    const sent: string[] = []
+    installNetworkTestSession(service, 'identified-user-turn', sent)
+    let committed = false
+
+    expect(await service.sendMessage(
+      'identified-user-turn',
+      'Identify this turn',
+      undefined,
+      {
+        messageUuid: 'identified-turn-uuid',
+        onCommitted: () => {
+          committed = true
+        },
+      },
+    )).toBe(true)
+
+    expect(committed).toBe(true)
+    expect(sent.map((line) => JSON.parse(line))).toContainEqual(expect.objectContaining({
+      type: 'user',
+      uuid: 'identified-turn-uuid',
+    }))
   })
 
   test('sendMessage hot-applies direct to system routing before the next user turn', async () => {
@@ -862,7 +915,9 @@ describe('ConversationService', () => {
     expect(env.ANTHROPIC_AUTH_TOKEN).toBe('provider-key')
     expect(env.ANTHROPIC_API_KEY).toBe('')
     expect(env.ANTHROPIC_MODEL).toBe('claude-sonnet-4-6')
-    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES).toBe('none')
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES).toBe(
+      'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
+    )
     expect(env.CLAUDE_CODE_ATTRIBUTION_HEADER).toBe('1')
   })
 
@@ -1264,6 +1319,177 @@ describe('ConversationService', () => {
     }))
 
     expect(completionObserved).toBe(true)
+  })
+
+  test('rejects a permission request that arrives behind a stopped turn boundary', () => {
+    const service = new ConversationService() as any
+    const outbound: string[] = []
+    const forwarded: any[] = []
+    service.sessions.set('stopped-permission-boundary', {
+      outputCallbacks: [(message: any) => forwarded.push(message)],
+      seenSdkMessageUuids: new Set<string>(),
+      sdkMessages: [],
+      sdkSocket: { send: (message: string) => outbound.push(message) },
+      pendingOutbound: [],
+      initMessage: null,
+      pendingPermissionRequests: new Map(),
+    })
+
+    service.handleSdkPayload('stopped-permission-boundary', JSON.stringify({
+      type: 'control_request',
+      request_id: 'late-permission',
+      request: {
+        subtype: 'can_use_tool',
+        tool_name: 'Bash',
+        input: { command: 'echo stale' },
+      },
+    }), {
+      canAcceptPermissionRequest: () => false,
+    })
+
+    expect(service.getPendingPermissionRequests('stopped-permission-boundary')).toEqual([])
+    expect(forwarded).toEqual([])
+    expect(outbound).toHaveLength(1)
+    expect(JSON.parse(outbound[0]!)).toEqual(expect.objectContaining({
+      type: 'control_response',
+      response: expect.objectContaining({
+        request_id: 'late-permission',
+        response: expect.objectContaining({ behavior: 'deny' }),
+      }),
+    }))
+  })
+
+  // CLI 的 WebSocketTransport 每次重连成功都会把整个发送缓冲区重放一遍，并假定
+  // 「The server deduplicates by UUID」。以前 server 没实现这个契约：笔记本睡醒后
+  // CLI 重连，一整轮早已结束的对话会被重新推上来，前端当成实时输出再渲染一遍
+  // （表现为满屏「已思考」）。
+  test('drops SDK messages replayed by the CLI after a reconnect', () => {
+    const service = new ConversationService() as any
+    const forwarded: any[] = []
+    service.sessions.set('replay-dedupe', {
+      outputCallbacks: [(message: any) => forwarded.push(message)],
+      seenSdkMessageUuids: new Set<string>(),
+      sdkMessages: [],
+      initMessage: null,
+      pendingPermissionRequests: new Map(),
+    })
+
+    const turn = [
+      { type: 'assistant', uuid: 'uuid-thinking-1', message: { content: [{ type: 'thinking', thinking: 'step one' }] } },
+      { type: 'assistant', uuid: 'uuid-thinking-2', message: { content: [{ type: 'thinking', thinking: 'step two' }] } },
+      { type: 'result', uuid: 'uuid-result', subtype: 'success', is_error: false },
+    ]
+    const payload = turn.map((msg) => JSON.stringify(msg)).join('\n')
+
+    service.handleSdkPayload('replay-dedupe', payload)
+    expect(forwarded).toHaveLength(3)
+
+    // 重连后 CLI 把同一批消息从缓冲区头部重放 —— 一条都不该再转发出去。
+    service.handleSdkPayload('replay-dedupe', payload)
+    service.handleSdkPayload('replay-dedupe', payload)
+    expect(forwarded).toHaveLength(3)
+  })
+
+  // 真机日志（cli-diagnostics.jsonl.58975）显示重放的 858 条里绝大多数是 stream_event：
+  // 桌面端固定传 --include-partial-messages，CLI 为每个 thinking_delta 单独产一条
+  // stream_event 并现铸 uuid（QueryEngine.ts:846），所以重放到达前端时是 delta 碎片，
+  // 而不是整块 thinking。渲染侧的逐字比对挡不住碎片，只有这里的 uuid 判重挡得住。
+  test('drops replayed partial-message stream events, not just whole assistant blocks', () => {
+    const service = new ConversationService() as any
+    const forwarded: any[] = []
+    service.sessions.set('replay-stream-events', {
+      outputCallbacks: [(message: any) => forwarded.push(message)],
+      seenSdkMessageUuids: new Set<string>(),
+      sdkMessages: [],
+      initMessage: null,
+      pendingPermissionRequests: new Map(),
+    })
+
+    const deltas = ['Start: get_', 'app_state to find ', 'the search box.']
+    const payload = deltas
+      .map((thinking, index) =>
+        JSON.stringify({
+          type: 'stream_event',
+          uuid: `uuid-stream-${index}`,
+          event: {
+            type: 'content_block_delta',
+            index: 0,
+            delta: { type: 'thinking_delta', thinking },
+          },
+        }),
+      )
+      .join('\n')
+
+    service.handleSdkPayload('replay-stream-events', payload)
+    expect(forwarded).toHaveLength(deltas.length)
+
+    service.handleSdkPayload('replay-stream-events', payload)
+    expect(forwarded).toHaveLength(deltas.length)
+  })
+
+  test('keeps forwarding SDK messages that carry no uuid', () => {
+    const service = new ConversationService() as any
+    const forwarded: any[] = []
+    service.sessions.set('no-uuid', {
+      outputCallbacks: [(message: any) => forwarded.push(message)],
+      seenSdkMessageUuids: new Set<string>(),
+      sdkMessages: [],
+      initMessage: null,
+      pendingPermissionRequests: new Map(),
+    })
+
+    // 没有 uuid 的消息不会进 CLI 的重放缓冲，所以也不该被判重丢弃。
+    const payload = JSON.stringify({ type: 'result', subtype: 'success', is_error: false })
+    service.handleSdkPayload('no-uuid', payload)
+    service.handleSdkPayload('no-uuid', payload)
+
+    expect(forwarded).toHaveLength(2)
+  })
+
+  test('tolerates sessions created without the replay-dedupe bookkeeping', () => {
+    const service = new ConversationService() as any
+    const forwarded: any[] = []
+    // 故意不带 seenSdkMessageUuids，模拟别处构造出来的会话对象。
+    service.sessions.set('legacy-shape', {
+      outputCallbacks: [(message: any) => forwarded.push(message)],
+      sdkMessages: [],
+      initMessage: null,
+      pendingPermissionRequests: new Map(),
+    })
+
+    const payload = JSON.stringify({
+      type: 'assistant',
+      uuid: 'uuid-legacy',
+      message: { content: [{ type: 'thinking', thinking: 'hello' }] },
+    })
+    service.handleSdkPayload('legacy-shape', payload)
+    service.handleSdkPayload('legacy-shape', payload)
+
+    expect(forwarded).toHaveLength(1)
+  })
+
+  test('remembers enough uuids to cover a full CLI replay buffer', () => {
+    const service = new ConversationService() as any
+    const forwarded: any[] = []
+    service.sessions.set('buffer-span', {
+      outputCallbacks: [(message: any) => forwarded.push(message)],
+      seenSdkMessageUuids: new Set<string>(),
+      sdkMessages: [],
+      initMessage: null,
+      pendingPermissionRequests: new Map(),
+    })
+
+    // CLI 侧缓冲上限是 1000 条，整个缓冲区被重放时每一条都必须还认得出来。
+    const CLI_REPLAY_BUFFER_SIZE = 1000
+    const payload = Array.from({ length: CLI_REPLAY_BUFFER_SIZE }, (_unused, index) =>
+      JSON.stringify({ type: 'assistant', uuid: `uuid-${index}`, message: { content: [] } }),
+    ).join('\n')
+
+    service.handleSdkPayload('buffer-span', payload)
+    expect(forwarded).toHaveLength(CLI_REPLAY_BUFFER_SIZE)
+
+    service.handleSdkPayload('buffer-span', payload)
+    expect(forwarded).toHaveLength(CLI_REPLAY_BUFFER_SIZE)
   })
 
   test('removes an exited CLI session even when one output callback throws', async () => {

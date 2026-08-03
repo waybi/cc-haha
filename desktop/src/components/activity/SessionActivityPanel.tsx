@@ -227,9 +227,17 @@ function getTaskProgress(rows: ActivityRow[]): { completed: number; total: numbe
   return { completed, total: rows.length, percent: Math.round((completed / rows.length) * 100) }
 }
 
-function ActivityRowIcon({ row, sessionId }: { row: ActivityRow; sessionId: string }) {
+function ActivityRowIcon({
+  row,
+  sessionId,
+  status = row.status,
+}: {
+  row: ActivityRow
+  sessionId: string
+  status?: ActivityRow['status']
+}) {
   if (row.section === 'subagents') {
-    return <AgentMascot seed={`${sessionId}:${row.toolUseId ?? row.taskId ?? row.id}`} status={row.status} />
+    return <AgentMascot seed={`${sessionId}:${row.toolUseId ?? row.taskId ?? row.id}`} status={status} />
   }
 
   const Icon = getRowIcon(row)
@@ -316,6 +324,11 @@ function ActivityRowView({
 }) {
   const t = useTranslation()
   const isTask = row.section === 'tasks'
+  const isStoppingSubagent = row.section === 'subagents' && row.status === 'running' && stoppingBackgroundTask
+  const displayStatus: ActivityRow['status'] = isStoppingSubagent ? 'pending' : row.status
+  const statusLabel = isStoppingSubagent
+    ? t('session.activity.status.stopping')
+    : getActivityStatusLabel(row.status, t)
   const label = row.taskHistory
     ? t('session.activity.tasks.earlier')
     : row.label
@@ -335,7 +348,7 @@ function ActivityRowView({
       {isTask ? (
         <TaskStatusMarker status={row.status} t={t} />
       ) : (
-        <ActivityRowIcon row={row} sessionId={sessionId} />
+        <ActivityRowIcon row={row} sessionId={sessionId} status={displayStatus} />
       )}
       <span className="min-w-0 flex-1 truncate text-left">
         <span
@@ -355,8 +368,8 @@ function ActivityRowView({
       </span>
       {isTask ? null : (
         <ActivityStatusIndicator
-          status={row.status}
-          label={getActivityStatusLabel(row.status, t)}
+          status={displayStatus}
+          label={statusLabel}
           animated={row.section !== 'subagents'}
         />
       )}
@@ -389,7 +402,6 @@ function ActivityRowView({
   }
 
   if (row.section === 'subagents' && row.openable && row.toolUseId) {
-    const statusLabel = getActivityStatusLabel(row.status, t)
     const openButton = (
       <button
         type="button"

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import Icon from '../../components/icons'
 import SiteHeader, { DOWNLOAD_URL, GITHUB_URL } from '../../components/SiteHeader'
 import { toSiteHref } from '../../content/docs'
+import { rememberLocale } from '../../lib/locale'
 import { setPageMeta } from '../../lib/meta'
 import { content, mascotAccents, mascots } from './content'
 import './home.css'
@@ -278,7 +279,12 @@ function Footer({ c, locale }) {
           </nav>
         ))}
         <div className="site-footer__meta">
-          <a href={toSiteHref(locale === 'en' ? '/' : '/en')}>{locale === 'en' ? '中文' : 'English'}</a>
+          <a
+            href={toSiteHref(locale === 'en' ? '/' : '/en')}
+            onClick={() => rememberLocale(locale === 'en' ? 'zh' : 'en')}
+          >
+            {locale === 'en' ? '中文' : 'English'}
+          </a>
         </div>
       </div>
     </footer>

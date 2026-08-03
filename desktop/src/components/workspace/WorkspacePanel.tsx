@@ -15,6 +15,7 @@ import {
   useWorkspacePanelStore,
   type WorkspacePreviewCloseScope,
   type WorkspacePreviewKind,
+  type WorkspacePreviewReveal,
   type WorkspacePreviewTab,
 } from '../../stores/workspacePanelStore'
 import { useChatStore } from '../../stores/chatStore'
@@ -26,6 +27,8 @@ import { useDismissable } from '@/hooks/useDismissable'
 import { copyTextToClipboard } from '@/lib/clipboard'
 import { clearWindowSelection, getSelectionPopoverPosition, useSelectionPopoverDismiss } from '../../hooks/useSelectionPopoverDismiss'
 import { MarkdownRenderer } from '../markdown/MarkdownRenderer'
+import { createWorkspaceMarkdownImageResolver } from '../../lib/markdownImages'
+import { getServerBaseUrl } from '../../lib/desktopRuntime'
 import {
   getFileExtension,
   normalizePrismLanguage,
@@ -509,11 +512,13 @@ function workspaceCodeTokenStyle(token: WorkspaceDiffHighlightToken): CSSPropert
 function CodeSurface({
   value,
   language,
+  reveal,
   onAddLineComment,
   onAddSelection,
 }: {
   value: string
   language: string
+  reveal?: WorkspacePreviewReveal
   onAddLineComment: (lineStart: number, lineEnd: number, note: string, quote: string) => void
   onAddSelection: (selection: WorkspaceTextSelection) => void
 }) {
@@ -541,6 +546,34 @@ function CodeSurface({
     setCommentDraft('')
     setSelectionMenu(null)
   }, [language, value])
+
+  const revealLine = reveal?.line
+  const revealNonce = reveal?.nonce
+
+  // A reference past the fold (`foo.ts:900`) is unreachable while the preview is
+  // truncated, so expand first. Declared AFTER the reset effect above on purpose:
+  // effects run in declaration order, so when a reload changes `value` the reset
+  // collapses and this re-expands, rather than the other way round.
+  useEffect(() => {
+    if (revealLine && revealLine > WORKSPACE_PREVIEW_LINE_LIMIT) setShowAllLines(true)
+  }, [revealLine, revealNonce, value])
+
+  // Scroll the marked line into view. `shikiTokensByLine` and `showAllLines` are
+  // dependencies because both rebuild the line rows underneath us — highlighting
+  // resolves asynchronously, so the row may not exist on the first pass.
+  useEffect(() => {
+    if (!revealLine) return
+    const surface = surfaceRef.current
+    const row = surface?.querySelector<HTMLElement>(`[data-workspace-line-number="${revealLine}"]`)
+    if (!surface || !row) return
+
+    // Deliberately not scrollIntoView: that also scrolls every ancestor, which
+    // drags the whole chat column when the workbench is a side panel.
+    const rowRect = row.getBoundingClientRect()
+    const surfaceRect = surface.getBoundingClientRect()
+    const delta = rowRect.top - surfaceRect.top - surface.clientHeight / 2 + rowRect.height / 2
+    surface.scrollTop = Math.max(0, surface.scrollTop + delta)
+  }, [revealLine, revealNonce, value, shikiTokensByLine, showAllLines])
 
   useEffect(() => {
     if (usePlainLargePreview) {
@@ -660,13 +693,17 @@ function CodeSurface({
     && lineNumber <= commentLineEnd
   )
 
-  const lineRowClassName = (lineNumber: number) => (
-    `group grid grid-cols-[48px_minmax(0,1fr)] gap-3 px-3 ${
-      isCommentLineSelected(lineNumber)
-        ? 'bg-[var(--color-info-container)]'
-        : 'hover:bg-[var(--color-surface-hover)]'
-    }`
-  )
+  const lineRowClassName = (lineNumber: number) => {
+    // A comment selection is something the user just did by hand, so it outranks
+    // the reveal mark left over from the reference they clicked to get here.
+    if (isCommentLineSelected(lineNumber)) {
+      return 'group grid grid-cols-[48px_minmax(0,1fr)] gap-3 px-3 bg-[var(--color-info-container)]'
+    }
+    if (revealLine === lineNumber) {
+      return 'group grid grid-cols-[48px_minmax(0,1fr)] gap-3 px-3 bg-[var(--color-brand-soft)] shadow-[inset_2px_0_0_var(--color-brand)]'
+    }
+    return 'group grid grid-cols-[48px_minmax(0,1fr)] gap-3 px-3 hover:bg-[var(--color-surface-hover)]'
+  }
 
   const renderLineNumberButton = (lineNumber: number) => {
     const selected = isCommentLineSelected(lineNumber)
@@ -825,14 +862,34 @@ function CodeSurface({
 
 function MarkdownSurface({
   value,
+  path,
+  sessionId,
+  workDir,
   onAddSelection,
 }: {
   value: string
+  path: string
+  sessionId: string
+  workDir?: string | null
   onAddSelection: (selection: WorkspaceTextSelection) => void
 }) {
   const surfaceRef = useRef<HTMLDivElement>(null)
   const selectionMenuRef = useRef<HTMLButtonElement>(null)
   const [selectionMenu, setSelectionMenu] = useState<FloatingSelectionMenuState | null>(null)
+
+  // The document is user-owned local content, so its images are trusted:
+  // relative paths resolve against the file's directory (served sandboxed via
+  // /preview-fs or /local-file) and remote URLs are left to CSP. Untrusted
+  // assistant Markdown gets no resolver and keeps the blob:/data:-only policy.
+  const resolveImageSrc = useMemo(
+    () => createWorkspaceMarkdownImageResolver({
+      baseUrl: getServerBaseUrl(),
+      sessionId,
+      filePath: path,
+      workDir,
+    }),
+    [path, sessionId, workDir],
+  )
 
   useEffect(() => {
     setSelectionMenu(null)
@@ -880,6 +937,7 @@ function MarkdownSurface({
         <MarkdownRenderer
           content={value}
           variant="document"
+          resolveImageSrc={resolveImageSrc}
           className="workspace-markdown-preview prose-p:text-[14px] prose-p:leading-7 prose-h1:text-[24px] prose-h2:text-[18px] prose-h3:text-[15px] prose-code:text-[12px] prose-pre:my-4"
         />
       </div>
@@ -1831,12 +1889,16 @@ export function WorkspacePanel({ sessionId, embedded = false, forceVisible = fal
         ) : state === 'ok' && isMarkdownPreview(activePreviewTab) ? (
           <MarkdownSurface
             value={activePreviewTab.content ?? ''}
+            path={activePreviewTab.path}
+            sessionId={sessionId}
+            workDir={status?.workDir}
             onAddSelection={(selection) => addSelectionToChat(activePreviewTab.path, selection)}
           />
         ) : state === 'ok' ? (
           <CodeSurface
             value={activePreviewTab.content ?? ''}
             language={activePreviewTab.language ?? 'text'}
+            reveal={activePreviewTab.reveal}
             onAddLineComment={(lineStart, lineEnd, note, quote) => (
               addLineCommentToChat(activePreviewTab.path, lineStart, lineEnd, note, quote)
             )}

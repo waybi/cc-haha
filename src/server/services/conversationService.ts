@@ -36,6 +36,8 @@ import {
   resolveClaudeCliLauncher,
 } from '../../utils/desktopBundledCli.js'
 import {
+  ASK_USER_QUESTION_CLARIFY_MESSAGE,
+  ASK_USER_QUESTION_CLARIFY_WITH_QUESTIONS_PREFIX,
   PLAN_REJECTION_MESSAGE,
   PLAN_REJECTION_WITH_REASON_PREFIX,
   REJECT_MESSAGE,
@@ -66,6 +68,13 @@ export const MAX_CAPTURED_SDK_MESSAGE_BYTES = 64 * 1024
 export const MAX_CAPTURED_SDK_TOTAL_BYTES = 512 * 1024
 const MAX_CAPTURED_SDK_DIAGNOSTIC_TEXT_BYTES = 4 * 1024
 const CONTROL_READY_POLL_MS = 50
+/**
+ * 记住多少条已处理的 SDK 消息 uuid，用来挡掉 CLI 重连时的重放。
+ * CLI 侧重放缓冲是 DEFAULT_MAX_BUFFER_SIZE = 1000 条
+ * （src/cli/transports/WebSocketTransport.ts），这里留一倍余量，
+ * 保证整个缓冲区被重放时每一条都还认得出来。
+ */
+const MAX_SEEN_SDK_MESSAGE_UUIDS = 2_000
 const AUTO_MEMORY_DIRNAME = 'memory'
 export const DESKTOP_CLI_GRACEFUL_SHUTDOWN_TIMEOUT_MS = 6_000
 
@@ -89,8 +98,9 @@ export function cliExitSeverity(code: number | null): 'info' | 'error' {
  * Builds the denial text the CLI hands to the model as tool_result content.
  *
  * The model reads this verbatim, so it has to carry the instruction the desktop
- * UI can't: a plain tool denial means "stop and wait for me", while a rejected
- * plan means "keep planning". Both renderers (the CLI's
+ * UI can't: a plain tool denial means "stop and wait for me", a rejected plan
+ * means "keep planning", and a question the user wants to talk over means "ask
+ * them what needs clarifying". Both plan renderers (the CLI's
  * renderToolUseRejectedMessage, the desktop's extractPlanPreview) read the plan
  * from the tool input, so nothing here needs to echo the plan back.
  */
@@ -103,6 +113,14 @@ export function buildDenyMessage(
     return feedback
       ? `${PLAN_REJECTION_WITH_REASON_PREFIX}${feedback}`
       : PLAN_REJECTION_MESSAGE
+  }
+  // "Chat about this" is a denial only in transport terms — the user wants to
+  // keep talking, not to stop the turn. REJECT_MESSAGE's "STOP and wait" would
+  // contradict that and leave them staring at a silent turn.
+  if (toolName === 'AskUserQuestion') {
+    return feedback
+      ? `${ASK_USER_QUESTION_CLARIFY_WITH_QUESTIONS_PREFIX}${feedback}`
+      : ASK_USER_QUESTION_CLARIFY_MESSAGE
   }
   return feedback
     ? `${REJECT_MESSAGE_WITH_REASON_PREFIX}${feedback}`
@@ -133,6 +151,16 @@ type AttachmentRef = {
 }
 
 type UserContentBlock = Record<string, unknown>
+
+type SendMessageOptions = {
+  canSend?: () => boolean
+  messageUuid?: string
+  onCommitted?: () => void
+}
+
+type HandleSdkPayloadOptions = {
+  canAcceptPermissionRequest?: (message: any) => boolean
+}
 
 type MaterializedAttachments = {
   pathPrefix: string
@@ -175,6 +203,11 @@ type SessionProcess = {
   stdoutLines: string[]
   stderrLines: string[]
   outputDrain: Promise<void>
+  /**
+   * UUID 的 SDK 消息一旦处理过就记在这里，用于挡掉 CLI 重连时的整轮重放。
+   * 详见 handleSdkPayload 里的说明。插入顺序即淘汰顺序（Set 保序）。
+   */
+  seenSdkMessageUuids: Set<string>
   sdkMessages: any[]
   sdkMessageBytes?: number
   initMessage: any | null
@@ -190,6 +223,7 @@ type SessionProcess = {
       permissionSuggestions?: unknown[]
     }
   >
+  pendingControlRequests: Map<string, (reason: Error) => void>
 }
 
 export type PendingPermissionRequest = {
@@ -432,6 +466,7 @@ export class ConversationService {
       networkDerivedFirstTokenTimeout: networkRuntimeMetadata.firstTokenTimeoutDerived,
       sdkToken: this.getSdkTokenFromUrl(sdkUrl),
       sdkSocket: null,
+      seenSdkMessageUuids: new Set<string>(),
       sdkAttached,
       resolveSdkAttached,
       pendingOutbound: [],
@@ -446,6 +481,7 @@ export class ConversationService {
       usesOfficialOAuth,
       officialOAuthToken: childEnv.CLAUDE_CODE_OAUTH_TOKEN ?? null,
       pendingPermissionRequests: new Map(),
+      pendingControlRequests: new Map(),
     }
     this.sessions.set(sessionId, session)
 
@@ -560,6 +596,7 @@ export class ConversationService {
     sessionId: string,
     content: string,
     attachments?: AttachmentRef[],
+    options?: SendMessageOptions,
   ): Promise<boolean> {
     const userContent = await this.buildUserContent(content, sessionId, attachments)
     let session = this.sessions.get(sessionId)
@@ -570,8 +607,14 @@ export class ConversationService {
     if (session) {
       await this.refreshOfficialOAuthTokenBeforeTurn(sessionId, session)
     }
-    return this.sendSdkMessage(sessionId, {
+    // Building attachments, refreshing network settings, and refreshing OAuth
+    // can all suspend this call. Stop may revoke the owning desktop turn while
+    // one of those awaits is pending, so check ownership at the last possible
+    // point before writing the user message to the SDK socket.
+    if (options?.canSend && !options.canSend()) return false
+    const sent = this.sendSdkMessage(sessionId, {
       type: 'user',
+      ...(options?.messageUuid ? { uuid: options.messageUuid } : {}),
       message: {
         role: 'user',
         content: userContent,
@@ -579,6 +622,8 @@ export class ConversationService {
       parent_tool_use_id: null,
       session_id: '',
     })
+    if (sent) options?.onCommitted?.()
+    return sent
   }
 
   private async refreshNetworkEnvironmentBeforeTurn(
@@ -813,6 +858,10 @@ export class ConversationService {
 
     const startedAt = Date.now()
     await this.waitForControlChannelReady(sessionId, timeoutMs, signal)
+    const session = this.sessions.get(sessionId)
+    if (!session) {
+      throw new Error('CLI session is not running')
+    }
     const responseTimeoutMs = Math.max(1, timeoutMs - (Date.now() - startedAt))
     const requestId = crypto.randomUUID()
     return new Promise((resolve, reject) => {
@@ -824,7 +873,8 @@ export class ConversationService {
         settled = true
         clearTimeout(timeout)
         signal?.removeEventListener('abort', handleAbort)
-        this.removeOutputCallback(sessionId, handleOutput)
+        session.outputCallbacks = session.outputCallbacks.filter((entry) => entry !== handleOutput)
+        session.pendingControlRequests?.delete(requestId)
         fn()
       }
 
@@ -857,13 +907,18 @@ export class ConversationService {
           `Timed out waiting for ${String(request.subtype ?? 'control')} response`,
         )))
       }, responseTimeoutMs)
-      this.onOutput(sessionId, handleOutput)
+      session.outputCallbacks.push(handleOutput)
+      const pendingControlRequests = session.pendingControlRequests ?? new Map<string, (reason: Error) => void>()
+      session.pendingControlRequests = pendingControlRequests
+      pendingControlRequests.set(requestId, (reason) => {
+        finish(() => reject(reason))
+      })
       signal?.addEventListener('abort', handleAbort, { once: true })
       if (signal?.aborted) {
         handleAbort()
         return
       }
-      const sent = this.sendSdkMessage(sessionId, {
+      const sent = this.sessions.get(sessionId) === session && this.sendSdkMessage(sessionId, {
         type: 'control_request',
         request_id: requestId,
         request,
@@ -944,7 +999,40 @@ export class ConversationService {
     }
   }
 
-  handleSdkPayload(sessionId: string, rawPayload: string): void {
+  /**
+   * CLI 的 WebSocketTransport 在每次重连成功后会把它的整个发送缓冲区重放一遍，
+   * 并且明确假定「The server deduplicates by UUID」
+   * （src/cli/transports/WebSocketTransport.ts:204）。这个契约以前没有实现：
+   * 笔记本睡眠导致连接断开后（该 transport 有专门的睡眠检测，会无限重置重连预算），
+   * CLI 重连时会把最多 1000 条**早已完成**的消息重新推上来，server 原样转发给前端，
+   * 前端便把一整轮结束很久的对话当成实时输出重新渲染一遍 —— 表现为满屏「已思考」。
+   *
+   * 只有带 uuid 的消息才会进入 CLI 的重放缓冲（同文件 write()），所以这里也只按
+   * uuid 判重；没有 uuid 的消息（如 control_request）本就不会被重放，照常处理。
+   */
+  private isReplayedSdkMessage(session: SessionProcess, msg: any): boolean {
+    const uuid = typeof msg?.uuid === 'string' ? msg.uuid : ''
+    if (!uuid) return false
+
+    // 会话对象并非只有 startSession 一条构造路径，缺字段时按空集合起步而不是抛错。
+    const seen = session.seenSdkMessageUuids ?? new Set<string>()
+    session.seenSdkMessageUuids = seen
+    if (seen.has(uuid)) return true
+
+    if (seen.size >= MAX_SEEN_SDK_MESSAGE_UUIDS) {
+      // Set 保持插入顺序，最早进来的就是最该淘汰的。
+      const oldest = seen.values().next().value
+      if (oldest !== undefined) seen.delete(oldest)
+    }
+    seen.add(uuid)
+    return false
+  }
+
+  handleSdkPayload(
+    sessionId: string,
+    rawPayload: string,
+    options?: HandleSdkPayloadOptions,
+  ): void {
     const session = this.sessions.get(sessionId)
     if (!session) return
 
@@ -956,6 +1044,19 @@ export class ConversationService {
     for (const line of lines) {
       try {
         const msg = JSON.parse(line)
+        if (this.isReplayedSdkMessage(session, msg)) continue
+        if (
+          msg?.type === 'control_request' &&
+          msg.request?.subtype === 'can_use_tool' &&
+          typeof msg.request_id === 'string' &&
+          options?.canAcceptPermissionRequest?.(msg) === false
+        ) {
+          // Stop may win while a permission request is already queued on the
+          // SDK transport. Reject it at the service boundary so it is neither
+          // persisted as pending nor replayed to a reconnecting renderer.
+          this.respondToPermission(sessionId, msg.request_id, false)
+          continue
+        }
         this.retainSdkMessage(session, msg, Buffer.byteLength(line, 'utf-8'))
         const sdkError = this.extractSdkErrorEvent(msg)
         if (sdkError) {
@@ -1125,10 +1226,23 @@ export class ConversationService {
     return `${truncated}\n[truncated]`
   }
 
+  private cancelPendingControlRequests(
+    session: SessionProcess,
+    reason = new Error('CLI session stopped'),
+  ): void {
+    const pending = session.pendingControlRequests
+    if (!pending || pending.size === 0) return
+    for (const cancel of [...pending.values()]) {
+      cancel(reason)
+    }
+    pending.clear()
+  }
+
   stopSession(sessionId: string): void {
     const session = this.sessions.get(sessionId)
     if (!session) return
 
+    this.cancelPendingControlRequests(session)
     this.sessions.delete(sessionId)
     this.killProcess(sessionId, session)
   }
@@ -1140,6 +1254,7 @@ export class ConversationService {
     const session = this.sessions.get(sessionId)
     if (!session) return
 
+    this.cancelPendingControlRequests(session)
     this.sessions.delete(sessionId)
     await this.stopProcessAndWait(sessionId, session, timeoutMs)
   }
@@ -1156,6 +1271,9 @@ export class ConversationService {
     const activeSessions = Array.from(this.sessions.entries())
     if (activeSessions.length === 0) return
 
+    for (const [, session] of activeSessions) {
+      this.cancelPendingControlRequests(session)
+    }
     this.sessions.clear()
     await Promise.all(
       activeSessions.map(([sessionId, session]) =>
@@ -1309,6 +1427,10 @@ export class ConversationService {
 
     const activeSession = this.sessions.get(sessionId)
     if (activeSession?.proc === proc) {
+      this.cancelPendingControlRequests(
+        activeSession,
+        new Error('CLI session exited before the control request completed'),
+      )
       if (activeSession.startupPending) {
         activeSession.startupExitCode = code
         return
@@ -1524,6 +1646,12 @@ export class ConversationService {
             // arrives. Flush the completed turn first so the replacement can
             // reliably choose --resume and load the context (#1033).
             CLAUDE_CODE_EAGER_FLUSH: cleanEnv.CLAUDE_CODE_EAGER_FLUSH || '1',
+            // The CLI may keep processing internally after an SDK `result`
+            // (for example, a completed background Agent can enqueue one last
+            // model follow-up). Desktop cleanup must use the CLI's authoritative
+            // running/idle boundary or a disconnected renderer can kill that
+            // follow-up after the fixed idle grace period.
+            CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1',
             CC_HAHA_COMPUTER_USE_HOST_BUNDLE_ID: 'com.claude-code-haha.desktop',
           }
         : {}),

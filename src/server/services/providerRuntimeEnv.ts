@@ -1,6 +1,7 @@
 import * as fs from 'fs'
 import * as path from 'path'
 
+import { getClaudeCodeModelCapabilities } from '../../shared/modelReasoning.js'
 import { MODEL_CONTEXT_WINDOWS_ENV_KEY } from '../../utils/model/modelContextWindows.js'
 import { PROVIDER_PRESETS } from '../config/providerPresets.js'
 import type {
@@ -55,11 +56,6 @@ export const MANAGED_PROVIDER_ENV_KEYS = [
   GROK_OAUTH_FILE_ENV_KEY,
 ] as const
 
-const CUSTOM_PROVIDER_MODEL_CAPABILITIES =
-  'thinking,effort,adaptive_thinking,xhigh_effort,max_effort'
-const XIAOMI_MIMO_MODEL_CAPABILITIES = 'thinking'
-const KIMI_K3_MODEL_CAPABILITIES = 'thinking,required_thinking,effort,max_effort'
-const KIMI_CODING_FALLBACK_MODEL_CAPABILITIES = 'thinking,required_thinking'
 const AUTH_ENV_KEYS = new Set(['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN'])
 const MODEL_SLOTS = ['main', 'haiku', 'sonnet', 'opus'] as const
 
@@ -105,7 +101,7 @@ function isSavedProvider(value: unknown): value is SavedProvider {
   )
 }
 
-function normalizeToolSearchEnabled(value: unknown): boolean {
+export function normalizeToolSearchEnabled(value: unknown): boolean {
   if (typeof value === 'boolean') return value
   if (typeof value === 'number') return value !== 0
   if (typeof value === 'string') {
@@ -118,7 +114,7 @@ function normalizeToolSearchEnabled(value: unknown): boolean {
   return true
 }
 
-function normalizeDisableExperimentalBetas(value: unknown): boolean {
+export function normalizeDisableExperimentalBetas(value: unknown): boolean {
   if (typeof value === 'boolean') return value
   if (typeof value === 'number') return value !== 0
   if (typeof value === 'string') {
@@ -279,59 +275,25 @@ function getPresetModelContextWindows(presetId: string): Record<string, number> 
   return PROVIDER_PRESETS.find((preset) => preset.id === presetId)?.modelContextWindows ?? {}
 }
 
-function isXiaomiMimoProvider(provider: SavedProvider, models: SavedProvider['models']): boolean {
-  const baseUrl = provider.baseUrl.toLowerCase()
-  const modelIds = Object.values(models).map((model) => model.toLowerCase())
-  return (
-    baseUrl.includes('xiaomimimo.com') ||
-    modelIds.some((model) => /^mimo-v\d/i.test(model))
-  )
-}
-
-function getCustomProviderModelCapabilities(
-  provider: SavedProvider,
-  models: SavedProvider['models'],
-): string {
-  if (isXiaomiMimoProvider(provider, models)) {
-    return XIAOMI_MIMO_MODEL_CAPABILITIES
-  }
-  return CUSTOM_PROVIDER_MODEL_CAPABILITIES
-}
-
-function getKimiModelCapabilities(model: string): string {
-  const normalized = model
-    .trim()
-    .replace(/\[1m\]$/i, '')
-    .replace(/:1m$/i, '')
-    .toLowerCase()
-  return normalized === 'k3'
-    ? KIMI_K3_MODEL_CAPABILITIES
-    : KIMI_CODING_FALLBACK_MODEL_CAPABILITIES
-}
-
 function getProviderCapabilityEnv(
   provider: SavedProvider,
   models: SavedProvider['models'],
 ): Record<string, string> {
-  if (provider.presetId === 'custom') {
-    const capabilities = getCustomProviderModelCapabilities(provider, models)
-    return {
-      ...(models.fable
-        ? { ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES: capabilities }
-        : {}),
-      ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES: capabilities,
-      ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES: capabilities,
-      ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES: capabilities,
-    }
+  const apiFormat = provider.apiFormat ?? 'anthropic'
+  return {
+    ...(models.fable
+      ? {
+          ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES:
+            getClaudeCodeModelCapabilities(models.fable, apiFormat),
+        }
+      : {}),
+    ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES:
+      getClaudeCodeModelCapabilities(models.haiku, apiFormat),
+    ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES:
+      getClaudeCodeModelCapabilities(models.sonnet, apiFormat),
+    ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES:
+      getClaudeCodeModelCapabilities(models.opus, apiFormat),
   }
-  if (provider.presetId === 'kimi') {
-    return {
-      ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES: getKimiModelCapabilities(models.haiku),
-      ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES: getKimiModelCapabilities(models.sonnet),
-      ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES: getKimiModelCapabilities(models.opus),
-    }
-  }
-  return {}
 }
 
 export function buildProviderAuthEnv(
@@ -402,8 +364,8 @@ export function buildProviderManagedEnv(
   const providerCapabilityEnv = getProviderCapabilityEnv(provider, models)
 
   return {
-    ...omitAuthEnv(presetDefaultEnv),
     ...providerCapabilityEnv,
+    ...omitAuthEnv(presetDefaultEnv),
     ...(provider.autoCompactWindow !== undefined && {
       CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(provider.autoCompactWindow),
     }),

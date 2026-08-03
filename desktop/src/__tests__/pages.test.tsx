@@ -148,14 +148,14 @@ describe('Content-only pages render without errors', () => {
       target: { value: '/', selectionStart: 1 },
     })
 
-    expect(await screen.findByText('/lark-mail')).toBeInTheDocument()
-    expect(screen.getByText('/mcp')).toBeInTheDocument()
-    expect(screen.getByText('/skills')).toBeInTheDocument()
-    expect(screen.getByText('/help')).toBeInTheDocument()
-    expect(screen.getByText('/plugin')).toBeInTheDocument()
-    expect(screen.getByText('/context')).toBeInTheDocument()
-    expect(screen.queryByText('/plugins')).not.toBeInTheDocument()
-    expect(screen.queryByText('/internal-only')).not.toBeInTheDocument()
+    expect(await screen.findByText('lark-mail')).toBeInTheDocument()
+    expect(screen.getByText('mcp')).toBeInTheDocument()
+    expect(screen.getByText('skills')).toBeInTheDocument()
+    expect(screen.getByText('help')).toBeInTheDocument()
+    expect(screen.getByText('plugin')).toBeInTheDocument()
+    expect(screen.getByText('context')).toBeInTheDocument()
+    expect(screen.queryByText('plugins')).not.toBeInTheDocument()
+    expect(screen.queryByText('internal-only')).not.toBeInTheDocument()
   })
 
   it('EmptySession shows /goal as one command with argument hints, not pseudo subcommands', async () => {
@@ -167,7 +167,7 @@ describe('Content-only pages render without errors', () => {
       target: { value: '/goal', selectionStart: 5 },
     })
 
-    expect(await screen.findAllByText('/goal')).toHaveLength(2)
+    expect(await screen.findByRole('option', { name: /^goal / })).toBeInTheDocument()
     expect(screen.getByText('[<condition> | clear]')).toBeInTheDocument()
     expect(screen.getByText('Set a completion goal')).toBeInTheDocument()
     expect(screen.queryByText('/goal status')).not.toBeInTheDocument()
@@ -778,7 +778,7 @@ describe('Content-only pages render without errors', () => {
     resetPageStores()
   })
 
-  it('ActiveSession keeps a stable context placeholder while context usage loads', async () => {
+  it('ActiveSession keeps a stable context placeholder while the first turn loads context', async () => {
     const SESSION_ID = 'context-loading-session'
     vi.mocked(sessionsApi.getInspection).mockImplementationOnce(() => new Promise(() => {}))
 
@@ -802,7 +802,7 @@ describe('Content-only pages render without errors', () => {
       sessions: {
         [SESSION_ID]: {
           messages: [],
-          chatState: 'idle',
+          chatState: 'thinking',
           connectionState: 'connected',
           streamingText: '',
           streamingToolInput: '',
@@ -833,19 +833,7 @@ describe('Content-only pages render without errors', () => {
 
   it('ActiveSession treats an empty idle session without a running CLI as pending context', async () => {
     const SESSION_ID = 'context-empty-idle-session'
-    vi.mocked(sessionsApi.getInspection).mockResolvedValueOnce({
-      active: false,
-      status: {
-        sessionId: SESSION_ID,
-        workDir: '/workspace/project',
-        cwd: '/workspace/project',
-        permissionMode: 'bypassPermissions',
-        model: 'kimi-k2.6',
-      },
-      errors: {
-        context: 'CLI session is not running',
-      },
-    })
+    const inspectionCallsBeforeRender = vi.mocked(sessionsApi.getInspection).mock.calls.length
 
     useTabStore.setState({ tabs: [{ sessionId: SESSION_ID, title: 'Test', type: 'session' as const, status: 'idle' }], activeTabId: SESSION_ID })
     useSessionStore.setState({
@@ -891,14 +879,14 @@ describe('Content-only pages render without errors', () => {
 
     const indicator = await screen.findByLabelText('Context usage not calculated')
     expect(indicator).toHaveTextContent('--')
-    expect(screen.getAllByText('kimi-k2.6').length).toBeGreaterThan(0)
     expect(screen.getByText('Context usage will be calculated after the session starts.')).toBeInTheDocument()
     expect(screen.queryByText('CLI session is not running')).not.toBeInTheDocument()
+    expect(vi.mocked(sessionsApi.getInspection).mock.calls.length).toBe(inspectionCallsBeforeRender)
 
     resetPageStores()
   })
 
-  it('ActiveSession shows initial context usage for an empty live session', async () => {
+  it('ActiveSession waits for the first turn before inspecting an empty live session', async () => {
     const SESSION_ID = 'context-empty-live-session'
     vi.mocked(sessionsApi.getInspection).mockResolvedValueOnce({
       active: true,
@@ -968,12 +956,29 @@ describe('Content-only pages render without errors', () => {
       },
     })
 
+    const inspectionCallsBeforeRender = vi.mocked(sessionsApi.getInspection).mock.calls.length
     render(<ActiveSession />)
+
+    const pendingIndicator = await screen.findByLabelText('Context usage not calculated')
+    expect(pendingIndicator).toHaveTextContent('--')
+    expect(vi.mocked(sessionsApi.getInspection).mock.calls.length).toBe(inspectionCallsBeforeRender)
+
+    act(() => {
+      useChatStore.setState((state) => ({
+        sessions: {
+          ...state.sessions,
+          [SESSION_ID]: {
+            ...state.sessions[SESSION_ID]!,
+            chatState: 'thinking',
+          },
+        },
+      }))
+    })
 
     const indicator = await screen.findByLabelText('Context usage 22%')
     expect(indicator).toHaveTextContent('22%')
     expect(screen.getAllByText('kimi-k2.6').length).toBeGreaterThan(0)
-    expect(screen.queryByText('Context usage will be calculated after the session starts.')).not.toBeInTheDocument()
+    expect(vi.mocked(sessionsApi.getInspection).mock.calls.length - inspectionCallsBeforeRender).toBe(1)
 
     resetPageStores()
   })

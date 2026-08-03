@@ -250,9 +250,9 @@ function splitMessagesIntoTurns(messages: UIMessage[]): TaskMessageTurn[] {
   return turns
 }
 
-function normalizeTaskStatus(status: unknown): TaskSummaryItem['status'] {
+function parseTaskStatus(status: unknown): TaskSummaryItem['status'] | undefined {
   if (status === 'completed' || status === 'in_progress' || status === 'pending') return status
-  return 'pending'
+  return undefined
 }
 
 function taskIdFromInput(input: Record<string, unknown>): string {
@@ -263,18 +263,61 @@ function isDeletedStatus(input: Record<string, unknown>): boolean {
   return stringField(input, 'status') === 'deleted'
 }
 
+function collectToolResults(
+  messages: UIMessage[],
+): Map<string, Extract<UIMessage, { type: 'tool_result' }>> {
+  const resultsByToolUseId = new Map<string, Extract<UIMessage, { type: 'tool_result' }>>()
+  for (const message of messages) {
+    if (message.type === 'tool_result') {
+      resultsByToolUseId.set(message.toolUseId, message)
+    }
+  }
+  return resultsByToolUseId
+}
+
+function collectSubagentCreatedTaskIds(messages: UIMessage[]): Set<string> {
+  const taskIds = new Set<string>()
+  const resultsByToolUseId = collectToolResults(messages)
+
+  for (const message of messages) {
+    if (
+      message.type !== 'tool_use' ||
+      message.toolName !== 'TaskCreate' ||
+      !message.parentToolUseId
+    ) {
+      continue
+    }
+
+    const result = resultsByToolUseId.get(message.toolUseId)
+    if (!result || result.isError) continue
+    const createdTask = parseCreatedTaskResult(result.content)
+    if (createdTask) taskIds.add(createdTask.id)
+  }
+
+  return taskIds
+}
+
+function keepSessionLevelTaskMessage(message: UIMessage): boolean {
+  return !(
+    (message.type === 'tool_use' || message.type === 'tool_result') &&
+    message.parentToolUseId
+  )
+}
+
 /**
  * TaskUpdate 的 deleted 是删除动作而非状态，删除可能发生在创建它的那一轮之后，
  * 所以要跨轮次收集，避免已删任务留在历史统计里。
  */
 function collectDeletedTaskIds(messages: UIMessage[]): Set<string> {
   const deletedTaskIds = new Set<string>()
+  const resultsByToolUseId = collectToolResults(messages)
 
   for (const message of messages) {
     if (message.type !== 'tool_use' || message.toolName !== 'TaskUpdate') continue
 
     const input = isRecordValue(message.input) ? message.input : {}
     if (!isDeletedStatus(input)) continue
+    if (!isSuccessfulTaskUpdate(input, resultsByToolUseId.get(message.toolUseId))) continue
 
     const taskId = taskIdFromInput(input)
     if (taskId) deletedTaskIds.add(taskId)
@@ -292,6 +335,20 @@ function parseCreatedTaskResult(content: unknown): { id: string; subject?: strin
     id: match[1],
     subject: match[2]?.trim(),
   }
+}
+
+function parseUpdatedTaskResult(content: unknown): { id: string } | null {
+  const match = extractTextContent(content).trimStart().match(/^Updated task #([^\s]+)(?:\s|$)/i)
+  return match?.[1] ? { id: match[1] } : null
+}
+
+function isSuccessfulTaskUpdate(
+  input: Record<string, unknown>,
+  result: Extract<UIMessage, { type: 'tool_result' }> | undefined,
+): boolean {
+  if (!result || result.isError) return false
+  const taskId = taskIdFromInput(input)
+  return Boolean(taskId && parseUpdatedTaskResult(result.content)?.id === taskId)
 }
 
 function buildTaskToolRow(
@@ -449,13 +506,10 @@ function buildAgentRowsFromMessages(messages: UIMessage[]): ActivityRow[] {
   return rows
 }
 
-function buildTaskRowsFromTaskTools(messages: UIMessage[]): ActivityRow[] {
-  const resultsByToolUseId = new Map<string, Extract<UIMessage, { type: 'tool_result' }>>()
-  for (const message of messages) {
-    if (message.type === 'tool_result') {
-      resultsByToolUseId.set(message.toolUseId, message)
-    }
-  }
+function buildTaskRowsFromTaskTools(
+  messages: UIMessage[],
+  resultsByToolUseId = collectToolResults(messages),
+): ActivityRow[] {
 
   const rowsByTaskId = new Map<string, ActivityRow>()
   let createIndex = 0
@@ -477,6 +531,9 @@ function buildTaskRowsFromTaskTools(messages: UIMessage[]): ActivityRow[] {
       const input = isRecordValue(message.input) ? message.input : {}
       const taskId = taskIdFromInput(input)
       if (!taskId) continue
+      // TaskUpdate reports benign failures such as "Task not found" with
+      // isError=false, so only its positive result is authoritative.
+      if (!isSuccessfulTaskUpdate(input, resultsByToolUseId.get(message.toolUseId))) continue
 
       // deleted 不是一种任务状态：CLI 侧 TaskUpdateTool 会真的删掉任务文件
       if (isDeletedStatus(input)) {
@@ -487,6 +544,7 @@ function buildTaskRowsFromTaskTools(messages: UIMessage[]): ActivityRow[] {
       const existing = rowsByTaskId.get(taskId)
       const activeForm = stringField(input, 'activeForm')
       const subject = stringField(input, 'subject')
+      const status = parseTaskStatus(input.status) ?? existing?.status ?? 'pending'
       rowsByTaskId.set(taskId, {
         ...(existing ?? {
           id: taskId,
@@ -495,7 +553,7 @@ function buildTaskRowsFromTaskTools(messages: UIMessage[]): ActivityRow[] {
           taskId,
           openable: false,
         }),
-        status: normalizeTaskStatus(input.status),
+        status,
         ...(activeForm && activeForm !== (existing?.label ?? subject) ? { description: activeForm } : {}),
       })
     }
@@ -504,7 +562,10 @@ function buildTaskRowsFromTaskTools(messages: UIMessage[]): ActivityRow[] {
   return Array.from(rowsByTaskId.values())
 }
 
-function buildTaskRowsFromTurnMessages(messages: UIMessage[]): ActivityRow[] {
+function buildTaskRowsFromTurnMessages(
+  messages: UIMessage[],
+  resultsByToolUseId = collectToolResults(messages),
+): ActivityRow[] {
   let latestSummary: Extract<UIMessage, { type: 'task_summary' }> | undefined
   let latestTodoWrite: Extract<UIMessage, { type: 'tool_use' }> | undefined
   let latestTaskToolTimestamp = -Infinity
@@ -514,8 +575,13 @@ function buildTaskRowsFromTurnMessages(messages: UIMessage[]): ActivityRow[] {
       latestSummary = message
     } else if (message.type === 'tool_use' && message.toolName === 'TodoWrite') {
       latestTodoWrite = message
-    } else if (message.type === 'tool_use' && (message.toolName === 'TaskCreate' || message.toolName === 'TaskUpdate')) {
+    } else if (message.type === 'tool_use' && message.toolName === 'TaskCreate') {
       latestTaskToolTimestamp = Math.max(latestTaskToolTimestamp, message.timestamp)
+    } else if (message.type === 'tool_use' && message.toolName === 'TaskUpdate') {
+      const input = isRecordValue(message.input) ? message.input : {}
+      if (isSuccessfulTaskUpdate(input, resultsByToolUseId.get(message.toolUseId))) {
+        latestTaskToolTimestamp = Math.max(latestTaskToolTimestamp, message.timestamp)
+      }
     }
   }
 
@@ -528,7 +594,7 @@ function buildTaskRowsFromTurnMessages(messages: UIMessage[]): ActivityRow[] {
     return dedupeTaskRows(input.todos.map(buildTodoTaskRow))
   }
 
-  return buildTaskRowsFromTaskTools(messages)
+  return buildTaskRowsFromTaskTools(messages, resultsByToolUseId)
 }
 
 function mergeTaskRowsById(baseRows: ActivityRow[], liveRows: ActivityRow[]): ActivityRow[] {
@@ -579,12 +645,20 @@ function buildHistoricalTasksRow(groups: TaskTurnRows[]): ActivityRow | null {
 }
 
 function buildTaskRowsFromMessages(messages: UIMessage[], liveTasks: CLITask[]): ActivityRow[] {
+  const subagentCreatedTaskIds = collectSubagentCreatedTaskIds(messages)
+  const sessionMessages = messages.filter(keepSessionLevelTaskMessage)
   const deletedTaskIds = collectDeletedTaskIds(messages)
-  const isLiveRow = (row: ActivityRow) => (row.taskId ? !deletedTaskIds.has(row.taskId) : true)
+  const resultsByToolUseId = collectToolResults(sessionMessages)
+  const isSessionTaskRow = (row: ActivityRow) => row.taskId
+    ? !deletedTaskIds.has(row.taskId) && !subagentCreatedTaskIds.has(row.taskId)
+    : true
   // 任务列表要等 tool_result 到达后才异步刷新，这中间 liveTasks 里还留着已删的任务
-  const liveRows = liveTasks.filter((task) => !deletedTaskIds.has(task.id)).map(buildTaskRow)
-  const taskTurnRows = splitMessagesIntoTurns(messages)
-    .map((turn) => ({ turn, rows: buildTaskRowsFromTurnMessages(turn.messages).filter(isLiveRow) }))
+  const liveRows = liveTasks.map(buildTaskRow).filter(isSessionTaskRow)
+  const taskTurnRows = splitMessagesIntoTurns(sessionMessages)
+    .map((turn) => ({
+      turn,
+      rows: buildTaskRowsFromTurnMessages(turn.messages, resultsByToolUseId).filter(isSessionTaskRow),
+    }))
     .filter((group) => group.rows.length > 0)
 
   if (taskTurnRows.length === 0) {

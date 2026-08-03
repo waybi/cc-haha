@@ -40,14 +40,26 @@ Codes are valid for 60 minutes, work once, and are invalidated when a new one is
 - `/start` — show help and available commands
 - `/help` — show available commands
 - `/projects` — list recent projects and switch
+- `/resume` — choose and restore a previous session
 - `/status` — project, model, run state, and task summary
 - `/new` — clear the current binding and choose a project again
 - `/clear` — clear context, keep the project binding
 - `/stop` — stop the current generation
+- `/provider` — view or switch the provider
+- `/model [model]` — view or switch the model
+- `/skills` — list project Skills and invoke one by selecting it
+
+## Agent capabilities and boundaries
+
+Telegram is not a separate question-and-answer model. Regular messages and Skills selected from `/skills` enter the same Claude Code Agent session for the current project, so they retain multi-turn context and can use the file, terminal, Git, Skill, and MCP tools already available to that session. Selecting a Skill sends its `/<skill-name>` invocation into the Agent, where the existing Skill system loads `SKILL.md` and continues the task.
+
+These capabilities are intended for one trusted user remotely controlling their own machine. A paired account receives the full Agent capabilities available in the selected project. Permission prompts are an operation gate, not an operating-system sandbox. Do not expose the Bot to public groups or untrusted accounts, and do not install unreviewed Skills, Plugins, or MCP servers from chat.
+
+The adapter accepts private chats only from paired or allowlisted accounts. Project lists, name matching, and historical session restore are restricted to the configured project root. New remote sessions always use the `default` permission mode, and historical `bypassPermissions` sessions are not restored remotely. Local images in Agent output must resolve inside the active session work directory; the Adapter never fetches remote image URLs from Agent-authored text.
 
 ## Approval and reply behavior
 
-A permission request arrives as a message with three buttons: allow once, always allow the matching operation, and deny. The choice is converted to a `permission_response` for the pending Desktop session.
+A permission request arrives as a message with three buttons: allow once, always allow the matching operation for this session, and deny. Only a currently pending request can be confirmed, and the choice is converted to a `permission_response` for that same Desktop session.
 
 Replies pass through a streaming buffer: a placeholder can be sent while Claude is thinking, text deltas accumulate in place, and completed text is split into platform-sized messages.
 

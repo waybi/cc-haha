@@ -74,4 +74,25 @@ describe('Settings section navigation', () => {
     expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' })
     expect(useUIStore.getState().activeSettingsTab).toBe('diagnostics')
   })
+
+  it('keeps the rail on paper so the Settings tab meets its own content', () => {
+    render(<Settings />)
+
+    const rail = screen.getByRole('button', { name: 'Providers' })
+      .closest('div[class*="w-[220px]"]')
+
+    // This rail is what sits directly under the Settings tab, and the tab is
+    // filled with paper precisely so its bottom edge runs unbroken into the
+    // view it opens onto. The rail used to be
+    // `--color-surface-container-low`, which resolves to the same value as the
+    // strip's trough — making Settings the one tab in the app whose paper met
+    // a different colour at its own bottom edge, a white card stranded on a
+    // grey panel. Paper plus the rule, the way the workbench and the diff
+    // split already do it.
+    expect(rail?.className).toContain('bg-[var(--color-surface)]')
+    expect(rail?.className).not.toContain('bg-[var(--color-surface-container-low)]')
+    // The rule is what separates the rail from the section beside it now, so
+    // it is load-bearing rather than trim.
+    expect(rail?.className).toContain('border-r')
+  })
 })

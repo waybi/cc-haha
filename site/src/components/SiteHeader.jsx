@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import Icon from './icons'
 import { toSiteHref } from '../content/docs'
+import { rememberLocale } from '../lib/locale'
 import { useTheme } from '../lib/theme'
 import SearchDialog from './SearchDialog'
 
@@ -83,7 +84,16 @@ export default function SiteHeader({ activeSection, locale = 'zh', localeHref })
                 {label}
               </a>
             ))}
-            <a href={toSiteHref(switchHref)} onClick={() => setOpen(false)}>{c.toEnglish}</a>
+            <a
+              href={toSiteHref(switchHref)}
+              onClick={() => {
+                // 手动切过就记住，别让下次进首页时又被浏览器语言盖回去。
+                rememberLocale(locale === 'en' ? 'zh' : 'en')
+                setOpen(false)
+              }}
+            >
+              {c.toEnglish}
+            </a>
           </nav>
 
           <div className="header-tools">

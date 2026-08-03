@@ -295,6 +295,7 @@ import { useChatStore } from '../../stores/chatStore'
 import { useWorkspaceChatContextStore } from '../../stores/workspaceChatContextStore'
 import { useWorkspacePanelStore } from '../../stores/workspacePanelStore'
 import { useUIStore } from '../../stores/uiStore'
+import { getServerBaseUrl } from '../../lib/desktopRuntime'
 import { WorkspacePanel } from './WorkspacePanel'
 
 describe('WorkspacePanel', () => {
@@ -1742,6 +1743,94 @@ describe('WorkspacePanel', () => {
     expect(view.getByRole('button', { name: 'Collapse preview' })).toBeTruthy()
   })
 
+  it('marks the revealed line when a reference carries one', async () => {
+    // #1146: clicking `src/app.ts:3` in the chat has to land on line 3, not just
+    // open the file.
+    await setWorkspaceState((state) => ({
+      ...state,
+      panelBySession: {
+        ...state.panelBySession,
+        'session-reveal-line': { isOpen: true, activeView: 'all' },
+      },
+      previewTabsBySession: {
+        ...state.previewTabsBySession,
+        'session-reveal-line': [{
+          id: 'file:src/app.ts',
+          path: 'src/app.ts',
+          kind: 'file',
+          title: 'app.ts',
+          content: 'const a = 1\nconst b = 2\nconst c = 3\nconst d = 4',
+          language: 'typescript',
+          previewType: 'text',
+          state: 'ok',
+          reveal: { line: 3, nonce: 1 },
+        }],
+      },
+      activePreviewTabIdBySession: {
+        ...state.activePreviewTabIdBySession,
+        'session-reveal-line': 'file:src/app.ts',
+      },
+    }))
+
+    const view = await renderPanel('session-reveal-line')
+    const code = view.getByTestId('workspace-code')
+
+    const revealed = code.querySelector('[data-workspace-line-number="3"]')
+    expect(revealed?.className).toContain('bg-[var(--color-brand-soft)]')
+    // The inset rule is the load-bearing part of the mark: every soft fill in the
+    // palette sits under 1.11 contrast against the code background. See
+    // theme/contrast.test.ts.
+    expect(revealed?.className).toContain('shadow-[inset_2px_0_0_var(--color-brand)]')
+    // Neighbours keep the plain hover treatment.
+    expect(code.querySelector('[data-workspace-line-number="2"]')?.className)
+      .toContain('hover:bg-[var(--color-surface-hover)]')
+  })
+
+  it('expands a truncated preview when the revealed line is past the fold', async () => {
+    // Without this the reference silently does nothing: the row it points at is
+    // not rendered at all while the preview is capped.
+    const longFile = Array.from(
+      { length: workspacePreviewLineLimitForTests + 10 },
+      (_, index) => `const line${index + 1} = ${index + 1}`,
+    ).join('\n')
+    const revealLine = workspacePreviewLineLimitForTests + 5
+
+    await setWorkspaceState((state) => ({
+      ...state,
+      panelBySession: {
+        ...state.panelBySession,
+        'session-reveal-past-fold': { isOpen: true, activeView: 'all' },
+      },
+      previewTabsBySession: {
+        ...state.previewTabsBySession,
+        'session-reveal-past-fold': [{
+          id: 'file:long.ts',
+          path: 'long.ts',
+          kind: 'file',
+          title: 'long.ts',
+          content: longFile,
+          language: 'typescript',
+          previewType: 'text',
+          state: 'ok',
+          reveal: { line: revealLine, nonce: 1 },
+        }],
+      },
+      activePreviewTabIdBySession: {
+        ...state.activePreviewTabIdBySession,
+        'session-reveal-past-fold': 'file:long.ts',
+      },
+    }))
+
+    const view = await renderPanel('session-reveal-past-fold')
+
+    await waitFor(() => {
+      expect(view.getByTestId('workspace-code').textContent).toContain(`const line${revealLine} = ${revealLine}`)
+    })
+    expect(view.getByTestId('workspace-code')
+      .querySelector(`[data-workspace-line-number="${revealLine}"]`)?.className)
+      .toContain('bg-[var(--color-brand-soft)]')
+  })
+
   it('renders image previews from workspace files', async () => {
     await setWorkspaceState((state) => ({
       ...state,
@@ -1828,6 +1917,71 @@ describe('WorkspacePanel', () => {
     expect(view.getByText('Done')).toBeTruthy()
     expect(view.container.textContent).toContain('export const ok = true')
     expect(view.queryByTestId('workspace-code')).toBeNull()
+  })
+
+  it('resolves relative and remote markdown preview images to loadable URLs', async () => {
+    await setWorkspaceState((state) => ({
+      ...state,
+      panelBySession: {
+        ...state.panelBySession,
+        'session-markdown-images': {
+          isOpen: true,
+          activeView: 'all',
+        },
+      },
+      statusBySession: {
+        ...state.statusBySession,
+        'session-markdown-images': {
+          state: 'ok',
+          workDir: '/repo',
+          repoName: 'repo',
+          branch: 'main',
+          isGitRepo: true,
+          changedFiles: [],
+        },
+      },
+      previewTabsBySession: {
+        ...state.previewTabsBySession,
+        'session-markdown-images': [{
+          id: 'file:docs/guide.md',
+          path: 'docs/guide.md',
+          kind: 'file',
+          title: 'guide.md',
+          language: 'markdown',
+          content: [
+            '# Guide',
+            '',
+            '![logo](assets/logo.png)',
+            '![banner](../shared/banner.png)',
+            '![badge](https://img.shields.io/badge/stars-1k.svg)',
+            '![absolute](/repo/docs/raw.png)',
+            '![inline](data:image/png;base64,AAAA)',
+          ].join('\n'),
+          state: 'ok',
+          size: 160,
+        }],
+      },
+      activePreviewTabIdBySession: {
+        ...state.activePreviewTabIdBySession,
+        'session-markdown-images': 'file:docs/guide.md',
+      },
+    }))
+
+    const view = await renderPanel('session-markdown-images')
+
+    const base = getServerBaseUrl()
+    const images = await waitFor(() => {
+      const found = Array.from(view.container.querySelectorAll('img'))
+      expect(found).toHaveLength(5)
+      return found
+    })
+    expect(images.map((image) => image.getAttribute('src'))).toEqual([
+      `${base}/preview-fs/session-markdown-images/docs/assets/logo.png`,
+      `${base}/preview-fs/session-markdown-images/shared/banner.png`,
+      'https://img.shields.io/badge/stars-1k.svg',
+      `${base}/local-file/repo/docs/raw.png`,
+      'data:image/png;base64,AAAA',
+    ])
   })
 
   it('renders Mermaid diagrams in markdown file previews when labels contain HTML breaks and braces', async () => {

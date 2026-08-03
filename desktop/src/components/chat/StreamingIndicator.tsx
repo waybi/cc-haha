@@ -5,13 +5,7 @@ import { useChatStore } from '../../stores/chatStore'
 import { useTabStore } from '../../stores/tabStore'
 import { useTranslation, type TranslationKey } from '../../i18n'
 import { formatTokenCount } from '../../lib/formatTokenCount'
-
-function formatElapsed(seconds: number): string {
-  if (seconds < 60) return `${seconds}s`
-  const m = Math.floor(seconds / 60)
-  const s = seconds % 60
-  return `${m}m ${s}s`
-}
+import { formatDurationSeconds } from '../../lib/backgroundTasks'
 
 function translateServerVerb(
   t: (key: TranslationKey) => string,
@@ -115,7 +109,7 @@ export function StreamingIndicator() {
         </span>
         {elapsedSeconds > 0 && (
           <span className="text-[12.5px] text-[var(--color-text-tertiary)]">
-            {formatElapsed(elapsedSeconds)}
+            {formatDurationSeconds(elapsedSeconds, t)}
           </span>
         )}
       </div>
@@ -140,7 +134,7 @@ export function StreamingIndicator() {
       <span className="animate-pulse-dot text-[var(--color-brand)]" aria-hidden="true">✦</span>
       <span className="font-medium text-[var(--color-text-primary)]">{verb}...</span>
       {elapsedSeconds > 0 && (
-        <span>{formatElapsed(elapsedSeconds)}</span>
+        <span>{formatDurationSeconds(elapsedSeconds, t)}</span>
       )}
       {streamingTokens > 0 && (
         <>

@@ -29,9 +29,10 @@ import {
   type ConversationNavigationItem,
   type ConversationNavigationMode,
 } from './ConversationNavigator'
-import type { AgentTaskNotification, UIMessage } from '../../types/chat'
+import type { AgentTaskNotification, BackgroundAgentTask, UIMessage } from '../../types/chat'
 import { formatTokenCount } from '../../lib/formatTokenCount'
 import { formatDurationMs, hasRunningBackgroundTasks as hasAnyRunningBackgroundTasks } from '../../lib/backgroundTasks'
+import { buildTurnCompletionByMessageId, type TurnCompletion } from '../../lib/turnCompletion'
 import { isTouchH5Document } from '../../lib/touchH5'
 import { Button } from '@/components/ui/Button'
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
@@ -792,6 +793,7 @@ function buildTurnCardInsertionMap(
 
   const cardsByRenderIndex = new Map<number, TurnChangeCardModel[]>()
   turnChangeCards.forEach((card) => {
+    if (card.checkpoint.code.filesChanged.length === 0) return
     const renderIndex =
       lastResponseIndexByTurnId.get(card.target.messageId) ??
       userIndexByTurnId.get(card.target.messageId)
@@ -819,9 +821,7 @@ function buildChangedFilesByRenderIndex(
 ): Map<number, string[]> {
   const filesByTurnId = new Map<string, string[]>()
   for (const card of turnChangeCards) {
-    if (card.checkpoint.code.filesChanged.length > 0) {
-      filesByTurnId.set(card.target.messageId, card.checkpoint.code.filesChanged)
-    }
+    filesByTurnId.set(card.target.messageId, card.checkpoint.code.filesChanged)
   }
   if (filesByTurnId.size === 0) return new Map()
 
@@ -955,9 +955,9 @@ const VIRTUAL_OVERSCAN_PX = 1200
 const VIRTUAL_DEFAULT_VIEWPORT_HEIGHT = 720
 const VIRTUAL_MIN_ITEM_HEIGHT = 48
 const VIRTUAL_MAX_ITEM_HEIGHT = 24_000
-// Windows WebView2 can report 1px oscillations for live chat content; don't
-// convert those into bottom-scroll corrections.
-const CONTENT_RESIZE_FOLLOW_MIN_DELTA_PX = 2
+// Windows WebView2 can report up to 2px oscillations for live chat content;
+// don't convert those into bottom-scroll corrections.
+const CONTENT_RESIZE_FOLLOW_JITTER_MAX_DELTA_PX = 2
 const USER_SCROLL_INTENT_WINDOW_MS = 500
 const CONVERSATION_NAVIGATION_MIN_ITEMS = 4
 const CONVERSATION_NAVIGATION_FULL_MIN_WIDTH_PX = 960
@@ -1586,7 +1586,15 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
   const streamingToolInput = sessionState?.streamingToolInput ?? ''
   const activeThinkingId = sessionState?.activeThinkingId ?? null
   const agentTaskNotifications = sessionState?.agentTaskNotifications ?? EMPTY_AGENT_TASK_NOTIFICATIONS
-  const hasRunningBackgroundTasks = hasAnyRunningBackgroundTasks(sessionState?.backgroundAgentTasks)
+  const backgroundAgentTasks = sessionState?.backgroundAgentTasks
+  const agentTaskStatuses = useMemo<Record<string, BackgroundAgentTask['status']>>(() => {
+    const statuses: Record<string, BackgroundAgentTask['status']> = {}
+    for (const task of Object.values(backgroundAgentTasks ?? {})) {
+      if (task.toolUseId) statuses[task.toolUseId] = task.status
+    }
+    return statuses
+  }, [backgroundAgentTasks])
+  const hasRunningBackgroundTasks = hasAnyRunningBackgroundTasks(backgroundAgentTasks)
   const pendingPermissions = listPendingPermissions(sessionState)
   const activeAskUserQuestionToolUseId =
     pendingPermissions
@@ -1634,13 +1642,14 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
   const [branchingMessageId, setBranchingMessageId] = useState<string | null>(null)
   const [rewindingTurnId, setRewindingTurnId] = useState<string | null>(null)
   const [turnUndoConfirmTargetId, setTurnUndoConfirmTargetId] = useState<string | null>(null)
-  const [showJumpToLatest, setShowJumpToLatest] = useState(false)
+  const [isAwayFromLatest, setIsAwayFromLatest] = useState(false)
   const [virtualViewport, setVirtualViewport] = useState<VirtualViewport>({
     scrollTop: SCROLL_BOTTOM_SENTINEL,
     viewportHeight: VIRTUAL_DEFAULT_VIEWPORT_HEIGHT,
   })
   const [measuredItemsVersion, setMeasuredItemsVersion] = useState(0)
   const [highlightedNavigationItemKey, setHighlightedNavigationItemKey] = useState<string | null>(null)
+  const [programmaticNavigationItemId, setProgrammaticNavigationItemId] = useState<string | null>(null)
   const [activeConversationFindMatch, setActiveConversationFindMatch] = useState<ConversationFindMatch | null>(null)
   const conversationFindMatchesRef = useRef<ConversationFindMatch[]>([])
   const [messageListWidth, setMessageListWidth] = useState<number | null>(null)
@@ -1731,7 +1740,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
         wasAtBottom: true,
       })
     }
-    setShowJumpToLatest(false)
+    setIsAwayFromLatest(false)
     // Reset flag after the scroll event(s) from scrollIntoView have fired
     requestAnimationFrame(() => {
       const latestContainer = scrollContainerRef.current
@@ -1804,6 +1813,9 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
       syncVirtualViewportFromContainer(container)
       return
     }
+    if (performance.now() < userScrollIntentUntilRef.current) {
+      setProgrammaticNavigationItemId(null)
+    }
     syncVirtualViewportFromContainer(container)
     const isAtBottom = isNearScrollBottom(container)
     const isPermissionLayoutShift =
@@ -1814,7 +1826,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
     if (isPermissionLayoutShift) return
 
     shouldAutoScrollRef.current = isAtBottom
-    setShowJumpToLatest(!isAtBottom)
+    setIsAwayFromLatest(!isAtBottom)
 
     if (resolvedSessionId) {
       rememberSessionScroll(resolvedSessionId, container)
@@ -1829,7 +1841,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
     markUserScrollIntent()
     if (event.deltaY < 0) {
       shouldAutoScrollRef.current = false
-      setShowJumpToLatest(true)
+      setIsAwayFromLatest(true)
     }
   }, [markUserScrollIntent])
 
@@ -1849,7 +1861,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
     markUserScrollIntent()
     if (isUpwardScrollKey) {
       shouldAutoScrollRef.current = false
-      setShowJumpToLatest(true)
+      setIsAwayFromLatest(true)
     }
   }, [markUserScrollIntent])
 
@@ -1858,6 +1870,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
       const snapshot = resolvedSessionId ? sessionScrollSnapshots.get(resolvedSessionId) : undefined
       shouldAutoScrollRef.current = snapshot?.wasAtBottom ?? true
       lastSessionIdRef.current = resolvedSessionId
+      setProgrammaticNavigationItemId(null)
       virtualItemHeightsRef.current = resolvedSessionId
         ? getHeightsForSession(resolvedSessionId)
         : new Map<string, number>()
@@ -1881,7 +1894,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
           scrollTop: snapshot.scrollTop,
           viewportHeight: container.clientHeight || current.viewportHeight || VIRTUAL_DEFAULT_VIEWPORT_HEIGHT,
         }))
-        setShowJumpToLatest(true)
+        setIsAwayFromLatest(true)
       } else if (container) {
         // Switch to a session we were at the bottom of (or first visit): write
         // the bottom sentinel without going through scrollToBottom's read path,
@@ -1895,7 +1908,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
           scrollTop: SCROLL_BOTTOM_SENTINEL,
           viewportHeight: container.clientHeight || current.viewportHeight || VIRTUAL_DEFAULT_VIEWPORT_HEIGHT,
         }))
-        setShowJumpToLatest(false)
+        setIsAwayFromLatest(false)
         if (resolvedSessionId) {
           sessionScrollSnapshots.set(resolvedSessionId, {
             scrollTop: container.scrollTop,
@@ -1928,7 +1941,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
 
   useEffect(() => {
     if (!shouldAutoScrollRef.current) {
-      setShowJumpToLatest(true)
+      setIsAwayFromLatest(true)
       return
     }
 
@@ -1936,6 +1949,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
   }, [messages.length, resolvedSessionId, scrollToBottom, streamingText, streamingToolInput])
 
   const handleJumpToLatest = useCallback(() => {
+    setProgrammaticNavigationItemId(null)
     scrollToBottom('auto')
   }, [scrollToBottom])
 
@@ -1949,7 +1963,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
         const previousFollowHeight = lastContentResizeFollowHeightRef.current
         if (
           previousFollowHeight !== null &&
-          Math.abs(nextHeight - previousFollowHeight) < CONTENT_RESIZE_FOLLOW_MIN_DELTA_PX
+          Math.abs(nextHeight - previousFollowHeight) <= CONTENT_RESIZE_FOLLOW_JITTER_MAX_DELTA_PX
         ) {
           return
         }
@@ -2001,6 +2015,10 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
     () => getCompletedTurnTargets(deferredMessages),
     [deferredMessages],
   )
+  const turnCompletionByMessageId = useMemo(
+    () => buildTurnCompletionByMessageId(deferredMessages, { turnActive: chatState !== 'idle' }),
+    [deferredMessages, chatState],
+  )
   const latestCompletedTurnId =
     completedTurnTargets.length > 0
       ? completedTurnTargets[completedTurnTargets.length - 1]?.messageId ?? null
@@ -2011,8 +2029,8 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
     [renderItems, visibleTurnChangeCards],
   )
   const changedFilesByRenderIndex = useMemo(
-    () => buildChangedFilesByRenderIndex(renderItems, visibleTurnChangeCards),
-    [renderItems, visibleTurnChangeCards],
+    () => buildChangedFilesByRenderIndex(renderItems, turnChangeCards),
+    [renderItems, turnChangeCards],
   )
   const renderItemKeys = useMemo(
     () => renderItems.map(getRenderItemKey),
@@ -2035,7 +2053,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
     }),
     [renderItemKeys, renderItems],
   )
-  const conversationNavigationHistoryItems = useMemo(() => {
+  const conversationNavigationItems = useMemo(() => {
     const sources = renderItems.flatMap((item, renderIndex) => item.kind === 'message'
       ? [{
           message: item.message,
@@ -2046,26 +2064,6 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
 
     return buildConversationNavigationItems(sources)
   }, [renderItems])
-  const streamingConversationNavigationItem = useMemo(() => {
-    if (!streamingText.trim()) return null
-
-    return buildConversationNavigationItems([{
-      message: {
-        id: `${STREAMING_ASSISTANT_NAVIGATION_KEY}-${resolvedSessionId ?? 'session'}`,
-        type: 'assistant_text',
-        content: streamingText,
-        timestamp: 0,
-      },
-      renderIndex: renderItems.length,
-      renderItemKey: STREAMING_ASSISTANT_NAVIGATION_KEY,
-    }])[0] ?? null
-  }, [renderItems, resolvedSessionId, streamingText])
-  const conversationNavigationItems = useMemo(
-    () => streamingConversationNavigationItem
-      ? [...conversationNavigationHistoryItems, streamingConversationNavigationItem]
-      : conversationNavigationHistoryItems,
-    [conversationNavigationHistoryItems, streamingConversationNavigationItem],
-  )
   const virtualTranscriptWindow = useMemo(
     () => buildVirtualTranscriptWindow(
       renderItems,
@@ -2078,14 +2076,20 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
     [measuredItemsVersion, renderItemKeys, renderItemMetrics, renderItems, virtualViewport],
   )
   const activeConversationNavigationItemId = useMemo(
-    () => getActiveConversationNavigationItemId(
-      conversationNavigationItems,
-      virtualTranscriptWindow.offsets,
-      virtualViewport.scrollTop,
-      virtualViewport.viewportHeight,
-    ),
-    [conversationNavigationItems, virtualTranscriptWindow.offsets, virtualViewport],
+    () => isAwayFromLatest
+      ? getActiveConversationNavigationItemId(
+          conversationNavigationItems,
+          virtualTranscriptWindow.offsets,
+          virtualViewport.scrollTop,
+          virtualViewport.viewportHeight,
+        )
+      : null,
+    [conversationNavigationItems, isAwayFromLatest, virtualTranscriptWindow.offsets, virtualViewport],
   )
+  const visibleConversationNavigationItemId =
+    programmaticNavigationItemId && conversationNavigationItems.some((item) => item.id === programmaticNavigationItemId)
+      ? programmaticNavigationItemId
+      : activeConversationNavigationItemId
   const conversationNavigationMode: ConversationNavigationMode =
     messageListWidth === null || messageListWidth >= CONVERSATION_NAVIGATION_FULL_MIN_WIDTH_PX
       ? 'full'
@@ -2175,7 +2179,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
             const target =
               targetByMessageId.get(checkpoint.target.targetUserMessageId) ??
               targetByUserMessageIndex.get(checkpoint.target.userMessageIndex)
-            if (!target || !checkpoint.code.available || checkpoint.code.filesChanged.length === 0) {
+            if (!target || !checkpoint.code.available) {
               return []
             }
             return [{
@@ -2322,9 +2326,8 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
     if (!container) return
 
     const viewportHeight = container.clientHeight || virtualViewport.viewportHeight || VIRTUAL_DEFAULT_VIEWPORT_HEIGHT
-    const isTranscriptTail =
-      item.renderItemKey === STREAMING_ASSISTANT_NAVIGATION_KEY ||
-      item.renderIndex === renderItems.length - 1
+    userScrollIntentUntilRef.current = 0
+    setProgrammaticNavigationItemId(item.id)
     setHighlightedNavigationItemKey(item.renderItemKey)
 
     const scheduleHighlightClear = () => {
@@ -2337,12 +2340,6 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
       }, 1400)
     }
 
-    if (isTranscriptTail) {
-      scrollToBottom('auto')
-      requestAnimationFrame(scheduleHighlightClear)
-      return
-    }
-
     const targetScrollTop = getConversationNavigationTargetScrollTop(
       item,
       virtualTranscriptWindow.offsets,
@@ -2353,7 +2350,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
     const isNearby = Math.abs(container.scrollTop - targetScrollTop) <= viewportHeight * 1.25
 
     shouldAutoScrollRef.current = false
-    setShowJumpToLatest(true)
+    setIsAwayFromLatest(true)
     ignoreProgrammaticScrollUntilRef.current = performance.now() + 250
     ignoreProgrammaticScrollTopRef.current = targetScrollTop
 
@@ -2384,8 +2381,6 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
       scheduleHighlightClear()
     })
   }, [
-    renderItems.length,
-    scrollToBottom,
     syncVirtualViewportFromContainer,
     virtualTranscriptWindow.offsets,
     virtualTranscriptWindow.totalHeight,
@@ -2406,7 +2401,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
 
     setActiveConversationFindMatch(match)
     shouldAutoScrollRef.current = false
-    setShowJumpToLatest(true)
+    setIsAwayFromLatest(true)
     ignoreProgrammaticScrollUntilRef.current = performance.now() + 250
     ignoreProgrammaticScrollTopRef.current = targetScrollTop
     setScrollTopWithoutLayoutRead(container, targetScrollTop)
@@ -2576,6 +2571,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
             resultMap={toolResultMap}
             childToolCallsByParent={childToolCallsByParent}
             agentTaskNotifications={agentTaskNotifications}
+            agentTaskStatuses={agentTaskStatuses}
             isStreaming={
               chatState === 'tool_executing' &&
               item.toolCalls.some((tc) => !toolResultMap.has(tc.toolUseId))
@@ -2594,6 +2590,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
             }
             branchAction={branchActionByMessageId.get(item.message.id)}
             turnChangedFiles={changedFilesByRenderIndex.get(index)}
+            turnCompletion={turnCompletionByMessageId.get(item.message.id)}
           />
         )}
 
@@ -2663,10 +2660,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
           ) : null}
 
           {streamingText.trim() && (
-            <div
-              data-chat-render-item-key={STREAMING_ASSISTANT_NAVIGATION_KEY}
-              className={highlightedNavigationItemKey === STREAMING_ASSISTANT_NAVIGATION_KEY ? 'chat-render-item--navigation-target' : ''}
-            >
+            <div data-chat-render-item-key={STREAMING_ASSISTANT_NAVIGATION_KEY}>
               <AssistantMessage content={streamingText} isStreaming={chatState === 'streaming'} />
             </div>
           )}
@@ -2697,12 +2691,12 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
         <ConversationNavigator
           mode={conversationNavigationMode}
           items={conversationNavigationItems}
-          activeItemId={activeConversationNavigationItemId}
+          activeItemId={visibleConversationNavigationItemId}
           onNavigate={handleNavigateToConversationItem}
         />
       ) : null}
 
-      {showJumpToLatest && (
+      {isAwayFromLatest && (
         <Button
           variant="secondary"
           size="md"
@@ -2751,6 +2745,7 @@ export const MessageBlock = memo(function MessageBlock({
   toolResult,
   branchAction,
   turnChangedFiles,
+  turnCompletion,
 }: {
   sessionId?: string | null
   message: UIMessage
@@ -2763,6 +2758,7 @@ export const MessageBlock = memo(function MessageBlock({
     onBranch: () => void
   }
   turnChangedFiles?: string[]
+  turnCompletion?: TurnCompletion
 }) {
   const t = useTranslation()
 
@@ -2780,6 +2776,7 @@ export const MessageBlock = memo(function MessageBlock({
             attachments={message.attachments}
             branchAction={branchAction}
             timestamp={message.timestamp}
+            sessionId={sessionId ?? undefined}
           />
         </SelectableChatMessage>
       )
@@ -2797,6 +2794,7 @@ export const MessageBlock = memo(function MessageBlock({
             sessionId={sessionId ?? undefined}
             timestamp={message.timestamp}
             turnChangedFiles={turnChangedFiles}
+            turnCompletion={turnCompletion}
           />
         </SelectableChatMessage>
       )
@@ -2813,6 +2811,11 @@ export const MessageBlock = memo(function MessageBlock({
           />
         )
       }
+      // No durationMs prop here on purpose: buildRenderModel only emits a
+      // standalone tool_use item for AskUserQuestion, and this branch is reached
+      // only while such a call is still pending — so there is never a result to
+      // measure against. The badge is wired in ToolCallGroup, the path every
+      // other tool call takes.
       return (
         <ToolCallBlock
           toolName={message.toolName}

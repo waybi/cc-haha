@@ -46,10 +46,11 @@ import { useActivityPanelStore } from '../stores/activityPanelStore'
 import { getSessionBrowsablePath, getSessionWorkspaceState } from '../lib/sessionWorkspace'
 
 const TASK_POLL_INTERVAL_MS = 1000
+const ACTIVITY_AUTOCLOSE_GRACE_MS = 2000
 const WORKSPACE_RESIZE_STEP = 32
 const TERMINAL_RESIZE_STEP = 24
 const CHAT_COLUMN_WITH_WORKSPACE_CLASS =
-  'min-w-[320px] flex-1 border-r border-[var(--color-border)] bg-[var(--color-surface)]'
+  'min-w-[320px] flex-1 bg-[var(--color-surface)]'
 const EMPTY_DISMISSED_BACKGROUND_TASK_KEYS: readonly string[] = []
 
 function isSessionTabState(activeTabId: string | null, activeTabType: TabType | null | undefined) {
@@ -200,9 +201,9 @@ function WorkspaceResizeHandle({ panelRef }: { panelRef: RefObject<HTMLElement> 
           setWidth(renderedWidth - WORKSPACE_RESIZE_STEP)
         }
       }}
-      className="group relative z-10 flex w-2 shrink-0 cursor-col-resize items-stretch justify-center bg-[var(--color-surface)] outline-none focus-visible:bg-[var(--color-surface-container)]"
+      className="relative z-10 w-px shrink-0 cursor-col-resize bg-[var(--color-border)] outline-none transition-colors hover:bg-[var(--color-border-focus)] focus-visible:bg-[var(--color-border-focus)]"
     >
-      <div className="my-3 w-px rounded-full bg-[var(--color-border)] transition-colors group-hover:bg-[var(--color-border-focus)] group-focus-visible:bg-[var(--color-border-focus)]" />
+      <div aria-hidden="true" className="absolute -inset-x-1 inset-y-0" />
     </div>
   )
 }
@@ -407,6 +408,8 @@ export function ActiveSession() {
     (trackedTaskSessionId === activeTabId && hasRunningTasks) ||
     hasRunningBackgroundTasks
   const totalTokens = getTokenUsageTotal(tokenUsage)
+  const cachedTokens = (tokenUsage.cache_read_tokens ?? 0) +
+    (tokenUsage.cache_creation_tokens ?? 0)
   const activityTeamMembers = useMemo(() => {
     if (!activeTeam || activeTeam.leadSessionId !== activeTabId) return []
     return activeTeam.members.filter((member) =>
@@ -476,8 +479,19 @@ export function ActiveSession() {
 
   useEffect(() => {
     if (!activeTabId || !isActivityPanelOpen || hasVisibleActivity) return
-    closeActivityPanel(activeTabId)
-  }, [activeTabId, closeActivityPanel, hasVisibleActivity, isActivityPanelOpen])
+    // Activity rows derive from volatile caches that are briefly empty during
+    // history loads, cli-task refetches and reconnect reloads. Closing the
+    // panel on the first empty beat made that flicker permanent (auto-open
+    // does not re-fire after a remount), so only close once the empty state
+    // survives a full history-ready grace period.
+    if (sessionState?.historyStatus === 'loading') return
+    const timer = setTimeout(() => {
+      const current = useChatStore.getState().sessions[activeTabId]
+      if (current?.historyStatus === 'loading') return
+      closeActivityPanel(activeTabId)
+    }, ACTIVITY_AUTOCLOSE_GRACE_MS)
+    return () => clearTimeout(timer)
+  }, [activeTabId, closeActivityPanel, hasVisibleActivity, isActivityPanelOpen, sessionState?.historyStatus])
 
   useEffect(() => {
     if (!activeTabId || !showWorkbench || !isActivityPanelOpen) return
@@ -649,8 +663,17 @@ export function ActiveSession() {
                           </span>
                         ),
                         totalTokens > 0 && (
-                          <span key="tokens" className="shrink-0" title={t('common.tokens', { count: totalTokens.toLocaleString() })}>
-                            {t('common.tokens', { count: formatTokenCount(totalTokens) })}
+                          <span
+                            key="tokens"
+                            className="shrink-0"
+                            title={t('session.apiTokenBreakdown', {
+                              total: totalTokens.toLocaleString(),
+                              input: tokenUsage.input_tokens.toLocaleString(),
+                              output: tokenUsage.output_tokens.toLocaleString(),
+                              cache: cachedTokens.toLocaleString(),
+                            })}
+                          >
+                            {t('session.apiTokens', { count: formatTokenCount(totalTokens) })}
                           </span>
                         ),
                         lastUpdated && (
@@ -774,7 +797,7 @@ export function ActiveSession() {
             <aside
               ref={workbenchPanelRef}
               data-testid="workbench-panel"
-              className="flex h-full shrink-0 flex-col border-l border-[var(--color-border)] bg-[var(--color-surface)]"
+              className="flex h-full shrink-0 flex-col bg-[var(--color-surface)]"
               style={{ width: rightPanelWidth, maxWidth: '62%', minWidth: 'min(420px, 54%)' }}
             >
               <WorkbenchPanel sessionId={activeTabId} />

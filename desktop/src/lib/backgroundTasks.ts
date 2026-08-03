@@ -11,6 +11,13 @@ export function hasRunningBackgroundTasks(tasks?: Record<string, BackgroundAgent
   )
 }
 
+export function hasRunningSubagentTasks(tasks?: Record<string, BackgroundAgentTask>): boolean {
+  return Object.values(tasks ?? {}).some(
+    (task) => task.status === 'running' &&
+      (task.taskType === 'local_agent' || task.taskType === 'remote_agent'),
+  )
+}
+
 export function createBackgroundTaskDismissKey(task: BackgroundAgentTask): string {
   return `${task.taskId}:${task.status}:${task.startedAt}`
 }
@@ -24,9 +31,19 @@ export function formatDurationSeconds(
   if (totalSeconds < 60) {
     return t('chat.duration.seconds', { seconds: totalSeconds })
   }
-  const minutes = Math.floor(totalSeconds / 60)
-  const remainingSeconds = totalSeconds % 60
-  return t('chat.duration.minutesSeconds', { minutes, seconds: remainingSeconds })
+  const totalMinutes = Math.floor(totalSeconds / 60)
+  if (totalMinutes < 60) {
+    return t('chat.duration.minutesSeconds', {
+      minutes: totalMinutes,
+      seconds: totalSeconds % 60,
+    })
+  }
+  // Past an hour "125 min 3 s" makes the reader divide by 60 themselves. Seconds
+  // stop being interesting at that scale, so they are dropped rather than kept.
+  return t('chat.duration.hoursMinutes', {
+    hours: Math.floor(totalMinutes / 60),
+    minutes: totalMinutes % 60,
+  })
 }
 
 export function formatDurationMs(durationMs: number | undefined, t: Translator): string | null {

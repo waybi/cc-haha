@@ -646,5 +646,21 @@ describe('release desktop workflow', () => {
     expect(installerSmoke).toContain('$Stage completed successfully.')
     expect(installerSmoke).toContain('Fresh install did not create the application executable')
     expect(installerSmoke).toContain('Reinstall removed the application executable')
+    expect(installerSmoke).toContain("'中文 安装目录\\Claude Code Haha'")
+    expect(installerSmoke).toContain('Invoke-InstalledApplicationSmoke')
+    expect(installerSmoke).toContain('CC_HAHA_ELECTRON_WINDOW_SMOKE_LOG')
+    expect(installerSmoke).toContain('desktop-server-state.json')
+    expect(installerSmoke).toContain('"reason":"after-final-show"')
+    expect(installerSmoke).toContain('"http://127.0.0.1:$port/health"')
+    expect(installerSmoke).toContain('"http://127.0.0.1:$port/"')
+    expect(installerSmoke).toContain('Installed application Unicode-path smoke passed')
+
+    const compiledSidecarSmoke = readFileSync(
+      'desktop/scripts/build-sidecars.test.ts',
+      'utf8',
+    )
+    expect(compiledSidecarSmoke).toContain("'中文 安装目录'")
+    expect(compiledSidecarSmoke).toContain("'中文 用户目录'")
+    expect(compiledSidecarSmoke).toContain('copyFile(builtExecutable, executable)')
   })
 })

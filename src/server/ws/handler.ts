@@ -4633,7 +4633,7 @@ function pickEffortLevel(
     const value = settings[key]
     if (typeof value === 'string') {
       const level = value.trim()
-      if (VALID_EFFORT_LEVELS.has(level)) return level
+      if (VALID_CLAUDE_EFFORT_LEVELS.has(level)) return level
     }
   }
   return undefined

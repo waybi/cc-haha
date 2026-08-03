@@ -161,7 +161,18 @@ function buildProviderModels(
   for (const model of provider.availableModels ?? []) {
     if (!model.id.trim() || byId.has(model.id)) continue
     byId.set(model.id, { id: model.id, labels: [] })
-    models.push(model)
+    const reasoningProfile = resolveModelReasoningProfile(
+      model.id,
+      provider.apiFormat,
+      getProviderModelCapabilityOverride(provider, model.id),
+    )
+    models.push({
+      ...model,
+      supportedReasoningEfforts: [...(reasoningProfile?.supportedReasoningEfforts ?? [])],
+      ...(reasoningProfile?.defaultReasoningEffort
+        ? { defaultReasoningEffort: reasoningProfile.defaultReasoningEffort }
+        : {}),
+    })
   }
 
   return models

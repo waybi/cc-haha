@@ -672,7 +672,7 @@ export function getMarketingNameForModel(modelId: string): string | undefined {
     return has1m ? 'Opus 4.8 (with 1M context)' : 'Opus 4.8'
   }
   if (canonical.includes('claude-opus-4-7')) {
-    return has1m ? 'Opus 4.7 (with 1M context)' : 'Opus 4.7'
+    return has1m ? 'Opus 4.6 (with 1M context)' : 'Opus 4.6'
   }
   if (canonical.includes('claude-opus-4-6')) {
     return has1m ? 'Opus 4.6 (with 1M context)' : 'Opus 4.6'

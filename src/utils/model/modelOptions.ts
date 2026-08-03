@@ -223,8 +223,8 @@ function getOpus46Option(fastMode = false): ModelOption {
   return {
     value: is3P ? getModelStrings().opus46 : 'opus',
     label: 'Opus',
-    description: `${is3P ? 'Opus 4.7' : 'Opus 4.8'} · Most capable for complex work${getOpus46PricingSuffix(fastMode)}`,
-    descriptionForModel: `${is3P ? 'Opus 4.7' : 'Opus 4.8'} - most capable for complex work`,
+    description: `${is3P ? 'Opus 4.6' : 'Opus 4.8'} · Most capable for complex work${getOpus46PricingSuffix(fastMode)}`,
+    descriptionForModel: `${is3P ? 'Opus 4.6' : 'Opus 4.8'} - most capable for complex work`,
   }
 }
 
@@ -242,7 +242,7 @@ export function getSonnet46_1MOption(): ModelOption {
 
 export function getOpus46_1MOption(fastMode = false): ModelOption {
   const is3P = shouldUseThirdPartyAnthropicOptions()
-  const modelName = is3P ? 'Opus 4.7' : 'Opus 4.8'
+  const modelName = is3P ? 'Opus 4.6' : 'Opus 4.8'
   return {
     value: is3P ? getModelStrings().opus46 + '[1m]' : 'opus[1m]',
     label: 'Opus (1M context)',
@@ -330,9 +330,9 @@ function getMergedOpus1MOption(fastMode = false): ModelOption {
   return {
     value: is3P ? getModelStrings().opus46 + '[1m]' : 'opus[1m]',
     label: 'Opus (1M context)',
-    description: `${is3P ? 'Opus 4.7' : 'Opus 4.8'} with 1M context · Most capable for complex work${!is3P && fastMode ? getOpus46PricingSuffix(fastMode) : ''}`,
+    description: `${is3P ? 'Opus 4.6' : 'Opus 4.8'} with 1M context · Most capable for complex work${!is3P && fastMode ? getOpus46PricingSuffix(fastMode) : ''}`,
     descriptionForModel:
-      `${is3P ? 'Opus 4.7' : 'Opus 4.8'} with 1M context - most capable for complex work`,
+      `${is3P ? 'Opus 4.6' : 'Opus 4.8'} with 1M context - most capable for complex work`,
   }
 }
 

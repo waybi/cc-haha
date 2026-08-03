@@ -442,6 +442,94 @@ describe('openaiResponsesStreamToAnthropic', () => {
     expect((msgDelta.data.delta as Record<string, unknown>).stop_reason).toBe('tool_use')
   })
 
+  test('recovers function call arguments when the item id is only known from the argument events', async () => {
+    const sseChunks = [
+      'event: response.created\ndata: {"id":"r3","model":"gpt-4o","status":"in_progress"}\n\n',
+      'event: response.output_item.added\ndata: {"output_index":0,"item":{"type":"function_call","call_id":"call_2","name":"Bash"}}\n\n',
+      'event: response.function_call_arguments.delta\ndata: {"item_id":"fc_2","delta":"{\\"command\\":\\"git log\\"}"}\n\n',
+      'event: response.function_call_arguments.done\ndata: {"item_id":"fc_2","arguments":"{\\"command\\":\\"git log\\"}"}\n\n',
+      'event: response.completed\ndata: {"response":{"id":"r3","model":"gpt-4o","status":"completed"}}\n\n',
+    ]
+
+    const events = await collectSse(openaiResponsesStreamToAnthropic(makeStream(sseChunks), 'gpt-4o'))
+
+    const toolStart = events.find(
+      (e) => e.event === 'content_block_start' && (e.data.content_block as Record<string, unknown>)?.type === 'tool_use',
+    )
+    expect(toolStart).toBeDefined()
+    const toolIndex = toolStart!.data.index as number
+
+    const partialJson = events
+      .filter(
+        (e) => e.event === 'content_block_delta' &&
+          e.data.index === toolIndex &&
+          (e.data.delta as Record<string, unknown>)?.type === 'input_json_delta',
+      )
+      .map((e) => (e.data.delta as Record<string, unknown>).partial_json as string)
+      .join('')
+    expect(partialJson).toBe('{"command":"git log"}')
+
+    const toolStop = events.find(
+      (e) => e.event === 'content_block_stop' && e.data.index === toolIndex,
+    )
+    expect(toolStop).toBeDefined()
+  })
+
+  test('recovers function call arguments delivered only on response.output_item.done', async () => {
+    const sseChunks = [
+      'event: response.created\ndata: {"id":"r4","model":"gpt-4o","status":"in_progress"}\n\n',
+      'event: response.output_item.added\ndata: {"output_index":0,"item":{"type":"function_call","id":"fc_3","call_id":"call_3","name":"Bash","arguments":""}}\n\n',
+      'event: response.output_item.done\ndata: {"output_index":0,"item":{"type":"function_call","id":"fc_3","call_id":"call_3","name":"Bash","arguments":"{\\"command\\":\\"git log -17\\"}"}}\n\n',
+      'event: response.completed\ndata: {"response":{"id":"r4","model":"gpt-4o","status":"completed"}}\n\n',
+    ]
+
+    const events = await collectSse(openaiResponsesStreamToAnthropic(makeStream(sseChunks), 'gpt-4o'))
+
+    const toolStart = events.find(
+      (e) => e.event === 'content_block_start' && (e.data.content_block as Record<string, unknown>)?.type === 'tool_use',
+    )
+    expect(toolStart).toBeDefined()
+    const toolIndex = toolStart!.data.index as number
+
+    const partialJson = events
+      .filter(
+        (e) => e.event === 'content_block_delta' &&
+          e.data.index === toolIndex &&
+          (e.data.delta as Record<string, unknown>)?.type === 'input_json_delta',
+      )
+      .map((e) => (e.data.delta as Record<string, unknown>).partial_json as string)
+      .join('')
+    expect(partialJson).toBe('{"command":"git log -17"}')
+
+    const toolStop = events.find(
+      (e) => e.event === 'content_block_stop' && e.data.index === toolIndex,
+    )
+    expect(toolStop).toBeDefined()
+  })
+
+  test('closes an unfinished tool block when the stream reaches response.completed', async () => {
+    const sseChunks = [
+      'event: response.created\ndata: {"id":"r5","model":"gpt-4o","status":"in_progress"}\n\n',
+      'event: response.output_item.added\ndata: {"output_index":0,"item":{"type":"function_call","id":"fc_4","call_id":"call_4","name":"Bash"}}\n\n',
+      'event: response.function_call_arguments.delta\ndata: {"item_id":"fc_4","delta":"{\\"command\\":\\"ls\\"}"}\n\n',
+      'event: response.completed\ndata: {"response":{"id":"r5","model":"gpt-4o","status":"completed"}}\n\n',
+    ]
+
+    const events = await collectSse(openaiResponsesStreamToAnthropic(makeStream(sseChunks), 'gpt-4o'))
+
+    const toolStart = events.find(
+      (e) => e.event === 'content_block_start' && (e.data.content_block as Record<string, unknown>)?.type === 'tool_use',
+    )!
+    const toolIndex = toolStart.data.index as number
+
+    const stopIndex = events.findIndex(
+      (e) => e.event === 'content_block_stop' && e.data.index === toolIndex,
+    )
+    const messageDeltaIndex = events.findIndex((e) => e.event === 'message_delta')
+    expect(stopIndex).toBeGreaterThanOrEqual(0)
+    expect(stopIndex).toBeLessThan(messageDeltaIndex)
+  })
+
   test('maps cached tokens from response.completed usage', async () => {
     const sseChunks = [
       'event: response.created\ndata: {"id":"r3","model":"gpt-5.4","status":"in_progress"}\n\n',

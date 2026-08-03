@@ -30,6 +30,8 @@ type StreamState = {
   indexByKey: Map<string, number>
   reasoningIndexByOutputIndex: Map<number, number>
   toolIndexByItemId: Map<string, number>
+  toolArgumentsByIndex: Map<number, string>
+  openToolIndexes: Set<number>
   model: string
   messageStarted: boolean
   messageStopped: boolean
@@ -62,6 +64,8 @@ export function openaiResponsesStreamToAnthropic(
     indexByKey: new Map(),
     reasoningIndexByOutputIndex: new Map(),
     toolIndexByItemId: new Map(),
+    toolArgumentsByIndex: new Map(),
+    openToolIndexes: new Set(),
     model,
     messageStarted: false,
     messageStopped: false,
@@ -252,7 +256,8 @@ function processEvent(
         const index = state.nextContentIndex++
         const callId = (item.call_id as string) || (item.id as string) || ''
         const name = (item.name as string) || ''
-        state.toolIndexByItemId.set((item.id as string) || callId, index)
+        rememberToolIndex(state, index, item.id, item.call_id)
+        state.openToolIndexes.add(index)
 
         controller.enqueue(encoder.encode(formatSse('content_block_start', {
           type: 'content_block_start',
@@ -272,7 +277,17 @@ function processEvent(
 
     case 'response.output_item.done': {
       const item = asRecord(data.item)
-      if (!item || item.type !== 'reasoning') break
+      if (!item) break
+
+      if (item.type === 'function_call') {
+        const index = resolveToolIndex(state, item.id, item.call_id, data.item_id)
+        if (index === undefined) break
+        emitToolArguments(state, index, item.arguments, controller, encoder)
+        closeToolBlock(state, index, controller, encoder)
+        break
+      }
+
+      if (item.type !== 'reasoning') break
 
       if (!options.openAICodexOAuth) {
         closeReasoningBlock(data, state, controller, encoder)
@@ -371,16 +386,10 @@ function processEvent(
     }
 
     case 'response.function_call_arguments.delta': {
-      const itemId = (data.item_id as string) || ''
-      const index = state.toolIndexByItemId.get(itemId)
+      const index = resolveToolIndex(state, data.item_id, data.call_id, data.id)
       if (index === undefined) break
 
-      const delta = stringifyOpenAIToolArguments(data.delta)
-      controller.enqueue(encoder.encode(formatSse('content_block_delta', {
-        type: 'content_block_delta',
-        index,
-        delta: { type: 'input_json_delta', partial_json: delta },
-      })))
+      emitToolArguments(state, index, data.delta, controller, encoder)
       break
     }
 
@@ -400,14 +409,11 @@ function processEvent(
     }
 
     case 'response.function_call_arguments.done': {
-      const itemId = (data.item_id as string) || ''
-      const index = state.toolIndexByItemId.get(itemId)
+      const index = resolveToolIndex(state, data.item_id, data.call_id, data.id)
       if (index === undefined) break
 
-      controller.enqueue(encoder.encode(formatSse('content_block_stop', {
-        type: 'content_block_stop',
-        index,
-      })))
+      emitToolArguments(state, index, data.arguments, controller, encoder)
+      closeToolBlock(state, index, controller, encoder)
       break
     }
 
@@ -457,6 +463,7 @@ function processEvent(
 
       if (!state.messageStarted) emitMessageStart(state, controller, encoder, state.model)
       closeAllReasoningBlocks(state, controller, encoder)
+      closeAllToolBlocks(state, controller, encoder)
       controller.enqueue(encoder.encode(formatSse('message_delta', {
         type: 'message_delta',
         delta: { stop_reason: stopReason, stop_sequence: null },
@@ -468,6 +475,85 @@ function processEvent(
   }
 
   return false
+}
+
+function rememberToolIndex(
+  state: StreamState,
+  index: number,
+  ...ids: unknown[]
+): void {
+  for (const id of ids) {
+    if (typeof id === 'string' && id) state.toolIndexByItemId.set(id, index)
+  }
+}
+
+/**
+ * Responses-compatible providers disagree on which identifier ties argument
+ * events back to their function_call item: some send item_id, some only
+ * call_id. Fall back to the single open tool block so arguments are never
+ * dropped when the identifier does not match the one seen at item start.
+ */
+function resolveToolIndex(
+  state: StreamState,
+  ...ids: unknown[]
+): number | undefined {
+  for (const id of ids) {
+    if (typeof id !== 'string' || !id) continue
+    const index = state.toolIndexByItemId.get(id)
+    if (index !== undefined) return index
+  }
+
+  if (state.openToolIndexes.size !== 1) return undefined
+  const [only] = state.openToolIndexes
+  rememberToolIndex(state, only, ...ids)
+  return only
+}
+
+function emitToolArguments(
+  state: StreamState,
+  index: number,
+  rawArguments: unknown,
+  controller: ReadableStreamDefaultController,
+  encoder: TextEncoder,
+): void {
+  const text = stringifyOpenAIToolArguments(rawArguments)
+  if (!text) return
+
+  const emitted = state.toolArgumentsByIndex.get(index) ?? ''
+  if (emitted === text) return
+
+  const delta = text.startsWith(emitted) ? text.slice(emitted.length) : text
+  if (!delta) return
+
+  state.toolArgumentsByIndex.set(index, emitted + delta)
+  controller.enqueue(encoder.encode(formatSse('content_block_delta', {
+    type: 'content_block_delta',
+    index,
+    delta: { type: 'input_json_delta', partial_json: delta },
+  })))
+}
+
+function closeToolBlock(
+  state: StreamState,
+  index: number,
+  controller: ReadableStreamDefaultController,
+  encoder: TextEncoder,
+): void {
+  if (!state.openToolIndexes.delete(index)) return
+  controller.enqueue(encoder.encode(formatSse('content_block_stop', {
+    type: 'content_block_stop',
+    index,
+  })))
+}
+
+function closeAllToolBlocks(
+  state: StreamState,
+  controller: ReadableStreamDefaultController,
+  encoder: TextEncoder,
+): void {
+  for (const index of [...state.openToolIndexes]) {
+    closeToolBlock(state, index, controller, encoder)
+  }
 }
 
 function ensureReasoningBlock(

@@ -5,7 +5,7 @@ export const MODEL_CONTEXT_WINDOW_MAX = 10_000_000
 const DIRECT_MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   'claude-fable-5': 1_000_000,
   'claude-opus-4-8': 1_000_000,
-  'claude-opus-4-7': 1_000_000,
+  'claude-opus-4-6': 1_000_000,
   'claude-sonnet-5': 1_000_000,
   'claude-sonnet-4-6': 200_000,
   'claude-haiku-4-5': 200_000,
@@ -43,7 +43,7 @@ const PATTERN_MODEL_CONTEXT_WINDOWS: Array<[RegExp, number]> = [
   [/^anthropic\/claude-fable-5\b/i, 1_000_000],
   [/^anthropic\/claude-opus-4\.8\b/i, 1_000_000],
   [/^anthropic\/claude-sonnet-5\b/i, 1_000_000],
-  [/^anthropic\/claude-opus-4\.7\b/i, 1_000_000],
+  [/^anthropic\/claude-opus-4\.6\b/i, 1_000_000],
   [/^anthropic\/claude-sonnet-4\.6\b/i, 200_000],
   [/^anthropic\/claude-haiku-4\.5\b/i, 200_000],
   [/^openai\/gpt-4\.1\b/i, 1_047_576],

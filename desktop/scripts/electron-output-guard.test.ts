@@ -81,4 +81,17 @@ describe('Electron output guard', () => {
     )
     expect(macBuildSource).not.toContain('rm -rf "${ELECTRON_OUTPUT_DIR}"')
   })
+
+  it('keeps local macOS builds separate from the installed release identity', () => {
+    const macBuildSource = readFileSync(path.join(scriptsDir, 'build-macos-arm64.sh'), 'utf8')
+
+    expect(macBuildSource).toContain(
+      'LOCAL_MACOS_APP_ID="${LOCAL_MACOS_APP_ID:-com.claude-code-haha.desktop.local}"',
+    )
+    expect(macBuildSource).toContain(
+      'LOCAL_CODESIGN_IDENTITY="${LOCAL_CODESIGN_IDENTITY:-cc-haha-codesign}"',
+    )
+    expect(macBuildSource).toContain('BUILDER_ARGS+=("-c.appId=${LOCAL_MACOS_APP_ID}"')
+    expect(macBuildSource).toContain('BUILDER_ARGS+=("-c.mac.identity=${LOCAL_CODESIGN_IDENTITY}")')
+  })
 })

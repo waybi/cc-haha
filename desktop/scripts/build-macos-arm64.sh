@@ -20,7 +20,11 @@ Usage:
 
 Environment:
   SKIP_INSTALL=1   Skip `bun install` in the repo root and desktop app.
-  SIGN_BUILD=1     Allow electron-builder to auto-discover signing identities.
+  SIGN_BUILD=1     Build with the release app identity and signing configuration.
+  LOCAL_MACOS_APP_ID
+                   Bundle ID for local builds. Defaults to "com.claude-code-haha.desktop.local".
+  LOCAL_CODESIGN_IDENTITY
+                   Stable local signing identity. Defaults to "cc-haha-codesign".
   REBUILD_NATIVE=1 Run `electron-builder install-app-deps` before packaging.
   MAC_TARGETS      Electron Builder macOS targets. Defaults to "dmg zip".
   SKIP_PACKAGE_SMOKE=1
@@ -117,11 +121,23 @@ echo "[build-macos-arm64] Cleaning empty dmg-builder cache directories..."
 
 BUILDER_ARGS=(node "${ELECTRON_BUILDER_CLI}" --mac "${MAC_TARGET_ARRAY[@]}" --arm64 --publish never)
 if [[ "${SIGN_BUILD:-0}" != "1" ]]; then
-  export CSC_IDENTITY_AUTO_DISCOVERY=false
+  LOCAL_MACOS_APP_ID="${LOCAL_MACOS_APP_ID:-com.claude-code-haha.desktop.local}"
+  LOCAL_CODESIGN_IDENTITY="${LOCAL_CODESIGN_IDENTITY:-cc-haha-codesign}"
+
   # package.json sets mac.notarize=true for the signed CI release path. A local
-  # unsigned build has no Developer ID credentials, so explicitly disable
-  # notarization here to keep `electron:package` working without an Apple account.
-  BUILDER_ARGS+=(-c.mac.notarize=false)
+  # build uses a separate bundle ID so its TCC grants cannot collide with the
+  # installed release app, and notarization remains disabled without Apple credentials.
+  BUILDER_ARGS+=("-c.appId=${LOCAL_MACOS_APP_ID}" -c.mac.notarize=false)
+
+  if security find-identity -v -p codesigning | grep -F "\"${LOCAL_CODESIGN_IDENTITY}\"" >/dev/null; then
+    export CSC_IDENTITY_AUTO_DISCOVERY=true
+    export CSC_NAME="${LOCAL_CODESIGN_IDENTITY}"
+    BUILDER_ARGS+=("-c.mac.identity=${LOCAL_CODESIGN_IDENTITY}")
+    echo "[build-macos-arm64] Signing local build with ${LOCAL_CODESIGN_IDENTITY}."
+  else
+    export CSC_IDENTITY_AUTO_DISCOVERY=false
+    echo "[build-macos-arm64] Local signing identity '${LOCAL_CODESIGN_IDENTITY}' was not found; the build will not retain TCC grants across rebuilds." >&2
+  fi
 fi
 if [[ "$#" -gt 0 ]]; then
   BUILDER_ARGS+=("$@")

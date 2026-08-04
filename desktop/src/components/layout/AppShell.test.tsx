@@ -119,11 +119,11 @@ vi.mock('../../pages/TraceSession', () => ({
   ),
 }))
 
-vi.mock('../shared/Toast', () => ({
+vi.mock('@/components/layout/Toast', () => ({
   ToastContainer: () => null,
 }))
 
-vi.mock('../shared/UpdateChecker', () => ({
+vi.mock('@/components/layout/UpdateChecker', () => ({
   UpdateChecker: () => <div>updates loaded</div>,
 }))
 
@@ -347,12 +347,33 @@ describe('AppShell boot flow', () => {
 
     await screen.findByText('sidebar loaded')
     await waitFor(() => {
-      expect(mocks.openTraceTab).toHaveBeenCalledWith(
-        'session-deep-link',
-        'Trace: session-',
-      )
+      // No session in the store yet, so the id prefix is all the title we have.
+      expect(mocks.openTraceTab).toHaveBeenCalledWith('session-deep-link', 'session-')
     })
     expect(mocks.connectToSession).not.toHaveBeenCalled()
+  })
+
+  it('titles a deep-linked trace tab with the session once the store knows it', async () => {
+    useSessionStore.setState({
+      sessions: [{
+        id: 'session-deep-link',
+        title: 'Debug stuck agent',
+        createdAt: '2026-06-09T10:00:00.000Z',
+        modifiedAt: '2026-06-09T10:10:00.000Z',
+        messageCount: 2,
+        projectPath: '/tmp',
+        workDir: '/tmp',
+        workDirExists: true,
+      }],
+    })
+    window.history.pushState({}, '', '/?traceSessionId=session-deep-link')
+
+    render(<AppShell />)
+
+    await screen.findByText('sidebar loaded')
+    await waitFor(() => {
+      expect(mocks.openTraceTab).toHaveBeenCalledWith('session-deep-link', 'Debug stuck agent')
+    })
   })
 
   it('renders a dedicated trace window shell from traceWindow deep links', async () => {
@@ -562,7 +583,10 @@ describe('AppShell boot flow', () => {
     expect(header).toHaveTextContent('Analyze recent commits')
     expect(header).toHaveTextContent('session.active')
     expect(header).toHaveTextContent('session.messages')
-    expect(screen.getByTestId('mobile-sidebar-toggle')).toHaveClass('h-10', 'w-10')
+    // 44px — the hamburger is the primary mobile navigation target, and the
+    // platform minimum for primary touch targets is 44, not the 40 it shipped
+    // at (IconButton's own size doc had the two tiers reversed).
+    expect(screen.getByTestId('mobile-sidebar-toggle')).toHaveClass('h-11', 'w-11')
   })
 
   it('keeps browser H5 mobile on chat tabs when settings was restored as active', async () => {

@@ -266,8 +266,8 @@ describe('ActiveSession task polling', () => {
 
     render(<ActiveSession />)
 
-    const tokenBadge = screen.getByTitle(/1,500/)
-    expect(tokenBadge).toHaveTextContent('1.5k')
+    const tokenBadge = screen.getByTitle(/cache 1,500/i)
+    expect(tokenBadge).toHaveTextContent('1.5k API tokens')
   })
 
   it('shows a loading state for historical sessions while messages are loading', () => {
@@ -700,10 +700,10 @@ describe('ActiveSession task polling', () => {
     expect(screen.queryByTestId('session-activity-panel')).not.toBeInTheDocument()
     await waitFor(() => {
       expect(useActivityPanelStore.getState().isOpen(sessionId)).toBe(false)
-    })
+    }, { timeout: 4000 })
   })
 
-  it('auto-opens the activity panel when the current session first produces activity', async () => {
+  it('auto-opens for current activity and seals unfinished tasks when the turn becomes idle', async () => {
     const sessionId = 'activity-auto-open-session'
     const fetchSessionTasks = vi.fn().mockResolvedValue(undefined)
 
@@ -714,7 +714,7 @@ describe('ActiveSession task polling', () => {
         title: 'Auto Open Activity Session',
         createdAt: '2026-05-07T00:00:00.000Z',
         modifiedAt: '2026-05-07T00:00:00.000Z',
-        messageCount: 0,
+        messageCount: 1,
         projectPath: '/workspace/project',
         workDir: '/workspace/project',
         workDirExists: true,
@@ -731,7 +731,7 @@ describe('ActiveSession task polling', () => {
       sessions: {
         [sessionId]: {
           messages: [],
-          chatState: 'idle',
+          chatState: 'thinking',
           connectionState: 'connected',
           streamingText: '',
           streamingToolInput: '',
@@ -778,6 +778,23 @@ describe('ActiveSession task polling', () => {
     })
     expect(screen.getByTestId('session-activity-panel')).toHaveAttribute('data-placement', 'rail')
     expect(screen.getByText('Draft implementation plan')).toBeInTheDocument()
+    expect(within(screen.getByTestId('session-activity-panel')).getByLabelText('Task in progress')).toBeInTheDocument()
+
+    act(() => {
+      useChatStore.setState((state) => ({
+        sessions: {
+          ...state.sessions,
+          [sessionId]: {
+            ...state.sessions[sessionId]!,
+            chatState: 'idle',
+          },
+        },
+      }))
+    })
+
+    expect(within(screen.getByTestId('session-activity-panel')).getByLabelText('Stopped')).toBeInTheDocument()
+    expect(within(screen.getByTestId('session-activity-panel')).queryByLabelText('Task in progress')).not.toBeInTheDocument()
+    expect(screen.queryByText(/session active|会话活跃中/)).not.toBeInTheDocument()
   })
 
   it('renders completed historical TodoWrite activity in the rail', () => {
@@ -918,7 +935,7 @@ describe('ActiveSession task polling', () => {
     expect(screen.queryByTestId('session-activity-panel')).not.toBeInTheDocument()
     await waitFor(() => {
       expect(useActivityPanelStore.getState().isOpen(sessionId)).toBe(false)
-    })
+    }, { timeout: 4000 })
   })
 
   it('opens a SubAgent detail tab from the activity panel', () => {
@@ -1098,7 +1115,7 @@ describe('ActiveSession task polling', () => {
     ]))
   })
 
-  it('clears the last visible background task by closing Activity while preserving later runs', () => {
+  it('clears the last visible background task by closing Activity while preserving later runs', async () => {
     const sessionId = 'activity-background-clear-session'
     const otherSessionId = 'activity-background-other-session'
 
@@ -1199,8 +1216,11 @@ describe('ActiveSession task polling', () => {
     fireEvent.click(screen.getByRole('button', { name: /clear finished/i }))
 
     expect(screen.queryByText('Finished smoke run')).not.toBeInTheDocument()
+    // The panel close is debounced so transient empty states cannot hide it.
+    await waitFor(() => {
+      expect(useActivityPanelStore.getState().isOpen(sessionId)).toBe(false)
+    }, { timeout: 4000 })
     expect(screen.queryByTestId('session-activity-panel')).not.toBeInTheDocument()
-    expect(useActivityPanelStore.getState().isOpen(sessionId)).toBe(false)
 
     act(() => {
       useTabStore.getState().setActiveTab(otherSessionId)
@@ -1515,6 +1535,10 @@ describe('ActiveSession task polling', () => {
     expect(within(chatColumn).getByTestId('chat-input')).toHaveAttribute('data-compact', 'true')
     expect(chatColumn).toHaveClass('flex-1')
     expect(chatColumn).not.toHaveClass('shrink-0')
+    expect(chatColumn).not.toHaveClass('border-r')
+    expect(workbenchPanel).not.toHaveClass('border-l')
+    expect(resizeHandle).toHaveClass('w-px', 'bg-[var(--color-border)]')
+    expect(resizeHandle.firstElementChild).toHaveClass('-inset-x-1')
     expect(contentRow.children[0]).toBe(chatColumn)
     expect(contentRow.children[1]).toBe(resizeHandle)
     expect(contentRow.children[2]).toBe(workbenchPanel)
@@ -1944,5 +1968,240 @@ describe('ActiveSession task polling', () => {
     expect(screen.getByTestId('session-terminal-panel')).toHaveClass('hidden')
     expect(screen.getByTestId(`session-terminal-host-${sessionId}`)).toHaveAttribute('data-active', 'false')
     expect(screen.getByTestId(`session-terminal-host-${sessionId}`)).toHaveAttribute('data-runtime-id', `__session_terminal__${sessionId}`)
+  })
+})
+
+describe('ActiveSession header', () => {
+  // 回归锚点：标题曾经是 text-[22px] 且不截断，长标题会折成两行再加一行元数据，
+  // 连同 pt-6/pb-4 把聊天区顶掉约 120px。标题必须单行截断，元数据留在它下面那行。
+  const longTitle = 'Create a todo_cccc-ccccbb directory, write a throwaway todo app with react + vite + tailwindcss, then start it'
+
+  function mountSessionWithLongTitle(sessionId: string) {
+    useSessionStore.setState({
+      sessions: [{
+        id: sessionId,
+        title: longTitle,
+        createdAt: '2026-05-07T00:00:00.000Z',
+        modifiedAt: new Date().toISOString(),
+        messageCount: 2,
+        projectPath: '/workspace/project',
+        workDir: '/workspace/project',
+        workDirExists: true,
+      }],
+      activeSessionId: sessionId,
+      isLoading: false,
+      error: null,
+    })
+    useTabStore.setState({
+      tabs: [{ sessionId, title: longTitle, type: 'session', status: 'idle' }],
+      activeTabId: sessionId,
+    })
+    useChatStore.setState({
+      sessions: {
+        [sessionId]: {
+          messages: [
+            { id: 'msg-1', type: 'user_text', content: 'hi', timestamp: 1 },
+            { id: 'msg-2', type: 'assistant_text', content: 'hello', timestamp: 2 },
+          ],
+          chatState: 'idle',
+          connectionState: 'connected',
+          streamingText: '',
+          streamingToolInput: '',
+          activeToolUseId: null,
+          activeToolName: null,
+          activeThinkingId: null,
+          pendingPermission: null,
+          pendingComputerUsePermission: null,
+          tokenUsage: { input_tokens: 12000, output_tokens: 3000 },
+          streamingResponseChars: 0,
+          elapsedSeconds: 0,
+          statusVerb: '',
+          slashCommands: [],
+          agentTaskNotifications: {},
+          elapsedTimer: null,
+        },
+      },
+    })
+  }
+
+  it('keeps a long title on one truncated line and hovers the full text', () => {
+    const sessionId = 'long-title-session'
+    mountSessionWithLongTitle(sessionId)
+
+    render(<ActiveSession />)
+
+    const heading = within(screen.getByTestId('session-header')).getByRole('heading', { level: 1 })
+    expect(heading).toHaveTextContent(longTitle)
+    expect(heading).toHaveAttribute('title', longTitle)
+    expect(heading).toHaveClass('truncate')
+    expect(heading.className).not.toMatch(/text-\[22px\]/)
+  })
+
+  it('gives the metadata its own line under the title', () => {
+    const sessionId = 'header-meta-session'
+    mountSessionWithLongTitle(sessionId)
+
+    render(<ActiveSession />)
+
+    const header = screen.getByTestId('session-header')
+    const heading = within(header).getByRole('heading', { level: 1 })
+    const titleRow = heading.parentElement as HTMLElement
+    const meta = titleRow.nextElementSibling as HTMLElement
+
+    // 元数据挤在标题右侧时会离标题很远，读起来像飘在角落的另一块内容。
+    expect(within(titleRow).queryByText('2 messages')).not.toBeInTheDocument()
+    expect(within(meta).getByText('2 messages')).toBeInTheDocument()
+    expect(within(meta).getByText('15k API tokens')).toBeInTheDocument()
+    expect(header).toHaveClass('py-3')
+  })
+
+  it('keeps the separators between metadata items, never in front of them', () => {
+    const sessionId = 'idle-header-session'
+    mountSessionWithLongTitle(sessionId)
+
+    render(<ActiveSession />)
+
+    const heading = within(screen.getByTestId('session-header')).getByRole('heading', { level: 1 })
+    const meta = (heading.parentElement as HTMLElement).nextElementSibling as HTMLElement
+
+    // 空闲会话只有三项元数据（tokens / 更新时间 / 消息数），之间两个「·」，开头不该有。
+    // 分隔符是纯装饰，读屏时不该被念出来。
+    expect(meta.textContent?.trimStart().startsWith('·')).toBe(false)
+    expect(meta.querySelectorAll('[aria-hidden="true"]')).toHaveLength(2)
+  })
+})
+
+describe('ActiveSession activity panel auto-close grace', () => {
+  const sessionId = 'activity-grace-session'
+
+  function seedActivitySession(overrides: Record<string, unknown> = {}) {
+    useSessionStore.setState({
+      sessions: [{
+        id: sessionId,
+        title: 'Activity Grace Session',
+        createdAt: '2026-08-02T00:00:00.000Z',
+        modifiedAt: '2026-08-02T00:00:00.000Z',
+        messageCount: 1,
+        projectPath: '/workspace/project',
+        workDir: '/workspace/project',
+        workDirExists: true,
+      }],
+      activeSessionId: sessionId,
+      isLoading: false,
+      error: null,
+    })
+    useTabStore.setState({
+      tabs: [{ sessionId, title: 'Activity Grace Session', type: 'session', status: 'idle' }],
+      activeTabId: sessionId,
+    })
+    useChatStore.setState({
+      sessions: {
+        [sessionId]: {
+          messages: [{ id: 'm1', type: 'assistant_text', content: 'ready', timestamp: 1 }],
+          chatState: 'idle',
+          connectionState: 'connected',
+          historyStatus: 'ready',
+          historyError: null,
+          streamingText: '',
+          streamingToolInput: '',
+          activeToolUseId: null,
+          activeToolName: null,
+          activeThinkingId: null,
+          pendingPermission: null,
+          pendingComputerUsePermission: null,
+          tokenUsage: { input_tokens: 0, output_tokens: 0 },
+          streamingResponseChars: 0,
+          elapsedSeconds: 0,
+          statusVerb: '',
+          slashCommands: [],
+          agentTaskNotifications: {},
+          backgroundAgentTasks: {
+            'agent-task-1': {
+              taskId: 'agent-task-1',
+              taskType: 'agent',
+              status: 'running',
+              startedAt: 1,
+              updatedAt: 1,
+            },
+          },
+          elapsedTimer: null,
+          ...overrides,
+        },
+      },
+    })
+  }
+
+  function patchSession(overrides: Record<string, unknown>) {
+    useChatStore.setState((state) => ({
+      sessions: {
+        ...state.sessions,
+        [sessionId]: { ...state.sessions[sessionId], ...overrides },
+      },
+    }) as never)
+  }
+
+  it('keeps the panel open through transient empty states and only closes after the grace period', () => {
+    vi.useFakeTimers()
+    seedActivitySession()
+    render(<ActiveSession />)
+    act(() => {
+      useActivityPanelStore.getState().open(sessionId)
+    })
+    expect(useActivityPanelStore.getState().isOpen(sessionId)).toBe(true)
+
+    // History reload window: activity caches are briefly drained while loading.
+    act(() => {
+      patchSession({ backgroundAgentTasks: {}, messages: [], historyStatus: 'loading' })
+      vi.advanceTimersByTime(5000)
+    })
+    expect(useActivityPanelStore.getState().isOpen(sessionId)).toBe(true)
+
+    // Empty but settled: still within the grace period. The debounce timer is
+    // scheduled when React flushes the effect at act exit, so patch and
+    // advance in separate acts to keep the timeline honest.
+    act(() => {
+      patchSession({ historyStatus: 'ready' })
+    })
+    act(() => {
+      vi.advanceTimersByTime(1000)
+    })
+    expect(useActivityPanelStore.getState().isOpen(sessionId)).toBe(true)
+
+    // The empty state outlives the grace period: genuinely no activity left.
+    act(() => {
+      vi.advanceTimersByTime(1500)
+    })
+    expect(useActivityPanelStore.getState().isOpen(sessionId)).toBe(false)
+  })
+
+  it('cancels the pending close when activity reappears inside the grace period', () => {
+    vi.useFakeTimers()
+    seedActivitySession()
+    render(<ActiveSession />)
+    act(() => {
+      useActivityPanelStore.getState().open(sessionId)
+    })
+
+    act(() => {
+      patchSession({ backgroundAgentTasks: {}, messages: [], historyStatus: 'ready' })
+      vi.advanceTimersByTime(1000)
+    })
+    act(() => {
+      patchSession({
+        messages: [{ id: 'm2', type: 'assistant_text', content: 'back', timestamp: 2 }],
+        backgroundAgentTasks: {
+          'agent-task-1': {
+            taskId: 'agent-task-1',
+            taskType: 'agent',
+            status: 'running',
+            startedAt: 1,
+            updatedAt: 1,
+          },
+        },
+      })
+      vi.advanceTimersByTime(5000)
+    })
+
+    expect(useActivityPanelStore.getState().isOpen(sessionId)).toBe(true)
   })
 })

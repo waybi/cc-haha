@@ -2,6 +2,7 @@ import type {
   AppMode as SettingsAppMode,
   AppModeConfig as SettingsAppModeConfig,
 } from '../../types/settings'
+import type { Locale } from '../../i18n/locale'
 
 export type DesktopHostKind = 'browser' | 'electron'
 
@@ -47,6 +48,24 @@ export type DialogSaveOptions = {
   filters?: DialogFileFilter[]
 }
 
+/**
+ * What the renderer settled on, reported to the native shell so the window
+ * background and the OS-drawn chrome can match it.
+ */
+export type AppliedAppearance = {
+  isDark: boolean
+  /** Base background of the applied theme, as a CSS hex color. */
+  background: string
+  /**
+   * Base background of the user's light theme, also as a hex color. Carried
+   * separately so a shell that cached this at night knows which light theme to
+   * repaint when it next starts in the morning.
+   */
+  lightBackground: string
+  /** Whether the renderer is tracking the OS setting rather than a fixed pick. */
+  followSystem: boolean
+}
+
 export type NotificationPermissionState = 'granted' | 'denied' | 'default'
 
 export type DesktopNotificationOptions = {
@@ -89,7 +108,6 @@ export type DesktopUpdateCheckOptions = {
 
 export type TerminalSpawnOptions = {
   cwd?: string
-  shell?: string
   cols: number
   rows: number
 }
@@ -131,8 +149,24 @@ export type PreviewCaptureMessage = {
 
 export type PreviewPickerMessage = {
   v: 1
-  type: 'enter-picker' | 'exit-picker'
-}
+} & (
+  | {
+      type: 'enter-picker'
+      mode?: 'single' | 'batch'
+      label?: number
+      copy?: {
+        cancel: string
+        send: string
+        queueAndContinue: string
+        add: string
+        descriptionPlaceholder: string
+      }
+    }
+  | { type: 'exit-picker' }
+  | { type: 'undo-selection'; itemId: string }
+  | { type: 'clear-selection-draft' }
+  | { type: 'commit-selection-draft' }
+)
 
 export type PreviewHostMessage = PreviewCaptureMessage | PreviewPickerMessage
 
@@ -173,16 +207,55 @@ export type DesktopPetCreateInput = {
   slug: string
   displayName: string
   description: string
+  dialogTitle?: string
+  dialogFilterName?: string
 }
 
-export type DesktopPetCreateResult = {
-  id: string
+export type DesktopPetCreateResult =
+  | { id: string }
+  | { errorCode: string }
+
+export type DesktopPetSheetPickInput = {
+  dialogTitle?: string
+  dialogFilterName?: string
+}
+
+/** Decoded pixels of a user-picked action sheet, ready to be normalized on a canvas. */
+export type DesktopPetSourceSheet = {
+  bytes: Uint8Array
+  mimeType: 'image/png' | 'image/webp'
+  width: number
+  height: number
+}
+
+export type DesktopPetSheetPickResult =
+  | DesktopPetSourceSheet
+  | { errorCode: string }
+
+export type DesktopPetCreateFromAtlasBytesInput = {
+  slug: string
+  displayName: string
+  description: string
+  atlasData: Uint8Array
+  mimeType: 'image/png' | 'image/webp'
 }
 
 export type DesktopPetWindowDrag = {
   phase: 'start' | 'move' | 'end'
   x: number
   y: number
+}
+
+/**
+ * Which side of the mascot the host wants the activity panel drawn on.
+ *
+ * The mascot is clamped to the display edge through the window's transparent
+ * padding, so at the top of the screen the panel that shares that padding ends
+ * up behind the menu bar. Only the host knows the window position and the work
+ * area, so it decides and the renderer follows.
+ */
+export type DesktopPetPanelPlacement = {
+  vertical: 'above' | 'below'
 }
 
 export type AppModeConfig = SettingsAppModeConfig
@@ -202,6 +275,10 @@ export type DesktopHost = {
   }
   app: {
     getVersion(): Promise<string>
+    getLocalePreference(): Promise<Locale | null>
+    setLocalePreference(locale: Locale): Promise<void>
+    getPreferredSystemLanguages(): Promise<string[]>
+    onLocaleChanged(handler: (locale: Locale) => void): Promise<DesktopHostUnlisten>
   }
   commands: {
     invoke<T>(command: string, args?: Record<string, unknown>): Promise<T>
@@ -209,6 +286,9 @@ export type DesktopHost = {
   clipboard: {
     readText(): Promise<string>
     writeText(text: string): Promise<void>
+  }
+  files: {
+    getPathForFile(file: File): string
   }
   events: {
     listen<T>(eventName: string, handler: (payload: T) => void): Promise<DesktopHostUnlisten>
@@ -227,16 +307,26 @@ export type DesktopHost = {
     list(): Promise<DesktopPetListResult>
     createFromImage(input: DesktopPetCreateInput): Promise<DesktopPetCreateResult | null>
     createFromAtlas(input: DesktopPetCreateInput): Promise<DesktopPetCreateResult | null>
+    pickSourceSheet(input: DesktopPetSheetPickInput): Promise<DesktopPetSheetPickResult | null>
+    createFromAtlasBytes(
+      input: DesktopPetCreateFromAtlasBytesInput,
+    ): Promise<DesktopPetCreateResult | null>
     openFolder(): Promise<void>
     show(): Promise<void>
     hide(): Promise<void>
     showContextMenu(closeLabel: string): Promise<boolean>
-    dragWindow(payload: DesktopPetWindowDrag): Promise<void>
+    dragWindow(payload: DesktopPetWindowDrag): Promise<DesktopPetPanelPlacement>
     setIgnoreMouseEvents(ignore: boolean): Promise<void>
-    setInteractiveRegions(regions: DesktopPetInteractiveRegion[]): Promise<void>
+    setInteractiveRegions(
+      regions: DesktopPetInteractiveRegion[],
+    ): Promise<DesktopPetPanelPlacement>
+    focusMainWindow(): Promise<void>
     focusSession(sessionId: string): Promise<void>
     onNavigateSession(handler: (sessionId: string) => void): Promise<DesktopHostUnlisten>
     onVisibilityChanged(handler: (visible: boolean) => void): Promise<DesktopHostUnlisten>
+    onPanelPlacementChanged(
+      handler: (placement: DesktopPetPanelPlacement) => void,
+    ): Promise<DesktopHostUnlisten>
   }
   dialogs: {
     open(options?: DialogOpenOptions): Promise<string | string[] | null>
@@ -297,6 +387,9 @@ export type DesktopHost = {
   }
   zoom: {
     set(level: number): Promise<void>
+  }
+  appearance: {
+    setApplied(state: AppliedAppearance): Promise<void>
   }
 }
 

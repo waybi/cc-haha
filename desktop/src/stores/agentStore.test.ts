@@ -68,6 +68,7 @@ describe('agentStore', () => {
     useAgentStore.setState({
       activeAgents: [],
       allAgents: [],
+      availableTools: [],
       isLoading: false,
       isMutating: false,
       error: null,
@@ -75,6 +76,9 @@ describe('agentStore', () => {
       mutationWarning: null,
       selectedAgent: null,
       selectedAgentReturnTab: 'agents',
+      requestedCwd: undefined,
+      resolvedCwd: undefined,
+      isContextStale: false,
     })
   })
 
@@ -133,6 +137,47 @@ describe('agentStore', () => {
       allAgents: [newAgent],
       isLoading: false,
       error: null,
+      requestedCwd: '/workspace/new',
+      resolvedCwd: '/workspace/new',
+      isContextStale: false,
+    })
+  })
+
+  it('marks an old project context stale while the next project is pending or fails', async () => {
+    const oldAgent = makeAgent({ agentType: 'old-project', source: 'projectSettings' })
+    const nextRequest = deferred<{ activeAgents: AgentDefinition[]; allAgents: AgentDefinition[] }>()
+    useAgentStore.setState({
+      activeAgents: [oldAgent],
+      allAgents: [oldAgent],
+      selectedAgent: oldAgent,
+      requestedCwd: '/workspace/old',
+      resolvedCwd: '/workspace/old',
+      isContextStale: false,
+    })
+    apiListMock.mockReturnValue(nextRequest.promise)
+
+    const fetch = useAgentStore.getState().fetchAgents('/workspace/new')
+
+    expect(useAgentStore.getState()).toMatchObject({
+      allAgents: [oldAgent],
+      selectedAgent: oldAgent,
+      isLoading: true,
+      requestedCwd: '/workspace/new',
+      resolvedCwd: '/workspace/old',
+      isContextStale: true,
+    })
+
+    nextRequest.reject(new Error('New project unavailable'))
+    await fetch
+
+    expect(useAgentStore.getState()).toMatchObject({
+      allAgents: [oldAgent],
+      selectedAgent: oldAgent,
+      isLoading: false,
+      error: 'New project unavailable',
+      requestedCwd: '/workspace/new',
+      resolvedCwd: '/workspace/old',
+      isContextStale: true,
     })
   })
 
@@ -187,6 +232,55 @@ describe('agentStore', () => {
     })
   })
 
+  it('finishes a create while the active session reload is still pending', async () => {
+    const reload = deferred<never>()
+    const createdAgent = makeAgent({ target: 'reviewer.md' })
+    apiCreateMock.mockResolvedValue({ agent: createdAgent })
+    apiListMock.mockResolvedValue({
+      activeAgents: [createdAgent],
+      allAgents: [createdAgent],
+    })
+    apiReloadMock.mockReturnValue(reload.promise)
+
+    await expect(
+      useAgentStore.getState().createAgent(makeInput(), 'session-1'),
+    ).resolves.toBe(createdAgent)
+
+    expect(apiReloadMock).toHaveBeenCalledWith('session-1')
+    expect(useAgentStore.getState()).toMatchObject({
+      selectedAgent: createdAgent,
+      isMutating: false,
+      mutationWarning: null,
+    })
+
+    reload.reject(new Error('Session reload unavailable'))
+    await vi.waitFor(() => expect(useAgentStore.getState().mutationWarning).toBe(
+      'Session reload unavailable',
+    ))
+  })
+
+  it('ignores a late reload warning after switching projects', async () => {
+    const reload = deferred<never>()
+    const createdAgent = makeAgent({ target: 'reviewer.md' })
+    const currentAgent = makeAgent({ agentType: 'current-project', source: 'projectSettings' })
+    apiCreateMock.mockResolvedValue({ agent: createdAgent })
+    apiListMock
+      .mockResolvedValueOnce({ activeAgents: [createdAgent], allAgents: [createdAgent] })
+      .mockResolvedValueOnce({ activeAgents: [currentAgent], allAgents: [currentAgent] })
+    apiReloadMock.mockReturnValue(reload.promise)
+
+    await useAgentStore.getState().createAgent(makeInput(), 'session-1')
+    await useAgentStore.getState().fetchAgents('/workspace/current-project')
+    reload.reject(new Error('Old session reload failed'))
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(useAgentStore.getState()).toMatchObject({
+      allAgents: [currentAgent],
+      mutationWarning: null,
+    })
+  })
+
   it('does not let a mutation refresh overwrite a later project switch', async () => {
     const mutationRefresh = deferred<{ activeAgents: AgentDefinition[]; allAgents: AgentDefinition[] }>()
     const currentRefresh = deferred<{ activeAgents: AgentDefinition[]; allAgents: AgentDefinition[] }>()
@@ -202,6 +296,10 @@ describe('agentStore', () => {
     const currentFetch = useAgentStore.getState().fetchAgents('/workspace/current-project')
     currentRefresh.resolve({ activeAgents: [currentAgent], allAgents: [currentAgent] })
     await currentFetch
+    expect(useAgentStore.getState()).toMatchObject({
+      allAgents: [currentAgent],
+      isMutating: true,
+    })
     mutationRefresh.resolve({ activeAgents: [oldAgent], allAgents: [oldAgent] })
     await expect(mutation).resolves.toBe(oldAgent)
 
@@ -210,6 +308,36 @@ describe('agentStore', () => {
       allAgents: [currentAgent],
       selectedAgent: null,
       isMutating: false,
+    })
+  })
+
+  it('keeps a persistent write busy across a project fetch without exposing its late error there', async () => {
+    const write = deferred<{ agent: AgentDefinition }>()
+    const currentAgent = makeAgent({ agentType: 'current-project', source: 'projectSettings' })
+    apiCreateMock.mockReturnValue(write.promise)
+    apiListMock.mockResolvedValue({
+      activeAgents: [currentAgent],
+      allAgents: [currentAgent],
+    })
+
+    const mutation = useAgentStore.getState().createAgent(
+      makeInput({ scope: 'project', cwd: '/workspace/old-project' }),
+    )
+    await vi.waitFor(() => expect(apiCreateMock).toHaveBeenCalledTimes(1))
+
+    await useAgentStore.getState().fetchAgents('/workspace/current-project')
+    expect(useAgentStore.getState()).toMatchObject({
+      allAgents: [currentAgent],
+      isMutating: true,
+      mutationError: null,
+    })
+
+    write.reject(new Error('Old project create failed'))
+    await expect(mutation).rejects.toThrow('Old project create failed')
+    expect(useAgentStore.getState()).toMatchObject({
+      allAgents: [currentAgent],
+      isMutating: false,
+      mutationError: null,
     })
   })
 
@@ -309,6 +437,34 @@ describe('agentStore', () => {
     expect(apiUpdateMock).toHaveBeenCalledWith('reviewer', input)
     expect(apiReloadMock).toHaveBeenCalledWith('session-1')
     expect(useAgentStore.getState().selectedAgent).toBe(updatedAgent)
+  })
+
+  it('finishes an update while the active session reload is still pending', async () => {
+    const reload = deferred<never>()
+    const updatedAgent = makeAgent({ description: 'Updated', target: 'reviewer.md' })
+    apiUpdateMock.mockResolvedValue({ agent: updatedAgent })
+    apiListMock.mockResolvedValue({
+      activeAgents: [updatedAgent],
+      allAgents: [updatedAgent],
+    })
+    apiReloadMock.mockReturnValue(reload.promise)
+
+    await expect(useAgentStore.getState().updateAgent(
+      'reviewer',
+      makeInput({ description: 'Updated' }),
+      'session-1',
+    )).resolves.toBe(updatedAgent)
+
+    expect(useAgentStore.getState()).toMatchObject({
+      selectedAgent: updatedAgent,
+      isMutating: false,
+      mutationWarning: null,
+    })
+
+    reload.reject(new Error('Session reload unavailable'))
+    await vi.waitFor(() => expect(useAgentStore.getState().mutationWarning).toBe(
+      'Session reload unavailable',
+    ))
   })
 
   it('does not expose an old mutation failure after a new project fetch succeeds', async () => {
@@ -425,6 +581,32 @@ describe('agentStore', () => {
       isMutating: false,
       mutationError: null,
     })
+  })
+
+  it('finishes a delete while the active session reload is still pending', async () => {
+    const reload = deferred<never>()
+    apiDeleteMock.mockResolvedValue(undefined)
+    apiListMock.mockResolvedValue({ activeAgents: [], allAgents: [] })
+    apiReloadMock.mockReturnValue(reload.promise)
+
+    await expect(useAgentStore.getState().deleteAgent(
+      'reviewer',
+      'project',
+      '/workspace/current',
+      'reviewer.md',
+      'session-1',
+    )).resolves.toBeUndefined()
+
+    expect(useAgentStore.getState()).toMatchObject({
+      selectedAgent: null,
+      isMutating: false,
+      mutationWarning: null,
+    })
+
+    reload.reject(new Error('Session reload unavailable'))
+    await vi.waitFor(() => expect(useAgentStore.getState().mutationWarning).toBe(
+      'Session reload unavailable',
+    ))
   })
 
   it('does not let a delete refresh clear the selection from a later project switch', async () => {

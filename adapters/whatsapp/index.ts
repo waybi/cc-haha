@@ -5,7 +5,6 @@
  * then run: bun run whatsapp
  */
 
-import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import {
   normalizeMessageContent,
@@ -34,6 +33,7 @@ import { AttachmentStore } from '../common/attachment/attachment-store.js'
 import { checkAttachmentLimit } from '../common/attachment/attachment-limits.js'
 import { ImageBlockWatcher } from '../common/attachment/image-block-watcher.js'
 import type { PendingUpload } from '../common/attachment/attachment-types.js'
+import { materializePendingUploadImage } from '../common/attachment/safe-remote-image.js'
 import {
   closeWhatsAppSocket,
   createWhatsAppSocket,
@@ -247,25 +247,7 @@ async function showProjectPicker(chatId: string): Promise<void> {
 
 async function dispatchOutboundMedia(chatId: string, pending: PendingUpload): Promise<void> {
   try {
-    let buffer: Buffer
-    let mime = 'image/png'
-    switch (pending.source.kind) {
-      case 'base64':
-        buffer = Buffer.from(pending.source.data, 'base64')
-        mime = pending.source.mime
-        break
-      case 'path':
-        buffer = await fs.readFile(pending.source.path)
-        mime = pending.source.mime ?? 'image/png'
-        break
-      case 'url': {
-        const resp = await fetch(pending.source.url)
-        if (!resp.ok) throw new Error(`fetch ${pending.source.url} -> ${resp.status}`)
-        buffer = Buffer.from(await resp.arrayBuffer())
-        mime = pending.source.mime ?? resp.headers.get('content-type') ?? 'image/png'
-        break
-      }
-    }
+    const { buffer, mime } = await materializePendingUploadImage(pending.source)
     const check = checkAttachmentLimit('image', buffer.length, mime)
     if (!check.ok) {
       console.warn('[WhatsApp] Outbound image rejected:', check.hint)

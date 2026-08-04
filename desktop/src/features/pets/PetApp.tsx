@@ -7,7 +7,7 @@ import {
   useState,
   type PointerEvent as ReactPointerEvent,
 } from 'react'
-import { ChevronUp } from 'lucide-react'
+import { ChevronDown } from 'lucide-react'
 import {
   desktopUiPreferencesApi,
   type DesktopPetPreferences,
@@ -15,6 +15,7 @@ import {
 import { sessionsApi, type PetSessionRuntimeStatus } from '../../api/sessions'
 import { useTranslation } from '../../i18n'
 import { getDesktopHost } from '../../lib/desktopHost'
+import type { DesktopPetPanelPlacement } from '../../lib/desktopHost/types'
 import { initializeDesktopServerUrl } from '../../lib/desktopRuntime'
 import { useChatStore } from '../../stores/chatStore'
 import { useSessionStore } from '../../stores/sessionStore'
@@ -38,6 +39,10 @@ const SESSION_REFRESH_INTERVAL_MS = 5_000
 const STATUS_REFRESH_INTERVAL_MS = 2_000
 const CUSTOM_PET_REFRESH_INTERVAL_MS = 30_000
 const PET_DRAG_THRESHOLD_PX = 4
+// The host owns this: it is the only side that knows where the window sits on
+// which display. Until it answers, the panel keeps its usual spot above the
+// mascot.
+const DEFAULT_PANEL_PLACEMENT: DesktopPetPanelPlacement = { vertical: 'above' }
 
 type PetDragGesture = {
   pointerId: number
@@ -76,6 +81,9 @@ export function PetApp() {
   const [isMascotDragging, setIsMascotDragging] = useState(false)
   const [dragDirection, setDragDirection] = useState<'left' | 'right' | null>(null)
   const [lookDirection, setLookDirection] = useState<PetLookDirection | null | undefined>(undefined)
+  const [panelPlacement, setPanelPlacement] = useState<DesktopPetPanelPlacement>(
+    DEFAULT_PANEL_PLACEMENT,
+  )
   const preferencesRef = useRef<DesktopPetPreferences | null>(null)
   const pendingPreferencePatchesRef = useRef(new Map<number, Partial<DesktopPetPreferences>>())
   const nextPreferencePatchIdRef = useRef(0)
@@ -83,7 +91,9 @@ export function PetApp() {
   const transientTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const stackRef = useRef<HTMLDivElement | null>(null)
   const mascotRef = useRef<HTMLButtonElement | null>(null)
+  const taskBadgeRef = useRef<HTMLButtonElement | null>(null)
   const activityCardRef = useRef<HTMLElement | null>(null)
+  const panelToggleRef = useRef<HTMLButtonElement | null>(null)
   const dragGestureRef = useRef<PetDragGesture | null>(null)
   const suppressNextMascotClickRef = useRef(false)
   const suppressClickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -323,11 +333,41 @@ export function PetApp() {
   const allPets: readonly PetDescriptor[] = [...BUILTIN_PETS, ...customPets]
   const selectedPet = allPets.find((pet) => pet.id === preferences?.selectedPetId)
     ?? findBuiltinPet(preferences?.selectedPetId ?? '')
-  const expanded = preferences ? !preferences.collapsed || Boolean(actionError) : false
+  const showActivityCard = Boolean(actionError)
+    || Boolean(preferences?.showTaskPanel && activities.length > 0)
+  const expanded = showActivityCard
+
+  // Ignoring an unchanged placement matters: the host answers every region
+  // report and every drag tick, and a fresh object each time would re-render the
+  // pet on every frame of a drag.
+  const applyPanelPlacement = useCallback((next: DesktopPetPanelPlacement | undefined) => {
+    if (!next) return
+    setPanelPlacement((current) => (current.vertical === next.vertical ? current : next))
+  }, [])
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined
+    let cancelled = false
+    void getDesktopHost().pets.onPanelPlacementChanged(applyPanelPlacement)
+      .then((dispose) => {
+        if (cancelled) dispose()
+        else unlisten = dispose
+      })
+      .catch(() => undefined)
+    return () => {
+      cancelled = true
+      unlisten?.()
+    }
+  }, [applyPanelPlacement])
 
   useLayoutEffect(() => {
     if (!preferences) return
-    const elements = [mascotRef.current, activityCardRef.current]
+    const elements = [
+      mascotRef.current,
+      taskBadgeRef.current,
+      activityCardRef.current,
+      panelToggleRef.current,
+    ]
     const targets = elements.filter((element) => element !== null) as HTMLElement[]
     const updateRegions = () => {
       const regions = targets.map((element) => {
@@ -339,7 +379,10 @@ export function PetApp() {
           height: Math.max(1, Math.ceil(rect.height)),
         }
       })
-      if (regions.length > 0) void getDesktopHost().pets.setInteractiveRegions(regions)
+      if (regions.length === 0) return
+      void getDesktopHost().pets.setInteractiveRegions(regions)
+        .then(applyPanelPlacement)
+        .catch(() => undefined)
     }
 
     updateRegions()
@@ -352,11 +395,24 @@ export function PetApp() {
       observer?.disconnect()
       window.removeEventListener('resize', updateRegions)
     }
-  }, [expanded, preferences?.size, selectedPet])
+  }, [
+    activities.length,
+    applyPanelPlacement,
+    expanded,
+    // A flip re-lays the window out without resizing anything in it, so
+    // ResizeObserver never fires and the reported boxes would keep describing
+    // the old side. The host needs the new ones to hold the mascot still.
+    panelPlacement.vertical,
+    preferences?.size,
+    selectedPet,
+    showActivityCard,
+  ])
 
   const isInteractivePoint = useCallback((x: number, y: number) => [
     mascotRef.current,
+    taskBadgeRef.current,
     activityCardRef.current,
+    panelToggleRef.current,
   ].some((element) => {
     if (!element) return false
     const rect = element.getBoundingClientRect()
@@ -387,6 +443,7 @@ export function PetApp() {
       }, 0)
       void gesture.startPromise
         .then(() => getDesktopHost().pets.dragWindow({ phase: 'end', x, y }))
+        .then(applyPanelPlacement)
         .catch(() => undefined)
     }
 
@@ -403,7 +460,7 @@ export function PetApp() {
       setLookDirection(undefined)
       void getDesktopHost().pets.setIgnoreMouseEvents(true)
     }
-  }, [isInteractivePoint])
+  }, [applyPanelPlacement, isInteractivePoint])
 
   const releasePointerPassthrough = useCallback((nextTarget: EventTarget | null) => {
     if (dragGestureRef.current) return
@@ -412,7 +469,9 @@ export function PetApp() {
       : null
     const remainsInteractive = nextNode !== null && [
       mascotRef.current,
+      taskBadgeRef.current,
       activityCardRef.current,
+      panelToggleRef.current,
     ].some((element) => element?.contains(nextNode))
     if (remainsInteractive) return
 
@@ -440,6 +499,7 @@ export function PetApp() {
       <div
         ref={stackRef}
         className="pet-window-stack"
+        data-panel-placement={panelPlacement.vertical}
         onMouseEnter={() => void getDesktopHost().pets.setIgnoreMouseEvents(false)}
         onMouseMove={(event) => {
           if (dragGestureRef.current) return
@@ -458,121 +518,141 @@ export function PetApp() {
           void getDesktopHost().pets.setIgnoreMouseEvents(true)
         }}
       >
-        <button
-          ref={mascotRef}
-          type="button"
-          className="pet-mascot-button"
-          data-dragging={isMascotDragging ? 'true' : 'false'}
-          data-drag-direction={dragDirection ?? undefined}
-          aria-label={t('pet.window.interact')}
-          onMouseEnter={() => {
-            void getDesktopHost().pets.setIgnoreMouseEvents(false)
-            if (!dragGestureRef.current && animationState === 'idle') {
-              playTransient('jumping')
-            }
-          }}
-          onClick={() => {
-            if (suppressNextMascotClickRef.current) {
+        <div className="pet-mascot-wrap">
+          <button
+            ref={mascotRef}
+            type="button"
+            className="pet-mascot-button"
+            data-dragging={isMascotDragging ? 'true' : 'false'}
+            data-drag-direction={dragDirection ?? undefined}
+            aria-label={t('pet.window.interact')}
+            onMouseEnter={() => {
+              void getDesktopHost().pets.setIgnoreMouseEvents(false)
+              if (!dragGestureRef.current && animationState === 'idle') {
+                playTransient('jumping')
+              }
+            }}
+            onClick={() => {
+              if (suppressNextMascotClickRef.current) {
+                suppressNextMascotClickRef.current = false
+                if (suppressClickTimerRef.current) {
+                  clearTimeout(suppressClickTimerRef.current)
+                  suppressClickTimerRef.current = null
+                }
+                return
+              }
+              void getDesktopHost().pets.focusMainWindow().catch(() => undefined)
+              playTransient('waving')
+            }}
+            onContextMenu={(event) => {
+              event.preventDefault()
+              event.stopPropagation()
+              void getDesktopHost().pets.showContextMenu(t('pet.window.close'))
+                .then((shouldClose) => {
+                  if (shouldClose) void closePet()
+                })
+                .catch(() => setActionError(t('pet.window.closeError')))
+            }}
+            onPointerDown={(event) => {
+              if (event.button !== 0 || event.isPrimary === false || dragGestureRef.current) return
               suppressNextMascotClickRef.current = false
               if (suppressClickTimerRef.current) {
                 clearTimeout(suppressClickTimerRef.current)
                 suppressClickTimerRef.current = null
               }
-              return
-            }
-            playTransient('waving')
-          }}
-          onContextMenu={(event) => {
-            event.preventDefault()
-            event.stopPropagation()
-            void getDesktopHost().pets.showContextMenu(t('pet.window.close'))
-              .then((shouldClose) => {
-                if (shouldClose) void closePet()
-              })
-              .catch(() => setActionError(t('pet.window.closeError')))
-          }}
-          onPointerDown={(event) => {
-            if (event.button !== 0 || event.isPrimary === false || dragGestureRef.current) return
-            suppressNextMascotClickRef.current = false
-            if (suppressClickTimerRef.current) {
-              clearTimeout(suppressClickTimerRef.current)
-              suppressClickTimerRef.current = null
-            }
-            dragGestureRef.current = {
-              pointerId: event.pointerId,
-              startScreenX: event.screenX,
-              startScreenY: event.screenY,
-              directionScreenX: event.screenX,
-              lastScreenX: event.screenX,
-              lastScreenY: event.screenY,
-              startPromise: null,
-            }
-            void getDesktopHost().pets.setIgnoreMouseEvents(false)
-            try {
-              event.currentTarget.setPointerCapture(event.pointerId)
-            } catch {
-              // Pointer capture can fail when the pointer has already been cancelled.
-            }
-          }}
-          onPointerMove={(event) => {
-            const gesture = dragGestureRef.current
-            if (!gesture || gesture.pointerId !== event.pointerId || (event.buttons & 1) === 0) return
-            gesture.lastScreenX = event.screenX
-            gesture.lastScreenY = event.screenY
-            if (!gesture.startPromise) {
-              const distance = Math.hypot(
-                event.screenX - gesture.startScreenX,
-                event.screenY - gesture.startScreenY,
-              )
-              if (distance < PET_DRAG_THRESHOLD_PX) return
-              suppressNextMascotClickRef.current = true
-              setIsMascotDragging(true)
-              gesture.startPromise = Promise.resolve().then(() =>
-                getDesktopHost().pets.dragWindow({
-                  phase: 'start',
-                  x: gesture.startScreenX,
-                  y: gesture.startScreenY,
-                }))
-              void gesture.startPromise.catch(() => undefined)
-            }
-            const directionDelta = event.screenX - gesture.directionScreenX
-            if (Math.abs(directionDelta) >= PET_DRAG_THRESHOLD_PX) {
-              setDragDirection(directionDelta < 0 ? 'left' : 'right')
-              gesture.directionScreenX = event.screenX
-            }
-            event.preventDefault()
-          }}
-          onPointerUp={(event) => finishMascotDrag(event, true)}
-          onPointerCancel={(event) => finishMascotDrag(event, true)}
-          onLostPointerCapture={(event) => finishMascotDrag(event, false)}
-          onMouseLeave={(event) => releasePointerPassthrough(event.relatedTarget)}
-        >
-          <PetRenderer
-            pet={selectedPet}
-            state={animationState}
-            size={preferences.size}
-            motionEnabled={preferences.motionEnabled}
-            lookDirection={animationState === 'idle'
-              ? lookDirection
-              : undefined}
-          />
-        </button>
-
-        <section
-          ref={activityCardRef}
-          className="pet-activity-card"
-          data-expanded={expanded ? 'true' : 'false'}
-          aria-label={t('pet.window.sessionCount', { count: activities.length })}
-          onMouseEnter={() => void getDesktopHost().pets.setIgnoreMouseEvents(false)}
-          onMouseLeave={(event) => releasePointerPassthrough(event.relatedTarget)}
-        >
-          {actionError && (
-            <p role="alert" className="mx-3 mt-2 rounded-lg bg-rose-500/10 px-3 py-2 text-xs text-rose-700 dark:text-rose-200">
-              {actionError}
-            </p>
+              dragGestureRef.current = {
+                pointerId: event.pointerId,
+                startScreenX: event.screenX,
+                startScreenY: event.screenY,
+                directionScreenX: event.screenX,
+                lastScreenX: event.screenX,
+                lastScreenY: event.screenY,
+                startPromise: null,
+              }
+              void getDesktopHost().pets.setIgnoreMouseEvents(false)
+              try {
+                event.currentTarget.setPointerCapture(event.pointerId)
+              } catch {
+                // Pointer capture can fail when the pointer has already been cancelled.
+              }
+            }}
+            onPointerMove={(event) => {
+              const gesture = dragGestureRef.current
+              if (!gesture || gesture.pointerId !== event.pointerId || (event.buttons & 1) === 0) return
+              gesture.lastScreenX = event.screenX
+              gesture.lastScreenY = event.screenY
+              if (!gesture.startPromise) {
+                const distance = Math.hypot(
+                  event.screenX - gesture.startScreenX,
+                  event.screenY - gesture.startScreenY,
+                )
+                if (distance < PET_DRAG_THRESHOLD_PX) return
+                suppressNextMascotClickRef.current = true
+                setIsMascotDragging(true)
+                gesture.startPromise = Promise.resolve()
+                  .then(() => getDesktopHost().pets.dragWindow({
+                    phase: 'start',
+                    x: gesture.startScreenX,
+                    y: gesture.startScreenY,
+                  }))
+                  .then(applyPanelPlacement)
+                void gesture.startPromise.catch(() => undefined)
+              }
+              const directionDelta = event.screenX - gesture.directionScreenX
+              if (Math.abs(directionDelta) >= PET_DRAG_THRESHOLD_PX) {
+                setDragDirection(directionDelta < 0 ? 'left' : 'right')
+                gesture.directionScreenX = event.screenX
+              }
+              event.preventDefault()
+            }}
+            onPointerUp={(event) => finishMascotDrag(event, true)}
+            onPointerCancel={(event) => finishMascotDrag(event, true)}
+            onLostPointerCapture={(event) => finishMascotDrag(event, false)}
+            onMouseLeave={(event) => releasePointerPassthrough(event.relatedTarget)}
+          >
+            <PetRenderer
+              pet={selectedPet}
+              state={animationState}
+              size={preferences.size}
+              motionEnabled={preferences.motionEnabled}
+              lookDirection={animationState === 'idle'
+                ? lookDirection
+                : undefined}
+            />
+          </button>
+          {activities.length > 0 && !showActivityCard && (
+            <button
+              ref={taskBadgeRef}
+              type="button"
+              className="pet-task-badge"
+              aria-label={t('pet.window.expandTasks', { count: activities.length })}
+              onMouseEnter={() => void getDesktopHost().pets.setIgnoreMouseEvents(false)}
+              onMouseLeave={(event) => releasePointerPassthrough(event.relatedTarget)}
+              onClick={() => void persistPreferences({ showTaskPanel: true })}
+            >
+              {activities.length}
+            </button>
           )}
+        </div>
 
-          {activities.length > 0 ? (
+        {showActivityCard && (
+          <section
+            ref={activityCardRef}
+            className="pet-activity-card"
+            data-expanded={expanded ? 'true' : 'false'}
+            aria-label={t('pet.window.sessionCount', { count: activities.length })}
+            onMouseEnter={() => void getDesktopHost().pets.setIgnoreMouseEvents(false)}
+            onMouseLeave={(event) => releasePointerPassthrough(event.relatedTarget)}
+          >
+            {actionError && (
+              <p
+                role="alert"
+                className="mx-3 mt-2 rounded-[var(--radius-md)] bg-[var(--color-error-container)] px-3 py-2 text-xs text-[var(--color-on-error-container)]"
+              >
+                {actionError}
+              </p>
+            )}
+
             <div
               className="pet-session-list"
               data-expanded={expanded ? 'true' : 'false'}
@@ -580,55 +660,46 @@ export function PetApp() {
               aria-live="polite"
               aria-label={t('pet.window.sessionCount', { count: activities.length })}
             >
-              {activities.map((activity, index) => {
+              {activities.map((activity) => {
                 const title = activity.session.title || t('pet.window.untitledSession')
                 const status = t(`pet.window.status.${activity.status}` as Parameters<typeof t>[0])
-                const hiddenWhileCollapsed = !expanded && index > 0
                 return (
                   <div
                     role="listitem"
                     key={activity.session.id}
-                    aria-hidden={hiddenWhileCollapsed || undefined}
                   >
                     <button
                       type="button"
                       className="pet-session-row"
                       aria-label={`${title}, ${status}`}
-                      tabIndex={hiddenWhileCollapsed ? -1 : 0}
                       onClick={() => void getDesktopHost().pets.focusSession(activity.session.id)}
                     >
-                      <span className={`pet-session-indicator ${statusDotClass(activity.status)}`} />
                       <span className="pet-session-copy">
                         <span className="pet-session-title">{title}</span>
                         <span className="pet-session-status">{status}</span>
                       </span>
+                      <span className={`pet-session-indicator ${statusDotClass(activity.status)}`} />
                     </button>
                   </div>
                 )
               })}
             </div>
-          ) : (
-            <div className="pet-empty-state" aria-live="polite">
-              <span>{t('pet.window.noSessions')}</span>
-            </div>
-          )}
 
-          <button
-            type="button"
-            className="pet-panel-toggle"
-            data-expanded={expanded ? 'true' : 'false'}
-            aria-label={`${expanded ? t('pet.window.collapse') : t('pet.window.expand')} ${t(
-              'pet.window.sessionCount',
-              { count: activities.length },
-            )}`}
-            onClick={() => {
-              setActionError(null)
-              void persistPreferences({ collapsed: expanded })
-            }}
-          >
-            <ChevronUp className={expanded ? 'rotate-180' : ''} size={18} aria-hidden="true" />
-          </button>
-        </section>
+            <button
+              ref={panelToggleRef}
+              type="button"
+              className="pet-panel-toggle"
+              data-expanded={expanded ? 'true' : 'false'}
+              aria-label={t('pet.window.hideTasks', { count: activities.length })}
+              onClick={() => {
+                setActionError(null)
+                void persistPreferences({ showTaskPanel: false })
+              }}
+            >
+              <ChevronDown size={16} aria-hidden="true" />
+            </button>
+          </section>
+        )}
       </div>
     </main>
   )

@@ -90,6 +90,7 @@ import {
   getSmallFastModel,
   isNonCustomOpusModel,
 } from "../../utils/model/model.js";
+import { disableKeepAlive } from "../../utils/proxy.js";
 import {
   asSystemPrompt,
   type SystemPrompt,
@@ -184,6 +185,10 @@ import { headlessProfilerCheckpoint } from "src/utils/headlessProfiler.js";
 import { isMcpInstructionsDeltaEnabled } from "src/utils/mcpInstructionsDelta.js";
 import { calculateUSDCost } from "src/utils/modelCost.js";
 import { isOpenAIResponsesModel } from "src/services/openaiAuth/models.js";
+import {
+  canRetryOpenAICodexStreamWithBufferedContent,
+  resolveOpenAICodexFirstTokenTimeoutMs,
+} from "src/services/openaiAuth/streamPolicy.js";
 import { endQueryProfile, queryCheckpoint } from "src/utils/queryProfiler.js";
 import {
   modelSupportsAdaptiveThinking,
@@ -273,6 +278,7 @@ import {
   isRetryableStreamError,
   RetriableStreamError,
   type RetryContext,
+  shouldRetryStreamAfterTransportDisconnect,
   withRetry,
 } from "./withRetry.js";
 
@@ -1495,8 +1501,6 @@ async function* queryModel(
     skipGlobalCacheForSystemPrompt: needsToolBasedCacheMarker,
     querySource: options.querySource,
   });
-  const useBetas = betas.length > 0;
-
   // Build minimal context for detailed tracing (when beta tracing is enabled)
   // Note: The actual new_context message extraction is done in sessionTracing.ts using
   // hash-based tracking per querySource (agent) from the messagesForAPI array
@@ -1848,13 +1852,12 @@ async function* queryModel(
       system,
       tools: allTools,
       tool_choice: options.toolChoice,
-      ...(useBetas && { betas: betasParams }),
+      ...(betasParams.length > 0 && { betas: betasParams }),
       metadata: getAPIMetadata(),
       max_tokens: maxOutputTokens,
       thinking,
       ...(temperature !== undefined && { temperature }),
       ...(contextManagement &&
-        useBetas &&
         betasParams.includes(CONTEXT_MANAGEMENT_BETA_HEADER) && {
           context_management: contextManagement,
         }),
@@ -1876,7 +1879,7 @@ async function* queryModel(
       thinkingConfig,
     });
     const logMessagesLength = queryParams.messages.length;
-    const logBetas = useBetas ? (queryParams.betas ?? []) : [];
+    const logBetas = queryParams.betas ?? [];
     const logThinkingType = queryParams.thinking?.type ?? "disabled";
     const logEffortValue = queryParams.output_config?.effort;
     void options.getToolPermissionContext().then((permissionContext) => {
@@ -2023,10 +2026,18 @@ async function* queryModel(
     // healthy-but-slow requests long before the user's configured timeout.
     // Falls back to API_TIMEOUT_MS (the user's request-timeout knob), then to
     // the idle value so terminal CLI behavior is unchanged when unset.
-    const STREAM_FIRST_TOKEN_TIMEOUT_MS =
+    const configuredFirstTokenTimeoutMs =
       parseInt(process.env.CLAUDE_STREAM_FIRST_TOKEN_TIMEOUT_MS || "", 10) ||
       parseInt(process.env.API_TIMEOUT_MS || "", 10) ||
       STREAM_IDLE_TIMEOUT_MS;
+    // ChatGPT Codex can emit encrypted reasoning items for minutes before any
+    // user-visible text. The OAuth fetch adapter marks only that direct path,
+    // so its larger pre-output budget does not change third-party providers.
+    const STREAM_FIRST_TOKEN_TIMEOUT_MS =
+      resolveOpenAICodexFirstTokenTimeoutMs(
+        streamResponse as Response | undefined,
+        configuredFirstTokenTimeoutMs,
+      );
     // The idle watchdog waits the first-token budget until the first chunk
     // arrives, then switches to the shorter mid-stream idle budget (#826).
     let currentStreamIdleTimeoutMs = STREAM_FIRST_TOKEN_TIMEOUT_MS;
@@ -2772,11 +2783,47 @@ async function* queryModel(
           )}`,
           { level: "warn" },
         );
-        throw new RetriableStreamError(streamingError);
+        throw new RetriableStreamError(streamingError, assistantCommitBuffer.flush());
+      }
+
+      // The socket under the stream died mid-response (stale pooled keep-alive
+      // connection, proxy/NAT dropping a reused one, upstream edge reset). It
+      // arrives as a bare transport error inside the SSE body, so withRetry
+      // (stream creation only) and isRetryableStreamError (SSE error payloads)
+      // both miss it, and with the non-streaming fallback disabled the turn
+      // would die on a fault a plain re-send clears. Recover on the same
+      // side-effect boundary the watchdog retry uses.
+      if (
+        shouldRetryStreamAfterTransportDisconnect({
+          error: streamingError,
+          hasCrossedSideEffectBoundary:
+            assistantCommitBuffer.hasCrossedSideEffectBoundary(),
+          streamIdleAborted,
+          signalAborted: signal.aborted,
+        })
+      ) {
+        // Nothing arrived at all, so the connection was already dead when the
+        // request went out — the pool is serving closed sockets. Stop reusing
+        // it so the retry opens a fresh one. A disconnect after message_start
+        // is a live connection that broke later; that pool stays trusted.
+        if (partialMessage === undefined) {
+          disableKeepAlive();
+        }
+        logForDebugging(
+          `Mid-stream transport disconnect before any tool output, will retry stream: ${errorMessage(
+            streamingError,
+          )}`,
+          { level: "warn" },
+        );
+        throw new RetriableStreamError(streamingError, assistantCommitBuffer.flush());
       }
 
       if (
-        newMessages.length === 0 &&
+        (newMessages.length === 0 ||
+          canRetryOpenAICodexStreamWithBufferedContent(
+            streamResponse as Response | undefined,
+            assistantCommitBuffer.hasCrossedSideEffectBoundary(),
+          )) &&
         !streamIdleAborted &&
         !signal.aborted &&
         isRetryableStreamError(streamingError)
@@ -2787,7 +2834,7 @@ async function* queryModel(
           )}`,
           { level: "warn" },
         );
-        throw new RetriableStreamError(streamingError);
+        throw new RetriableStreamError(streamingError, assistantCommitBuffer.flush());
       }
 
       // When the flag is enabled, skip the non-streaming fallback and let the
@@ -3087,6 +3134,7 @@ async function* queryModel(
           return;
         }
 
+        yield* assistantCommitBuffer.flush();
         yield getAssistantMessageFromError(error, errorModel, {
           messages,
           messagesForAPI,
@@ -3145,6 +3193,7 @@ async function* queryModel(
         return;
       }
 
+      yield* assistantCommitBuffer.flush();
       yield getAssistantMessageFromError(error, errorModel, {
         messages,
         messagesForAPI,

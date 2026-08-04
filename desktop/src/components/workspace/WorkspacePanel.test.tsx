@@ -37,6 +37,7 @@ type WorkspaceApiMocks = {
 }
 
 var mocks: WorkspaceApiMocks | undefined
+const workspacePreviewLineLimitForTests = vi.hoisted(() => 20)
 
 function getMocks() {
   if (!mocks) {
@@ -284,11 +285,17 @@ vi.mock('../../api/openTargets', () => ({
 
 vi.mock('@tauri-apps/plugin-shell', () => ({ open: vi.fn().mockResolvedValue(undefined) }))
 
+vi.mock('./WorkspaceCodeSurface', async (importOriginal) => ({
+  ...await importOriginal<typeof import('./WorkspaceCodeSurface')>(),
+  WORKSPACE_PREVIEW_LINE_LIMIT: workspacePreviewLineLimitForTests,
+}))
+
 import { useSettingsStore } from '../../stores/settingsStore'
 import { useChatStore } from '../../stores/chatStore'
 import { useWorkspaceChatContextStore } from '../../stores/workspaceChatContextStore'
 import { useWorkspacePanelStore } from '../../stores/workspacePanelStore'
 import { useUIStore } from '../../stores/uiStore'
+import { getServerBaseUrl } from '../../lib/desktopRuntime'
 import { WorkspacePanel } from './WorkspacePanel'
 
 describe('WorkspacePanel', () => {
@@ -1451,7 +1458,7 @@ describe('WorkspacePanel', () => {
   })
 
   it('uses theme tokens for the panel, preview header, and code surface in dark mode', async () => {
-    await setSettingsState({ ...settingsInitialState, locale: 'en', theme: 'dark' })
+    await setSettingsState({ ...settingsInitialState, locale: 'en' })
     await setWorkspaceState((state) => ({
       ...state,
       panelBySession: {
@@ -1689,7 +1696,10 @@ describe('WorkspacePanel', () => {
   })
 
   it('can expand long file previews beyond the default rendered line cap', async () => {
-    const longFile = Array.from({ length: 2300 }, (_, index) => `const line${index + 1} = ${index + 1}`).join('\n')
+    const longFile = Array.from(
+      { length: workspacePreviewLineLimitForTests + 3 },
+      (_, index) => `const line${index + 1} = ${index + 1}`,
+    ).join('\n')
 
     await setWorkspaceState((state) => ({
       ...state,
@@ -1723,15 +1733,103 @@ describe('WorkspacePanel', () => {
     const highlightedCode = view.getByTestId('workspace-code').textContent ?? ''
 
     expect(highlightedCode).toContain('const line1 = 1')
-    expect(highlightedCode).toContain('const line2000 = 2000')
-    expect(highlightedCode).not.toContain('const line2001 = 2001')
+    expect(highlightedCode).toContain('const line20 = 20')
+    expect(highlightedCode).not.toContain('const line21 = 21')
     await clickElement(view.getByRole('button', { name: 'Show all loaded lines' }))
 
     await waitFor(() => {
-      expect(view.getByTestId('workspace-code').textContent).toContain('const line2300 = 2300')
+      expect(view.getByTestId('workspace-code').textContent).toContain('const line23 = 23')
     })
     expect(view.getByRole('button', { name: 'Collapse preview' })).toBeTruthy()
-  }, 20_000)
+  })
+
+  it('marks the revealed line when a reference carries one', async () => {
+    // #1146: clicking `src/app.ts:3` in the chat has to land on line 3, not just
+    // open the file.
+    await setWorkspaceState((state) => ({
+      ...state,
+      panelBySession: {
+        ...state.panelBySession,
+        'session-reveal-line': { isOpen: true, activeView: 'all' },
+      },
+      previewTabsBySession: {
+        ...state.previewTabsBySession,
+        'session-reveal-line': [{
+          id: 'file:src/app.ts',
+          path: 'src/app.ts',
+          kind: 'file',
+          title: 'app.ts',
+          content: 'const a = 1\nconst b = 2\nconst c = 3\nconst d = 4',
+          language: 'typescript',
+          previewType: 'text',
+          state: 'ok',
+          reveal: { line: 3, nonce: 1 },
+        }],
+      },
+      activePreviewTabIdBySession: {
+        ...state.activePreviewTabIdBySession,
+        'session-reveal-line': 'file:src/app.ts',
+      },
+    }))
+
+    const view = await renderPanel('session-reveal-line')
+    const code = view.getByTestId('workspace-code')
+
+    const revealed = code.querySelector('[data-workspace-line-number="3"]')
+    expect(revealed?.className).toContain('bg-[var(--color-brand-soft)]')
+    // The inset rule is the load-bearing part of the mark: every soft fill in the
+    // palette sits under 1.11 contrast against the code background. See
+    // theme/contrast.test.ts.
+    expect(revealed?.className).toContain('shadow-[inset_2px_0_0_var(--color-brand)]')
+    // Neighbours keep the plain hover treatment.
+    expect(code.querySelector('[data-workspace-line-number="2"]')?.className)
+      .toContain('hover:bg-[var(--color-surface-hover)]')
+  })
+
+  it('expands a truncated preview when the revealed line is past the fold', async () => {
+    // Without this the reference silently does nothing: the row it points at is
+    // not rendered at all while the preview is capped.
+    const longFile = Array.from(
+      { length: workspacePreviewLineLimitForTests + 10 },
+      (_, index) => `const line${index + 1} = ${index + 1}`,
+    ).join('\n')
+    const revealLine = workspacePreviewLineLimitForTests + 5
+
+    await setWorkspaceState((state) => ({
+      ...state,
+      panelBySession: {
+        ...state.panelBySession,
+        'session-reveal-past-fold': { isOpen: true, activeView: 'all' },
+      },
+      previewTabsBySession: {
+        ...state.previewTabsBySession,
+        'session-reveal-past-fold': [{
+          id: 'file:long.ts',
+          path: 'long.ts',
+          kind: 'file',
+          title: 'long.ts',
+          content: longFile,
+          language: 'typescript',
+          previewType: 'text',
+          state: 'ok',
+          reveal: { line: revealLine, nonce: 1 },
+        }],
+      },
+      activePreviewTabIdBySession: {
+        ...state.activePreviewTabIdBySession,
+        'session-reveal-past-fold': 'file:long.ts',
+      },
+    }))
+
+    const view = await renderPanel('session-reveal-past-fold')
+
+    await waitFor(() => {
+      expect(view.getByTestId('workspace-code').textContent).toContain(`const line${revealLine} = ${revealLine}`)
+    })
+    expect(view.getByTestId('workspace-code')
+      .querySelector(`[data-workspace-line-number="${revealLine}"]`)?.className)
+      .toContain('bg-[var(--color-brand-soft)]')
+  })
 
   it('renders image previews from workspace files', async () => {
     await setWorkspaceState((state) => ({
@@ -1819,6 +1917,71 @@ describe('WorkspacePanel', () => {
     expect(view.getByText('Done')).toBeTruthy()
     expect(view.container.textContent).toContain('export const ok = true')
     expect(view.queryByTestId('workspace-code')).toBeNull()
+  })
+
+  it('resolves relative and remote markdown preview images to loadable URLs', async () => {
+    await setWorkspaceState((state) => ({
+      ...state,
+      panelBySession: {
+        ...state.panelBySession,
+        'session-markdown-images': {
+          isOpen: true,
+          activeView: 'all',
+        },
+      },
+      statusBySession: {
+        ...state.statusBySession,
+        'session-markdown-images': {
+          state: 'ok',
+          workDir: '/repo',
+          repoName: 'repo',
+          branch: 'main',
+          isGitRepo: true,
+          changedFiles: [],
+        },
+      },
+      previewTabsBySession: {
+        ...state.previewTabsBySession,
+        'session-markdown-images': [{
+          id: 'file:docs/guide.md',
+          path: 'docs/guide.md',
+          kind: 'file',
+          title: 'guide.md',
+          language: 'markdown',
+          content: [
+            '# Guide',
+            '',
+            '![logo](assets/logo.png)',
+            '![banner](../shared/banner.png)',
+            '![badge](https://img.shields.io/badge/stars-1k.svg)',
+            '![absolute](/repo/docs/raw.png)',
+            '![inline](data:image/png;base64,AAAA)',
+          ].join('\n'),
+          state: 'ok',
+          size: 160,
+        }],
+      },
+      activePreviewTabIdBySession: {
+        ...state.activePreviewTabIdBySession,
+        'session-markdown-images': 'file:docs/guide.md',
+      },
+    }))
+
+    const view = await renderPanel('session-markdown-images')
+
+    const base = getServerBaseUrl()
+    const images = await waitFor(() => {
+      const found = Array.from(view.container.querySelectorAll('img'))
+      expect(found).toHaveLength(5)
+      return found
+    })
+    expect(images.map((image) => image.getAttribute('src'))).toEqual([
+      `${base}/preview-fs/session-markdown-images/docs/assets/logo.png`,
+      `${base}/preview-fs/session-markdown-images/shared/banner.png`,
+      'https://img.shields.io/badge/stars-1k.svg',
+      `${base}/local-file/repo/docs/raw.png`,
+      'data:image/png;base64,AAAA',
+    ])
   })
 
   it('renders Mermaid diagrams in markdown file previews when labels contain HTML breaks and braces', async () => {
@@ -2416,13 +2579,18 @@ describe('WorkspacePanel', () => {
     const otherComposerShell = document.createElement('div')
     otherComposerShell.dataset.testid = 'chat-input-shell'
     otherComposerShell.dataset.sessionId = 'another-session'
-    otherComposerShell.append(document.createElement('textarea'))
+    const otherComposer = document.createElement('div')
+    otherComposer.setAttribute('data-composer-editor', 'true')
+    otherComposer.tabIndex = -1
+    otherComposerShell.append(otherComposer)
     document.body.append(otherComposerShell)
 
     const composerShell = document.createElement('div')
     composerShell.dataset.testid = 'chat-input-shell'
     composerShell.dataset.sessionId = 'session-diff-comment'
-    const composer = document.createElement('textarea')
+    const composer = document.createElement('div')
+    composer.setAttribute('data-composer-editor', 'true')
+    composer.tabIndex = -1
     composerShell.append(composer)
     document.body.append(composerShell)
 

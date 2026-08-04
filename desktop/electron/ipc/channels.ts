@@ -1,5 +1,8 @@
 export const ELECTRON_IPC_CHANNELS = {
   appGetVersion: 'desktop:app:get-version',
+  appGetLocalePreference: 'desktop:app:get-locale-preference',
+  appSetLocalePreference: 'desktop:app:set-locale-preference',
+  appGetPreferredSystemLanguages: 'desktop:app:get-preferred-system-languages',
   runtimeGetServerUrl: 'desktop:runtime:get-server-url',
   runtimeGetLocalAccessToken: 'desktop:runtime:get-local-access-token',
   runtimeGetPetAccessToken: 'desktop:runtime:get-pet-access-token',
@@ -12,6 +15,8 @@ export const ELECTRON_IPC_CHANNELS = {
   petsList: 'desktop:pets:list',
   petsCreateFromImage: 'desktop:pets:create-from-image',
   petsCreateFromAtlas: 'desktop:pets:create-from-atlas',
+  petsPickSourceSheet: 'desktop:pets:pick-source-sheet',
+  petsCreateFromAtlasBytes: 'desktop:pets:create-from-atlas-bytes',
   petsOpenFolder: 'desktop:pets:open-folder',
   petsShow: 'desktop:pets:show',
   petsHide: 'desktop:pets:hide',
@@ -19,6 +24,7 @@ export const ELECTRON_IPC_CHANNELS = {
   petsDragWindow: 'desktop:pets:drag-window',
   petsSetIgnoreMouseEvents: 'desktop:pets:set-ignore-mouse-events',
   petsSetInteractiveRegions: 'desktop:pets:set-interactive-regions',
+  petsFocusMainWindow: 'desktop:pets:focus-main-window',
   petsFocusSession: 'desktop:pets:focus-session',
   dialogOpen: 'desktop:dialog:open',
   dialogSave: 'desktop:dialog:save',
@@ -58,10 +64,12 @@ export const ELECTRON_IPC_CHANNELS = {
   appModeRestart: 'desktop:app-mode:restart',
   adaptersRestartSidecar: 'desktop:adapters:restart-sidecar',
   zoomSet: 'desktop:zoom:set',
+  appearanceSetApplied: 'desktop:appearance:set-applied',
 } as const
 
 export const ELECTRON_EVENT_CHANNELS = {
   event: 'desktop:event',
+  appLocaleChanged: 'desktop:app:locale-changed',
   webviewDragDrop: 'desktop:webview:drag-drop',
   notificationAction: 'desktop:notification:action',
   updateDownloadEvent: 'desktop:update:download-event',
@@ -72,6 +80,7 @@ export const ELECTRON_EVENT_CHANNELS = {
   previewEvent: 'desktop:preview:event',
   petNavigateSession: 'desktop:pets:navigate-session',
   petVisibilityChanged: 'desktop:pets:visibility-changed',
+  petPanelPlacementChanged: 'desktop:pets:panel-placement-changed',
 } as const
 
 export const ELECTRON_INTERNAL_CHANNELS = {

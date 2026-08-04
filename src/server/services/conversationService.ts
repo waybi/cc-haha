@@ -23,6 +23,13 @@ import {
   OPENAI_CODEX_REASONING_EFFORT_ENV_KEY,
   isOpenAIReasoningEffort,
 } from '../../services/openaiAuth/models.js'
+import {
+  IMAGE_GENERATION_API_KEY_ENV_KEY,
+  IMAGE_GENERATION_BASE_URL_ENV_KEY,
+  IMAGE_GENERATION_MODEL_ENV_KEY,
+  IMAGE_GENERATION_PROVIDER_ID_ENV_KEY,
+  IMAGE_GENERATION_PROVIDER_KIND_ENV_KEY,
+} from '../../services/imageGeneration/config.js'
 import { sessionService } from './sessionService.js'
 import { diagnosticsService } from './diagnosticsService.js'
 import {
@@ -35,6 +42,14 @@ import {
   buildClaudeCliArgs,
   resolveClaudeCliLauncher,
 } from '../../utils/desktopBundledCli.js'
+import {
+  ASK_USER_QUESTION_CLARIFY_MESSAGE,
+  ASK_USER_QUESTION_CLARIFY_WITH_QUESTIONS_PREFIX,
+  PLAN_REJECTION_MESSAGE,
+  PLAN_REJECTION_WITH_REASON_PREFIX,
+  REJECT_MESSAGE,
+  REJECT_MESSAGE_WITH_REASON_PREFIX,
+} from '../../constants/messages.js'
 import { getClaudeConfigHomeDir } from '../../utils/envUtils.js'
 import { findCanonicalGitRoot } from '../../utils/git.js'
 import { sanitizePath } from '../../utils/path.js'
@@ -60,6 +75,13 @@ export const MAX_CAPTURED_SDK_MESSAGE_BYTES = 64 * 1024
 export const MAX_CAPTURED_SDK_TOTAL_BYTES = 512 * 1024
 const MAX_CAPTURED_SDK_DIAGNOSTIC_TEXT_BYTES = 4 * 1024
 const CONTROL_READY_POLL_MS = 50
+/**
+ * 记住多少条已处理的 SDK 消息 uuid，用来挡掉 CLI 重连时的重放。
+ * CLI 侧重放缓冲是 DEFAULT_MAX_BUFFER_SIZE = 1000 条
+ * （src/cli/transports/WebSocketTransport.ts），这里留一倍余量，
+ * 保证整个缓冲区被重放时每一条都还认得出来。
+ */
+const MAX_SEEN_SDK_MESSAGE_UUIDS = 2_000
 const AUTO_MEMORY_DIRNAME = 'memory'
 export const DESKTOP_CLI_GRACEFUL_SHUTDOWN_TIMEOUT_MS = 6_000
 
@@ -77,6 +99,39 @@ export const DESKTOP_CLI_GRACEFUL_SHUTDOWN_TIMEOUT_MS = 6_000
 export function cliExitSeverity(code: number | null): 'info' | 'error' {
   if (code === 0 || code === null || code === 143 || code === 137) return 'info'
   return 'error'
+}
+
+/**
+ * Builds the denial text the CLI hands to the model as tool_result content.
+ *
+ * The model reads this verbatim, so it has to carry the instruction the desktop
+ * UI can't: a plain tool denial means "stop and wait for me", a rejected plan
+ * means "keep planning", and a question the user wants to talk over means "ask
+ * them what needs clarifying". Both plan renderers (the CLI's
+ * renderToolUseRejectedMessage, the desktop's extractPlanPreview) read the plan
+ * from the tool input, so nothing here needs to echo the plan back.
+ */
+export function buildDenyMessage(
+  toolName: string | undefined,
+  denyMessage: string | undefined,
+): string {
+  const feedback = denyMessage?.trim()
+  if (toolName === 'ExitPlanMode') {
+    return feedback
+      ? `${PLAN_REJECTION_WITH_REASON_PREFIX}${feedback}`
+      : PLAN_REJECTION_MESSAGE
+  }
+  // "Chat about this" is a denial only in transport terms — the user wants to
+  // keep talking, not to stop the turn. REJECT_MESSAGE's "STOP and wait" would
+  // contradict that and leave them staring at a silent turn.
+  if (toolName === 'AskUserQuestion') {
+    return feedback
+      ? `${ASK_USER_QUESTION_CLARIFY_WITH_QUESTIONS_PREFIX}${feedback}`
+      : ASK_USER_QUESTION_CLARIFY_MESSAGE
+  }
+  return feedback
+    ? `${REJECT_MESSAGE_WITH_REASON_PREFIX}${feedback}`
+    : REJECT_MESSAGE
 }
 
 export function buildConversationCliSpawnOptions(
@@ -103,6 +158,16 @@ type AttachmentRef = {
 }
 
 type UserContentBlock = Record<string, unknown>
+
+type SendMessageOptions = {
+  canSend?: () => boolean
+  messageUuid?: string
+  onCommitted?: () => void
+}
+
+type HandleSdkPayloadOptions = {
+  canAcceptPermissionRequest?: (message: any) => boolean
+}
 
 type MaterializedAttachments = {
   pathPrefix: string
@@ -145,6 +210,11 @@ type SessionProcess = {
   stdoutLines: string[]
   stderrLines: string[]
   outputDrain: Promise<void>
+  /**
+   * UUID 的 SDK 消息一旦处理过就记在这里，用于挡掉 CLI 重连时的整轮重放。
+   * 详见 handleSdkPayload 里的说明。插入顺序即淘汰顺序（Set 保序）。
+   */
+  seenSdkMessageUuids: Set<string>
   sdkMessages: any[]
   sdkMessageBytes?: number
   initMessage: any | null
@@ -160,6 +230,7 @@ type SessionProcess = {
       permissionSuggestions?: unknown[]
     }
   >
+  pendingControlRequests: Map<string, (reason: Error) => void>
 }
 
 export type PendingPermissionRequest = {
@@ -402,6 +473,7 @@ export class ConversationService {
       networkDerivedFirstTokenTimeout: networkRuntimeMetadata.firstTokenTimeoutDerived,
       sdkToken: this.getSdkTokenFromUrl(sdkUrl),
       sdkSocket: null,
+      seenSdkMessageUuids: new Set<string>(),
       sdkAttached,
       resolveSdkAttached,
       pendingOutbound: [],
@@ -416,6 +488,7 @@ export class ConversationService {
       usesOfficialOAuth,
       officialOAuthToken: childEnv.CLAUDE_CODE_OAUTH_TOKEN ?? null,
       pendingPermissionRequests: new Map(),
+      pendingControlRequests: new Map(),
     }
     this.sessions.set(sessionId, session)
 
@@ -530,6 +603,7 @@ export class ConversationService {
     sessionId: string,
     content: string,
     attachments?: AttachmentRef[],
+    options?: SendMessageOptions,
   ): Promise<boolean> {
     const userContent = await this.buildUserContent(content, sessionId, attachments)
     let session = this.sessions.get(sessionId)
@@ -540,8 +614,14 @@ export class ConversationService {
     if (session) {
       await this.refreshOfficialOAuthTokenBeforeTurn(sessionId, session)
     }
-    return this.sendSdkMessage(sessionId, {
+    // Building attachments, refreshing network settings, and refreshing OAuth
+    // can all suspend this call. Stop may revoke the owning desktop turn while
+    // one of those awaits is pending, so check ownership at the last possible
+    // point before writing the user message to the SDK socket.
+    if (options?.canSend && !options.canSend()) return false
+    const sent = this.sendSdkMessage(sessionId, {
       type: 'user',
+      ...(options?.messageUuid ? { uuid: options.messageUuid } : {}),
       message: {
         role: 'user',
         content: userContent,
@@ -549,6 +629,8 @@ export class ConversationService {
       parent_tool_use_id: null,
       session_id: '',
     })
+    if (sent) options?.onCommitted?.()
+    return sent
   }
 
   private async refreshNetworkEnvironmentBeforeTurn(
@@ -629,12 +711,16 @@ export class ConversationService {
             }
           : {
               behavior: 'deny',
-              message: denyMessage || 'User denied via UI',
-              // Rejecting ExitPlanMode means "keep planning"; other desktop
-              // denials stop the current agent turn and wait for user input.
-              ...(pendingRequest?.toolName !== 'ExitPlanMode'
-                ? { interrupt: true }
-                : {}),
+              // No `interrupt`: the denial travels back to the model as a
+              // tool_result so it can acknowledge the rejection and stop on its
+              // own. Aborting the turn instead (#1051) kept the model from ever
+              // seeing the denial, so a rejected tool ended the turn silently.
+              // REJECT_MESSAGE carries the "STOP and wait for the user"
+              // instruction that the abort used to enforce; 'User denied via UI'
+              // was a debug string the model had no way to act on.
+              // ExitPlanMode is the exception — rejecting it means "keep
+              // planning", so the model is told to revise rather than stop.
+              message: buildDenyMessage(pendingRequest?.toolName, denyMessage),
             },
       },
     })
@@ -645,13 +731,21 @@ export class ConversationService {
     this.trackPendingPermissionModeChange(sessionId, mode, 1)
 
     let confirmationSettled = false
-    let confirmationTimeout: ReturnType<typeof setTimeout>
-    let handleOutput: (msg: any) => void
+    let confirmationTimeout: ReturnType<typeof setTimeout> | undefined
+    let handleOutput: ((msg: any) => void) | undefined
+    let rejectConfirmation: ((reason?: unknown) => void) | undefined
     const cleanupConfirmation = () => {
-      clearTimeout(confirmationTimeout)
-      this.removeOutputCallback(sessionId, handleOutput)
+      if (confirmationTimeout !== undefined) clearTimeout(confirmationTimeout)
+      if (handleOutput) this.removeOutputCallback(sessionId, handleOutput)
+    }
+    const cancelConfirmation = (reason: unknown) => {
+      if (confirmationSettled) return
+      confirmationSettled = true
+      cleanupConfirmation()
+      rejectConfirmation?.(reason)
     }
     const confirmation = new Promise<void>((resolve, reject) => {
+      rejectConfirmation = reject
       handleOutput = (msg: any) => {
         if (
           msg?.type !== 'system' ||
@@ -665,12 +759,6 @@ export class ConversationService {
         cleanupConfirmation()
         resolve()
       }
-
-      confirmationTimeout = setTimeout(() => {
-        confirmationSettled = true
-        cleanupConfirmation()
-        reject(new Error(`Timed out waiting for permission mode confirmation: ${mode}`))
-      }, timeoutMs)
       this.onOutput(sessionId, handleOutput)
     })
     // requestControl can reject before the confirmation promise is awaited.
@@ -678,15 +766,22 @@ export class ConversationService {
     void confirmation.catch(() => undefined)
 
     try {
+      const startedAt = Date.now()
       await this.requestControl(sessionId, {
         subtype: 'set_permission_mode',
         mode,
       }, timeoutMs)
+      if (!confirmationSettled) {
+        const remainingMs = Math.max(1, timeoutMs - (Date.now() - startedAt))
+        confirmationTimeout = setTimeout(() => {
+          cancelConfirmation(new Error(`Timed out waiting for permission mode confirmation: ${mode}`))
+        }, remainingMs)
+      }
       await confirmation
 
       return this.sessions.has(sessionId)
     } catch (err) {
-      if (!confirmationSettled) cleanupConfirmation()
+      cancelConfirmation(err)
       throw err
     } finally {
       this.trackPendingPermissionModeChange(sessionId, mode, -1)
@@ -736,10 +831,12 @@ export class ConversationService {
   private async waitForControlChannelReady(
     sessionId: string,
     timeoutMs: number,
+    signal?: AbortSignal,
   ): Promise<void> {
     const startedAt = Date.now()
 
     while (Date.now() - startedAt < timeoutMs) {
+      if (signal?.aborted) throw controlRequestAbortReason(signal)
       const session = this.sessions.get(sessionId)
       if (!session) {
         throw new Error('CLI session is not running')
@@ -747,7 +844,7 @@ export class ConversationService {
       if (this.isControlChannelReady(session)) {
         return
       }
-      await new Promise((resolve) => setTimeout(resolve, CONTROL_READY_POLL_MS))
+      await waitForControlPoll(CONTROL_READY_POLL_MS, signal)
     }
 
     throw new Error('Timed out waiting for CLI control channel to become ready')
@@ -757,25 +854,39 @@ export class ConversationService {
     sessionId: string,
     request: Record<string, unknown>,
     timeoutMs = 10_000,
+    signal?: AbortSignal,
   ): Promise<Record<string, unknown>> {
+    if (signal?.aborted) {
+      return Promise.reject(controlRequestAbortReason(signal))
+    }
     if (!this.sessions.has(sessionId)) {
       return Promise.reject(new Error('CLI session is not running'))
     }
 
     const startedAt = Date.now()
-    await this.waitForControlChannelReady(sessionId, timeoutMs)
+    await this.waitForControlChannelReady(sessionId, timeoutMs, signal)
+    const session = this.sessions.get(sessionId)
+    if (!session) {
+      throw new Error('CLI session is not running')
+    }
     const responseTimeoutMs = Math.max(1, timeoutMs - (Date.now() - startedAt))
     const requestId = crypto.randomUUID()
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        this.removeOutputCallback(sessionId, handleOutput)
-        reject(new Error(`Timed out waiting for ${String(request.subtype ?? 'control')} response`))
-      }, responseTimeoutMs)
+      let settled = false
+      let timeout: ReturnType<typeof setTimeout>
 
       const finish = (fn: () => void) => {
+        if (settled) return
+        settled = true
         clearTimeout(timeout)
-        this.removeOutputCallback(sessionId, handleOutput)
+        signal?.removeEventListener('abort', handleAbort)
+        session.outputCallbacks = session.outputCallbacks.filter((entry) => entry !== handleOutput)
+        session.pendingControlRequests?.delete(requestId)
         fn()
+      }
+
+      const handleAbort = () => {
+        finish(() => reject(controlRequestAbortReason(signal!)))
       }
 
       const handleOutput = (msg: any) => {
@@ -798,8 +909,23 @@ export class ConversationService {
         ))
       }
 
-      this.onOutput(sessionId, handleOutput)
-      const sent = this.sendSdkMessage(sessionId, {
+      timeout = setTimeout(() => {
+        finish(() => reject(new Error(
+          `Timed out waiting for ${String(request.subtype ?? 'control')} response`,
+        )))
+      }, responseTimeoutMs)
+      session.outputCallbacks.push(handleOutput)
+      const pendingControlRequests = session.pendingControlRequests ?? new Map<string, (reason: Error) => void>()
+      session.pendingControlRequests = pendingControlRequests
+      pendingControlRequests.set(requestId, (reason) => {
+        finish(() => reject(reason))
+      })
+      signal?.addEventListener('abort', handleAbort, { once: true })
+      if (signal?.aborted) {
+        handleAbort()
+        return
+      }
+      const sent = this.sessions.get(sessionId) === session && this.sendSdkMessage(sessionId, {
         type: 'control_request',
         request_id: requestId,
         request,
@@ -880,7 +1006,40 @@ export class ConversationService {
     }
   }
 
-  handleSdkPayload(sessionId: string, rawPayload: string): void {
+  /**
+   * CLI 的 WebSocketTransport 在每次重连成功后会把它的整个发送缓冲区重放一遍，
+   * 并且明确假定「The server deduplicates by UUID」
+   * （src/cli/transports/WebSocketTransport.ts:204）。这个契约以前没有实现：
+   * 笔记本睡眠导致连接断开后（该 transport 有专门的睡眠检测，会无限重置重连预算），
+   * CLI 重连时会把最多 1000 条**早已完成**的消息重新推上来，server 原样转发给前端，
+   * 前端便把一整轮结束很久的对话当成实时输出重新渲染一遍 —— 表现为满屏「已思考」。
+   *
+   * 只有带 uuid 的消息才会进入 CLI 的重放缓冲（同文件 write()），所以这里也只按
+   * uuid 判重；没有 uuid 的消息（如 control_request）本就不会被重放，照常处理。
+   */
+  private isReplayedSdkMessage(session: SessionProcess, msg: any): boolean {
+    const uuid = typeof msg?.uuid === 'string' ? msg.uuid : ''
+    if (!uuid) return false
+
+    // 会话对象并非只有 startSession 一条构造路径，缺字段时按空集合起步而不是抛错。
+    const seen = session.seenSdkMessageUuids ?? new Set<string>()
+    session.seenSdkMessageUuids = seen
+    if (seen.has(uuid)) return true
+
+    if (seen.size >= MAX_SEEN_SDK_MESSAGE_UUIDS) {
+      // Set 保持插入顺序，最早进来的就是最该淘汰的。
+      const oldest = seen.values().next().value
+      if (oldest !== undefined) seen.delete(oldest)
+    }
+    seen.add(uuid)
+    return false
+  }
+
+  handleSdkPayload(
+    sessionId: string,
+    rawPayload: string,
+    options?: HandleSdkPayloadOptions,
+  ): void {
     const session = this.sessions.get(sessionId)
     if (!session) return
 
@@ -892,6 +1051,19 @@ export class ConversationService {
     for (const line of lines) {
       try {
         const msg = JSON.parse(line)
+        if (this.isReplayedSdkMessage(session, msg)) continue
+        if (
+          msg?.type === 'control_request' &&
+          msg.request?.subtype === 'can_use_tool' &&
+          typeof msg.request_id === 'string' &&
+          options?.canAcceptPermissionRequest?.(msg) === false
+        ) {
+          // Stop may win while a permission request is already queued on the
+          // SDK transport. Reject it at the service boundary so it is neither
+          // persisted as pending nor replayed to a reconnecting renderer.
+          this.respondToPermission(sessionId, msg.request_id, false)
+          continue
+        }
         this.retainSdkMessage(session, msg, Buffer.byteLength(line, 'utf-8'))
         const sdkError = this.extractSdkErrorEvent(msg)
         if (sdkError) {
@@ -1061,10 +1233,23 @@ export class ConversationService {
     return `${truncated}\n[truncated]`
   }
 
+  private cancelPendingControlRequests(
+    session: SessionProcess,
+    reason = new Error('CLI session stopped'),
+  ): void {
+    const pending = session.pendingControlRequests
+    if (!pending || pending.size === 0) return
+    for (const cancel of [...pending.values()]) {
+      cancel(reason)
+    }
+    pending.clear()
+  }
+
   stopSession(sessionId: string): void {
     const session = this.sessions.get(sessionId)
     if (!session) return
 
+    this.cancelPendingControlRequests(session)
     this.sessions.delete(sessionId)
     this.killProcess(sessionId, session)
   }
@@ -1076,6 +1261,7 @@ export class ConversationService {
     const session = this.sessions.get(sessionId)
     if (!session) return
 
+    this.cancelPendingControlRequests(session)
     this.sessions.delete(sessionId)
     await this.stopProcessAndWait(sessionId, session, timeoutMs)
   }
@@ -1092,6 +1278,9 @@ export class ConversationService {
     const activeSessions = Array.from(this.sessions.entries())
     if (activeSessions.length === 0) return
 
+    for (const [, session] of activeSessions) {
+      this.cancelPendingControlRequests(session)
+    }
     this.sessions.clear()
     await Promise.all(
       activeSessions.map(([sessionId, session]) =>
@@ -1245,6 +1434,10 @@ export class ConversationService {
 
     const activeSession = this.sessions.get(sessionId)
     if (activeSession?.proc === proc) {
+      this.cancelPendingControlRequests(
+        activeSession,
+        new Error('CLI session exited before the control request completed'),
+      )
       if (activeSession.startupPending) {
         activeSession.startupExitCode = code
         return
@@ -1336,6 +1529,10 @@ export class ConversationService {
       'ANTHROPIC_AUTH_TOKEN',
       'ENABLE_TOOL_SEARCH',
       'ANTHROPIC_MODEL',
+      'ANTHROPIC_DEFAULT_FABLE_MODEL',
+      'ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION',
+      'ANTHROPIC_DEFAULT_FABLE_MODEL_NAME',
+      'ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES',
       'ANTHROPIC_DEFAULT_HAIKU_MODEL',
       'ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES',
       'ANTHROPIC_DEFAULT_SONNET_MODEL',
@@ -1352,6 +1549,11 @@ export class ConversationService {
       OPENAI_CODEX_REASONING_EFFORT_ENV_KEY,
       GROK_OAUTH_PROVIDER_ENV_KEY,
       GROK_OAUTH_FILE_ENV_KEY,
+      IMAGE_GENERATION_PROVIDER_KIND_ENV_KEY,
+      IMAGE_GENERATION_PROVIDER_ID_ENV_KEY,
+      IMAGE_GENERATION_BASE_URL_ENV_KEY,
+      IMAGE_GENERATION_API_KEY_ENV_KEY,
+      IMAGE_GENERATION_MODEL_ENV_KEY,
     ] as const
 
     const cleanEnv = await getProcessEnvWithTerminalShellEnvironment()
@@ -1403,11 +1605,13 @@ export class ConversationService {
         cleanEnv.ANTHROPIC_MODEL,
     )
 
-    const cliDiagnosticsPath = diagnosticsService.getCliDiagnosticsPath()
+    let cliDiagnosticsPath: string | undefined
     try {
-      fs.mkdirSync(path.dirname(cliDiagnosticsPath), { recursive: true })
+      await diagnosticsService.prepareCliDiagnosticsStorage()
+      cliDiagnosticsPath = diagnosticsService.getCliDiagnosticsPath()
     } catch {
-      // Diagnostics must never block session startup.
+      // Diagnostics must never block session startup or point the child at an
+      // unsafe path when private storage could not be prepared.
     }
 
     return {
@@ -1444,7 +1648,7 @@ export class ConversationService {
       // forever while the UI shows "running" (#766). It can also double-run
       // tools (upstream inc-4258).
       CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK: cleanEnv.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK || '1',
-      CLAUDE_CODE_DIAGNOSTICS_FILE: cliDiagnosticsPath,
+      ...(cliDiagnosticsPath ? { CLAUDE_CODE_DIAGNOSTICS_FILE: cliDiagnosticsPath } : {}),
       CLAUDE_COWORK_MEMORY_PATH_OVERRIDE: this.resolveDesktopAutoMemoryPath(workDir),
       CALLER_DIR: workDir,
       PWD: workDir,
@@ -1454,6 +1658,12 @@ export class ConversationService {
             // arrives. Flush the completed turn first so the replacement can
             // reliably choose --resume and load the context (#1033).
             CLAUDE_CODE_EAGER_FLUSH: cleanEnv.CLAUDE_CODE_EAGER_FLUSH || '1',
+            // The CLI may keep processing internally after an SDK `result`
+            // (for example, a completed background Agent can enqueue one last
+            // model follow-up). Desktop cleanup must use the CLI's authoritative
+            // running/idle boundary or a disconnected renderer can kill that
+            // follow-up after the fixed idle grace period.
+            CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: '1',
             CC_HAHA_COMPUTER_USE_HOST_BUNDLE_ID: 'com.claude-code-haha.desktop',
           }
         : {}),
@@ -1600,6 +1810,10 @@ export class ConversationService {
         'ANTHROPIC_AUTH_TOKEN',
         'ENABLE_TOOL_SEARCH',
         'ANTHROPIC_MODEL',
+        'ANTHROPIC_DEFAULT_FABLE_MODEL',
+        'ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION',
+        'ANTHROPIC_DEFAULT_FABLE_MODEL_NAME',
+        'ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES',
         'ANTHROPIC_DEFAULT_HAIKU_MODEL',
         'ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES',
         'ANTHROPIC_DEFAULT_SONNET_MODEL',
@@ -1614,6 +1828,11 @@ export class ConversationService {
         OPENAI_CODEX_OAUTH_FILE_ENV_KEY,
         GROK_OAUTH_PROVIDER_ENV_KEY,
         GROK_OAUTH_FILE_ENV_KEY,
+        IMAGE_GENERATION_PROVIDER_KIND_ENV_KEY,
+        IMAGE_GENERATION_PROVIDER_ID_ENV_KEY,
+        IMAGE_GENERATION_BASE_URL_ENV_KEY,
+        IMAGE_GENERATION_API_KEY_ENV_KEY,
+        IMAGE_GENERATION_MODEL_ENV_KEY,
       ].some((key) => typeof env[key] === 'string' && env[key]!.trim().length > 0)
     } catch {
       return false
@@ -2048,7 +2267,10 @@ export class ConversationService {
         this.sanitizeAttachmentName(attachment.name, attachment.type, normalizedExt),
         normalizedExt,
       )
-      const sourcePath = source.sourcePath ?? this.writeUploadAttachment(
+      // Always stage the normalized bytes. ImageGen only accepts session uploads
+      // and prior generated outputs, so an attachment can be edited without
+      // granting the tool arbitrary filesystem read/upload access.
+      const sourcePath = this.writeUploadAttachment(
         uploadDir,
         storedName,
         resized.buffer,
@@ -2163,6 +2385,29 @@ export class ConversationService {
     const url = new URL(sdkUrl)
     return url.searchParams.get('token') || ''
   }
+}
+
+function controlRequestAbortReason(signal: AbortSignal): Error {
+  if (signal.reason instanceof Error) return signal.reason
+  return new DOMException('The operation was aborted', 'AbortError')
+}
+
+function waitForControlPoll(timeoutMs: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, timeoutMs))
+  if (signal.aborted) return Promise.reject(controlRequestAbortReason(signal))
+
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      signal.removeEventListener('abort', handleAbort)
+      resolve()
+    }, timeoutMs)
+    const handleAbort = () => {
+      clearTimeout(timeout)
+      reject(controlRequestAbortReason(signal))
+    }
+    signal.addEventListener('abort', handleAbort, { once: true })
+    if (signal.aborted) handleAbort()
+  })
 }
 
 function normalizeSessionPermissionUpdates(

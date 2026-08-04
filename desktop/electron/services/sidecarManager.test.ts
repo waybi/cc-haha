@@ -1,8 +1,20 @@
 import { describe, expect, it, vi } from 'vitest'
+import { EventEmitter } from 'node:events'
 import net from 'node:net'
 import http from 'node:http'
 import path from 'node:path'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import {
   appendHostDiagnostic,
@@ -24,6 +36,7 @@ import {
   reserveServerPort,
   resolveBundledRipgrepExecutable,
   resolveHostTriple,
+  resolveWindowsTaskkillExecutable,
   RIPGREP_PATH_ENV,
   SERVER_STATE_FILE,
   SYSTEM_PROXY_BRIDGE_ENV,
@@ -109,17 +122,21 @@ describe('Electron sidecar manager', () => {
   })
 
   it('can keep sidecar binaries and H5 assets unpacked while pointing app-root at app.asar', () => {
+    const resourcesRoot = path.resolve(path.sep, 'Applications', 'App.app', 'Contents', 'Resources')
+    const desktopRoot = path.join(resourcesRoot, 'app.asar.unpacked')
+    const appRoot = path.join(resourcesRoot, 'app.asar')
+    const h5DistDir = path.join(desktopRoot, 'dist')
     const plan = createServerPlan({
-      desktopRoot: '/Applications/App.app/Contents/Resources/app.asar.unpacked',
-      appRoot: '/Applications/App.app/Contents/Resources/app.asar',
-      h5DistDir: '/Applications/App.app/Contents/Resources/app.asar.unpacked/dist',
+      desktopRoot,
+      appRoot,
+      h5DistDir,
       port: 49321,
       env: {},
     })
 
-    expect(plan.command).toContain('/Applications/App.app/Contents/Resources/app.asar.unpacked/src-tauri/binaries/claude-sidecar-')
-    expect(plan.args).toContain('/Applications/App.app/Contents/Resources/app.asar')
-    expect(plan.env.CLAUDE_H5_DIST_DIR).toBe('/Applications/App.app/Contents/Resources/app.asar.unpacked/dist')
+    expect(plan.command).toContain(path.join(desktopRoot, 'src-tauri', 'binaries', 'claude-sidecar-'))
+    expect(plan.args).toContain(appRoot)
+    expect(plan.env.CLAUDE_H5_DIST_DIR).toBe(h5DistDir)
   })
 
   it('passes the packaged ripgrep path to the server and its CLI children', () => {
@@ -137,7 +154,9 @@ describe('Electron sidecar manager', () => {
       })
 
       expect(plan.env[RIPGREP_PATH_ENV]).toBe(bundledRipgrep)
-      expect(plan.env.PATH?.split(path.delimiter)).toContain(
+      const pathValue = Object.entries(plan.env)
+        .find(([key]) => key.toLowerCase() === 'path')?.[1]
+      expect(pathValue?.split(path.delimiter)).toContain(
         path.dirname(bundledRipgrep),
       )
 
@@ -318,7 +337,99 @@ describe('Electron sidecar manager', () => {
       expect(contents).not.toContain(homeDir)
       expect(lines).toHaveLength(HOST_DIAGNOSTICS_LINE_LIMIT)
       expect(lines[0]).toBe('line 6')
+      if (process.platform !== 'win32') {
+        expect(statSync(logPath).mode & 0o777).toBe(0o600)
+      }
     } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('creates the Electron diagnostics directory with private permissions', () => {
+    if (process.platform === 'win32') return
+    const dir = mkdtempSync(path.join(tmpdir(), 'cc-haha-electron-host-mode-'))
+    const diagnosticsDir = path.join(dir, 'cc-haha', 'diagnostics')
+    const logPath = path.join(diagnosticsDir, 'electron-host.log')
+    try {
+      appendHostDiagnostic(logPath, 'private mode probe')
+
+      expect(statSync(diagnosticsDir).mode & 0o777).toBe(0o700)
+      expect(statSync(logPath).mode & 0o777).toBe(0o600)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a symlinked Electron diagnostics directory without changing its target', () => {
+    if (process.platform === 'win32') return
+    const dir = mkdtempSync(path.join(tmpdir(), 'cc-haha-electron-host-symlink-dir-'))
+    const diagnosticsDir = path.join(dir, 'cc-haha', 'diagnostics')
+    const unrelatedDir = path.join(dir, 'unrelated')
+    const unrelatedLog = path.join(unrelatedDir, 'electron-host.log')
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    try {
+      mkdirSync(path.dirname(diagnosticsDir), { recursive: true })
+      mkdirSync(unrelatedDir, { mode: 0o755 })
+      writeFileSync(unrelatedLog, 'unrelated\n', { mode: 0o644 })
+      symlinkSync(unrelatedDir, diagnosticsDir, 'dir')
+
+      appendHostDiagnostic(path.join(diagnosticsDir, 'electron-host.log'), 'must not escape')
+
+      expect(statSync(unrelatedDir).mode & 0o777).toBe(0o755)
+      expect(statSync(unrelatedLog).mode & 0o777).toBe(0o644)
+      expect(readFileSync(unrelatedLog, 'utf-8')).toBe('unrelated\n')
+      expect(errorSpy).toHaveBeenCalledWith('[desktop] failed to persist Electron host diagnostics')
+    } finally {
+      errorSpy.mockRestore()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects an ancestor symlink before creating Electron diagnostics outside the config root', () => {
+    if (process.platform === 'win32') return
+    const dir = mkdtempSync(path.join(tmpdir(), 'cc-haha-electron-host-symlink-parent-'))
+    const configDir = path.join(dir, 'config')
+    const unrelatedDir = path.join(dir, 'unrelated')
+    const diagnosticsDir = path.join(configDir, 'cc-haha', 'diagnostics')
+    const unrelatedDiagnosticsDir = path.join(unrelatedDir, 'diagnostics')
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    try {
+      mkdirSync(configDir)
+      mkdirSync(unrelatedDiagnosticsDir, { recursive: true, mode: 0o755 })
+      symlinkSync(unrelatedDir, path.join(configDir, 'cc-haha'), 'dir')
+
+      appendHostDiagnostic(path.join(diagnosticsDir, 'electron-host.log'), 'must not escape')
+
+      expect(statSync(unrelatedDiagnosticsDir).mode & 0o777).toBe(0o755)
+      expect(existsSync(path.join(unrelatedDiagnosticsDir, 'electron-host.log'))).toBe(false)
+      expect(errorSpy).toHaveBeenCalledWith('[desktop] failed to persist Electron host diagnostics')
+    } finally {
+      errorSpy.mockRestore()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a symlinked Electron diagnostics file without copying its target', () => {
+    if (process.platform === 'win32') return
+    const dir = mkdtempSync(path.join(tmpdir(), 'cc-haha-electron-host-symlink-file-'))
+    const diagnosticsDir = path.join(dir, 'cc-haha', 'diagnostics')
+    const logPath = path.join(diagnosticsDir, 'electron-host.log')
+    const unrelatedLog = path.join(dir, 'unrelated.log')
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    try {
+      mkdirSync(diagnosticsDir, { recursive: true })
+      writeFileSync(unrelatedLog, 'PRIVATE_UNRELATED_CONTENT\n', { mode: 0o644 })
+      chmodSync(unrelatedLog, 0o644)
+      symlinkSync(unrelatedLog, logPath, 'file')
+
+      appendHostDiagnostic(logPath, 'must not copy target')
+
+      expect(lstatSync(logPath).isSymbolicLink()).toBe(true)
+      expect(statSync(unrelatedLog).mode & 0o777).toBe(0o644)
+      expect(readFileSync(unrelatedLog, 'utf-8')).toBe('PRIVATE_UNRELATED_CONTENT\n')
+      expect(errorSpy).toHaveBeenCalledWith('[desktop] failed to persist Electron host diagnostics')
+    } finally {
+      errorSpy.mockRestore()
       rmSync(dir, { recursive: true, force: true })
     }
   })
@@ -377,21 +488,90 @@ describe('Electron sidecar manager', () => {
 
   it('uses async taskkill on Windows by default', () => {
     const child = fakeChild(777)
-    const spawnAsync = vi.fn()
+    const taskkill = new EventEmitter()
+    const spawnAsync = vi.fn(() => taskkill)
     const spawnSyncFn = vi.fn()
-    killSidecar(child, false, { platform: 'win32', spawnAsync: spawnAsync as never, spawnSyncFn: spawnSyncFn as never })
-    expect(spawnAsync).toHaveBeenCalledWith('taskkill', ['/F', '/T', '/PID', '777'], { stdio: 'ignore', windowsHide: true })
+    killSidecar(child, false, {
+      platform: 'win32',
+      env: { SystemRoot: 'C:\\Windows' },
+      spawnAsync: spawnAsync as never,
+      spawnSyncFn: spawnSyncFn as never,
+    })
+    expect(spawnAsync).toHaveBeenCalledWith('C:\\Windows\\System32\\taskkill.exe', ['/F', '/T', '/PID', '777'], { stdio: 'ignore', windowsHide: true })
     expect(spawnSyncFn).not.toHaveBeenCalled()
     expect(child.kill).not.toHaveBeenCalled()
+  })
+
+  it('falls back without crashing when async taskkill is unavailable on Windows', () => {
+    const child = fakeChild(777)
+    const taskkill = new EventEmitter()
+    const spawnAsync = vi.fn(() => taskkill)
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    try {
+      killSidecar(child, false, {
+        platform: 'win32',
+        env: { SystemRoot: 'C:\\Windows' },
+        spawnAsync: spawnAsync as never,
+      })
+
+      const error = Object.assign(new Error('spawn taskkill ENOENT'), { code: 'ENOENT' })
+      expect(() => taskkill.emit('error', error)).not.toThrow()
+      expect(child.kill).toHaveBeenCalledTimes(1)
+      expect(errorSpy).toHaveBeenCalledWith(
+        '[desktop] taskkill failed; falling back to direct sidecar termination',
+        error,
+      )
+    } finally {
+      errorSpy.mockRestore()
+    }
   })
 
   it('uses synchronous taskkill on Windows during shutdown to avoid orphaned sidecars', () => {
     const child = fakeChild(777)
     const spawnAsync = vi.fn()
-    const spawnSyncFn = vi.fn()
-    killSidecar(child, true, { platform: 'win32', spawnAsync: spawnAsync as never, spawnSyncFn: spawnSyncFn as never })
-    expect(spawnSyncFn).toHaveBeenCalledWith('taskkill', ['/F', '/T', '/PID', '777'], { stdio: 'ignore', windowsHide: true })
+    const spawnSyncFn = vi.fn(() => ({ error: undefined }))
+    killSidecar(child, true, {
+      platform: 'win32',
+      env: { SystemRoot: 'C:\\Windows' },
+      spawnAsync: spawnAsync as never,
+      spawnSyncFn: spawnSyncFn as never,
+    })
+    expect(spawnSyncFn).toHaveBeenCalledWith('C:\\Windows\\System32\\taskkill.exe', ['/F', '/T', '/PID', '777'], { stdio: 'ignore', windowsHide: true })
     expect(spawnAsync).not.toHaveBeenCalled()
+    expect(child.kill).not.toHaveBeenCalled()
+  })
+
+  it('falls back when synchronous taskkill is unavailable on Windows', () => {
+    const child = fakeChild(777)
+    const error = Object.assign(new Error('spawnSync taskkill ENOENT'), { code: 'ENOENT' })
+    const spawnSyncFn = vi.fn(() => ({ error }))
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    try {
+      killSidecar(child, true, {
+        platform: 'win32',
+        env: { SystemRoot: 'C:\\Windows' },
+        spawnSyncFn: spawnSyncFn as never,
+      })
+
+      expect(child.kill).toHaveBeenCalledTimes(1)
+      expect(errorSpy).toHaveBeenCalledWith(
+        '[desktop] taskkill failed; falling back to direct sidecar termination',
+        error,
+      )
+    } finally {
+      errorSpy.mockRestore()
+    }
+  })
+
+  it('resolves taskkill from Windows system directories without relying on PATH', () => {
+    expect(resolveWindowsTaskkillExecutable({ SYSTEMROOT: 'D:\\Windows' }))
+      .toBe('D:\\Windows\\System32\\taskkill.exe')
+    expect(resolveWindowsTaskkillExecutable({ windir: 'E:\\WinDir' }))
+      .toBe('E:\\WinDir\\System32\\taskkill.exe')
+    expect(resolveWindowsTaskkillExecutable({}))
+      .toBe('taskkill.exe')
   })
 
   it('hides Windows console windows when launching sidecars', () => {
@@ -551,6 +731,27 @@ describe('Electron sidecar manager', () => {
       await expect(waitForServer('127.0.0.1', port, 300)).rejects.toThrow(
         /desktop server did not report healthy at http:\/\/127\.0\.0\.1:\d+\/health/,
       )
+    } finally {
+      await close(server)
+    }
+  })
+
+  it('isolates health probes from the shared HTTP connection pool', async () => {
+    const connections = new Set<number>()
+    const connectionHeaders: string[] = []
+    const server = http.createServer((request, response) => {
+      connections.add(request.socket.remotePort!)
+      connectionHeaders.push(request.headers.connection ?? '')
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ status: 'ok' }))
+    })
+    const port = await listen(server)
+
+    try {
+      await waitForServer('127.0.0.1', port, 1_000)
+      await waitForServer('127.0.0.1', port, 1_000)
+      expect(connections.size).toBe(2)
+      expect(connectionHeaders).toEqual(['close', 'close'])
     } finally {
       await close(server)
     }

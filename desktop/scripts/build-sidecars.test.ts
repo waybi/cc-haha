@@ -2,7 +2,7 @@
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { readFileSync } from 'node:fs'
-import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path, { join as joinPath } from 'node:path'
 
@@ -110,6 +110,23 @@ function startCompiledSidecar(options: {
   return { child, exited, logs: () => output }
 }
 
+/**
+ * What the compiled binary must still enforce about the desktop process token.
+ *
+ * Loopback is trusted on its own, so reading sessions without the token is the
+ * expected behaviour — plenty of legitimate local traffic (the OAuth success
+ * page, `/preview-fs` links, plain `curl`) can never carry it. The token is a
+ * strictly additive credential, required only on the `/api/h5-access` control
+ * plane, where another program on the same box must not be able to publish the
+ * user's sessions to the network.
+ */
+type CompiledSidecarAuthProof = {
+  loopbackWithoutTokenStatus: number
+  controlPlaneMissingTokenStatus: number
+  controlPlaneWrongTokenStatus: number
+  controlPlaneCorrectTokenStatus: number
+}
+
 async function waitForCompiledSidecar(options: {
   baseUrl: string
   expectedSessionId: string
@@ -117,11 +134,7 @@ async function waitForCompiledSidecar(options: {
   exited: SidecarProcess['exited']
   logs: () => string
   localAccessToken: string
-  onAuthProbe?: (proof: {
-    missingTokenStatus: number
-    wrongTokenStatus: number
-    correctTokenStatus: number
-  }) => void
+  onAuthProbe?: (proof: CompiledSidecarAuthProof) => void
 }): Promise<void> {
   const deadline = Date.now() + options.deadlineMs
   let authProbeComplete = false
@@ -148,26 +161,37 @@ async function waitForCompiledSidecar(options: {
         deadline,
       )
       if (!health.ok) throw new Error(`health returned ${health.status}`)
-      let pendingAuthProof: {
-        missingTokenStatus: number
-        wrongTokenStatus: number
-      } | undefined
+      let pendingAuthProof: CompiledSidecarAuthProof | undefined
       if (!authProbeComplete) {
-        const [missingTokenResponse, wrongTokenResponse] = await Promise.all([
+        const controlPlaneUrl = `${options.baseUrl}/api/h5-access`
+        const [
+          loopbackWithoutToken,
+          controlPlaneMissingToken,
+          controlPlaneWrongToken,
+          controlPlaneCorrectToken,
+        ] = await Promise.all([
           fetchBeforeCompiledSidecarDeadline(
             `${options.baseUrl}/api/sessions?limit=1&offset=0`,
             {},
             deadline,
           ),
+          fetchBeforeCompiledSidecarDeadline(controlPlaneUrl, {}, deadline),
           fetchBeforeCompiledSidecarDeadline(
-            `${options.baseUrl}/api/sessions?limit=1&offset=0`,
+            controlPlaneUrl,
             { headers: { Authorization: 'Bearer wrong-local-access-token' } },
+            deadline,
+          ),
+          fetchBeforeCompiledSidecarDeadline(
+            controlPlaneUrl,
+            { headers: authorizedHeaders },
             deadline,
           ),
         ])
         pendingAuthProof = {
-          missingTokenStatus: missingTokenResponse.status,
-          wrongTokenStatus: wrongTokenResponse.status,
+          loopbackWithoutTokenStatus: loopbackWithoutToken.status,
+          controlPlaneMissingTokenStatus: controlPlaneMissingToken.status,
+          controlPlaneWrongTokenStatus: controlPlaneWrongToken.status,
+          controlPlaneCorrectTokenStatus: controlPlaneCorrectToken.status,
         }
       }
       const sessionsResponse = await fetchBeforeCompiledSidecarDeadline(
@@ -179,10 +203,7 @@ async function waitForCompiledSidecar(options: {
         throw new Error(`sessions returned ${sessionsResponse.status}`)
       }
       if (pendingAuthProof) {
-        options.onAuthProbe?.({
-          ...pendingAuthProof,
-          correctTokenStatus: sessionsResponse.status,
-        })
+        options.onAuthProbe?.(pendingAuthProof)
         authProbeComplete = true
       }
       const body = await sessionsResponse.json() as {
@@ -536,23 +557,24 @@ describe.skipIf(!compiledSidecarSmokeEnabled)('compiled sidecar local-index smok
   it('uses SQLite by default, serves one indexed session, and reopens the database', async () => {
     const repoRoot = path.resolve(import.meta.dirname, '../..')
     const desktopRoot = path.resolve(import.meta.dirname, '..')
-    const executable = resolveSidecarExecutable(
+    const builtExecutable = resolveSidecarExecutable(
       desktopRoot,
       resolveHostTriple(),
     )
-    await stat(executable)
+    await stat(builtExecutable)
 
     const rootDir = await mkdtemp(joinPath(tmpdir(), 'cc-haha-compiled-sidecar-smoke-'))
-    const homeDir = joinPath(rootDir, 'home')
+    const unicodeInstallDir = joinPath(rootDir, '中文 安装目录')
+    const executable = process.platform === 'win32'
+      ? joinPath(unicodeInstallDir, path.basename(builtExecutable))
+      : builtExecutable
+
+    const homeDir = joinPath(rootDir, '中文 用户目录')
     const configDir = joinPath(homeDir, '.claude')
-    const projectDir = joinPath(configDir, 'projects', '-tmp-compiled-sidecar-smoke')
+    const projectDir = joinPath(configDir, 'projects', '-tmp-中文-compiled-sidecar-smoke')
     const sessionId = 'compiled-sidecar-smoke-session'
     const localAccessToken = 'compiled-sidecar-smoke-local-access-token'
-    const authenticationProofs: Array<{
-      missingTokenStatus: number
-      wrongTokenStatus: number
-      correctTokenStatus: number
-    }> = []
+    const authenticationProofs: CompiledSidecarAuthProof[] = []
     const databasePath = joinPath(
       configDir,
       'cc-haha',
@@ -588,6 +610,10 @@ describe.skipIf(!compiledSidecarSmokeEnabled)('compiled sidecar local-index smok
 
     try {
       await mkdir(projectDir, { recursive: true })
+      if (process.platform === 'win32') {
+        await mkdir(unicodeInstallDir, { recursive: true })
+        await copyFile(builtExecutable, executable)
+      }
       await writeFile(
         joinPath(projectDir, `${sessionId}.jsonl`),
         `${JSON.stringify({
@@ -610,9 +636,10 @@ describe.skipIf(!compiledSidecarSmokeEnabled)('compiled sidecar local-index smok
       expect(authenticationProofs).toHaveLength(compiledSidecarSmokeStarts)
       for (const proof of authenticationProofs) {
         expect(proof).toEqual({
-          missingTokenStatus: 403,
-          wrongTokenStatus: 403,
-          correctTokenStatus: 200,
+          loopbackWithoutTokenStatus: 200,
+          controlPlaneMissingTokenStatus: 403,
+          controlPlaneWrongTokenStatus: 403,
+          controlPlaneCorrectTokenStatus: 200,
         })
       }
     } finally {

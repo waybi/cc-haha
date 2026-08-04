@@ -23,6 +23,7 @@ import {
 } from './sessionIndex.js'
 import {
   createSessionProjector,
+  SESSION_SUMMARY_PARSER_VERSION,
   type SessionProjector,
   type SessionSourceCandidate,
 } from './sessionProjector.js'
@@ -40,7 +41,10 @@ import {
 } from './reconciliationWatcher.js'
 import type { LocalIndexMode, LocalIndexStatus } from './types.js'
 import type { ClaudeCodeStats, StatsDateRange } from '../../../utils/stats.js'
-import { writeActivityBackfillState } from './activityIndex.js'
+import {
+  markActivityBackfillBuilding,
+  writeActivityBackfillState,
+} from './activityIndex.js'
 
 export type LocalIndexSchedulingMetrics = {
   maxBatchSize: number
@@ -263,6 +267,49 @@ export async function discoverTranscriptSources(
   return { complete }
 }
 
+/**
+ * Depth a `subagents/` tree is walked. Plain subagents sit directly under it; a workflow nests
+ * them one group directory deeper (`subagents/workflows/<wf_id>/agent-*.jsonl`). The bound keeps
+ * an unexpected deep tree from turning discovery into a full filesystem walk.
+ */
+const SUBAGENT_SCAN_MAX_DEPTH = 3
+
+/**
+ * Every `agent-*.jsonl` beneath one session's `subagents/` directory, at any nesting level up to
+ * `SUBAGENT_SCAN_MAX_DEPTH`. Walking rather than reading one level is what brings workflow agent
+ * transcripts into the index — their tokens and tool calls were previously invisible.
+ */
+async function collectSubagentPaths(
+  directory: string,
+  signal: AbortSignal,
+  depth = 1,
+): Promise<{ complete: boolean; paths: string[] }> {
+  let entries
+  try {
+    entries = await readdir(directory, { withFileTypes: true })
+  } catch (error) {
+    if (isMissing(error)) return { complete: true, paths: [] }
+    return { complete: false, paths: [] }
+  }
+
+  const paths: string[] = []
+  let complete = true
+  for (const entry of entries) {
+    if (signal.aborted) return { complete: false, paths }
+    if (entry.isFile()) {
+      if (entry.name.startsWith('agent-') && entry.name.endsWith('.jsonl')) {
+        paths.push(join(directory, entry.name))
+      }
+      continue
+    }
+    if (!entry.isDirectory() || depth >= SUBAGENT_SCAN_MAX_DEPTH) continue
+    const nested = await collectSubagentPaths(join(directory, entry.name), signal, depth + 1)
+    if (!nested.complete) complete = false
+    paths.push(...nested.paths)
+  }
+  return { complete, paths }
+}
+
 export async function discoverActivityTranscriptSources(
   scope: string,
   signal: AbortSignal,
@@ -320,24 +367,10 @@ export async function discoverActivityTranscriptSources(
       }
       if (!entry.isDirectory()) continue
       const subagentsDir = join(projectDir, entry.name, 'subagents')
-      let subagentEntries
-      try {
-        subagentEntries = await readdir(subagentsDir, { withFileTypes: true })
-      } catch (error) {
-        if (isMissing(error)) continue
-        complete = false
-        continue
-      }
-      for (const subagent of subagentEntries) {
-        if (
-          signal.aborted ||
-          !subagent.isFile() ||
-          !subagent.name.startsWith('agent-') ||
-          !subagent.name.endsWith('.jsonl')
-        ) {
-          continue
-        }
-        const path = join(subagentsDir, subagent.name)
+      const found = await collectSubagentPaths(subagentsDir, signal)
+      if (!found.complete) complete = false
+      for (const path of found.paths) {
+        if (signal.aborted) return { complete: false, candidates }
         try {
           const snapshot = await stat(path)
           candidates.push({
@@ -1041,6 +1074,22 @@ export function createLocalIndexCoordinator(
       const activeDatabase = openedDatabase
       const activeIndex = createIndex(activeDatabase)
       const persisted = activeIndex.getBackfillState(resolvedScope)
+      // A parser upgrade makes persisted activity aggregates semantically stale. Invalidate their
+      // readiness before exposing the index so reads fall back until the rebuild finishes.
+      if (
+        typeof activeIndex.getActivityBackfillState === 'function' &&
+        typeof activeIndex.listActivitySources === 'function'
+      ) {
+        const persistedActivity = activeIndex.getActivityBackfillState(resolvedScope)
+        const parserUpgradePending = persistedActivity?.state === 'ready' &&
+          activeIndex.listActivitySources().some(source =>
+            source.parserVersion !== SESSION_SUMMARY_PARSER_VERSION)
+        if (parserUpgradePending) {
+          activeDatabase.transaction(operation => {
+            markActivityBackfillBuilding(operation, resolvedScope, now())
+          })
+        }
+      }
       scope = resolvedScope
       databasePath = resolvedDatabasePath
       database = activeDatabase

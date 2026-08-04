@@ -59,6 +59,7 @@ describe('PR quality workflow', () => {
       'server-checks',
       'provider-contract-checks',
       'chat-contract-checks',
+      'agent-flow-checks',
       'adapter-checks',
       'desktop-native-checks',
       'persistence-checks',
@@ -77,6 +78,19 @@ describe('PR quality workflow', () => {
     expect(workflow).toContain('uses: actions/upload-artifact@v4')
     expect(workflow).toContain('path: artifacts/coverage/')
     expect(workflow).toContain('retention-days: 14')
+  })
+
+  test('installs and validates the isolated React site for docs changes', () => {
+    const workflow = readFileSync('.github/workflows/pr-quality.yml', 'utf8')
+    const jobs = workflowJobs(workflow)
+    const docsSteps = jobs['docs-checks'].steps ?? []
+    const runDocs = docsSteps.find((step) => step.name === 'Run docs checks')
+
+    expect(workflow).toContain('cache-dependency-path: site/package-lock.json')
+    expect(runDocs?.run).toBe(
+      'npm --prefix site ci && npm --prefix site run build && npm --prefix site run check',
+    )
+    expect(workflow).not.toContain('vitepress')
   })
 
   test('keeps required PR checks deterministic and secret-free', () => {
@@ -102,6 +116,79 @@ describe('PR quality workflow', () => {
     expect(workflow).toContain('require_success "policy-enforcement" "${{ needs.policy-enforcement.result }}"')
     expect(workflow).toContain('require_selected "provider-contract-checks"')
     expect(workflow).toContain('require_selected "chat-contract-checks"')
+    expect(workflow).toContain('require_selected "agent-flow-checks"')
     expect(workflow).toContain('require_selected "coverage-checks"')
+  })
+
+  test('routes the deterministic agent flow through the scope plan and keeps its evidence', () => {
+    const workflow = readFileSync('.github/workflows/pr-quality.yml', 'utf8')
+    const jobs = workflowJobs(workflow)
+    const steps = jobs['agent-flow-checks'].steps ?? []
+
+    expect(workflow).toContain('agent_flow_checks: ${{ steps.policy.outputs.agent_flow_checks }}')
+    expect(steps.some((step) => step.run === 'bun run check:agent-flow')).toBe(true)
+    expect(workflow).toContain('path: artifacts/agent-flow/')
+    // The lane must stay runnable on an untrusted fork: no desktop install, no
+    // secrets, no live provider.
+    expect(steps.some((step) => String(step.run ?? '').includes('secrets'))).toBe(false)
+  })
+})
+
+describe('full quality workflow', () => {
+  test('runs every deterministic lane on demand without secrets or live providers', () => {
+    const workflow = readFileSync('.github/workflows/nightly-quality.yml', 'utf8')
+    const jobs = workflowJobs(workflow)
+    const runs = (jobs['full-deterministic'].steps ?? []).map((step) => step.run ?? '')
+
+    expect(workflow).toContain('workflow_dispatch:')
+    // Manual only, and it stays that way. This sweep costs about ninety minutes of
+    // CI; when to spend that is the maintainer's decision, so a schedule must not
+    // reappear here without one.
+    expect(workflow).not.toContain('schedule:')
+    expect(workflow).not.toContain('cron:')
+    for (const command of [
+      'bun run check:policy',
+      'bun run check:agent-flow',
+      'bun run check:server',
+      'bun run check:provider-contract',
+      'bun run check:chat-contract',
+      'bun run check:adapters',
+      'bun run check:desktop',
+      'bun run check:electron',
+      'bun run check:persistence-upgrade',
+      'bun run check:quarantine',
+      'bun run check:coverage',
+    ]) {
+      expect(runs, `full sweep must run ${command}`).toContain(command)
+    }
+
+    expect(workflow).not.toContain('--allow-live')
+    expect(workflow).not.toContain('secrets.')
+    expect(workflow.match(/persist-credentials: false/g)?.length).toBe(
+      workflow.match(/uses: actions\/checkout@v4/g)?.length,
+    )
+  })
+
+  test('re-proves the dependency graph so PR selection cannot silently degrade', () => {
+    const workflow = readFileSync('.github/workflows/nightly-quality.yml', 'utf8')
+    const jobs = workflowJobs(workflow)
+    const runs = (jobs['selection-drift'].steps ?? []).map((step) => step.run ?? '')
+
+    expect(runs.some((run) => run.includes('module-graph.test.ts'))).toBe(true)
+    expect(runs.some((run) => run.includes('check:impact'))).toBe(true)
+  })
+})
+
+describe('docs deployment workflow', () => {
+  test('builds and uploads the isolated React site', () => {
+    const workflow = readFileSync('.github/workflows/deploy-docs.yml', 'utf8')
+
+    expect(workflow).toContain("      - 'site/**'")
+    expect(workflow).toContain('cache-dependency-path: site/package-lock.json')
+    expect(workflow).toContain('run: npm --prefix site ci')
+    expect(workflow).toContain('run: npm --prefix site run build')
+    expect(workflow).toContain('path: site/dist')
+    expect(workflow).not.toContain('vitepress')
+    expect(workflow).not.toContain('docs/.vitepress/dist')
   })
 })

@@ -29,11 +29,13 @@ import {
   type ConversationNavigationItem,
   type ConversationNavigationMode,
 } from './ConversationNavigator'
-import type { AgentTaskNotification, UIMessage } from '../../types/chat'
+import type { AgentTaskNotification, BackgroundAgentTask, UIMessage } from '../../types/chat'
 import { formatTokenCount } from '../../lib/formatTokenCount'
 import { formatDurationMs, hasRunningBackgroundTasks as hasAnyRunningBackgroundTasks } from '../../lib/backgroundTasks'
+import { buildTurnCompletionByMessageId, type TurnCompletion } from '../../lib/turnCompletion'
 import { isTouchH5Document } from '../../lib/touchH5'
-import { ConfirmDialog } from '../shared/ConfirmDialog'
+import { Button } from '@/components/ui/Button'
+import { ConfirmDialog } from '@/components/ui/ConfirmDialog'
 import { clearWindowSelection, getSelectionPopoverPosition, useSelectionPopoverDismiss } from '../../hooks/useSelectionPopoverDismiss'
 import {
   getHeightsForSession,
@@ -107,12 +109,18 @@ function getElementForNode(node: Node | null): Element | null {
   return node.nodeType === Node.ELEMENT_NODE ? node as Element : node.parentElement
 }
 
-function getChatSelectionPosition(range: Range, root: HTMLElement, pointer: { clientX: number; clientY: number }) {
+function getChatSelectionPosition(
+  range: Range,
+  root: HTMLElement,
+  selection: Selection,
+  pointer: { clientX: number; clientY: number },
+) {
   return getSelectionPopoverPosition(range, root, {
     menuWidth: CHAT_SELECTION_MENU_WIDTH,
     menuHeight: CHAT_SELECTION_MENU_HEIGHT,
     offset: CHAT_SELECTION_MENU_OFFSET,
     fallbackPointer: pointer,
+    selectionFocus: { node: selection.focusNode, offset: selection.focusOffset },
   })
 }
 
@@ -135,7 +143,7 @@ function getChatSelectionFromContainer(
   if (!text) return null
 
   return {
-    ...getChatSelectionPosition(range, root, pointer),
+    ...getChatSelectionPosition(range, root, selection, pointer),
     text,
   }
 }
@@ -145,6 +153,14 @@ function getSelectionPointer(event: SelectionPointer): SelectionPointer {
     clientX: event.clientX,
     clientY: event.clientY,
   }
+}
+
+function isPrimarySelectionPointer(event: Pick<PointerEvent, 'button' | 'ctrlKey' | 'pointerType'>) {
+  return event.button === 0 && !(event.pointerType === 'mouse' && event.ctrlKey)
+}
+
+function isKeyboardSelectionKey(event: KeyboardEvent) {
+  return event.shiftKey && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)
 }
 
 function ChatSelectionMenu({
@@ -163,9 +179,11 @@ function ChatSelectionMenu({
     <button
       ref={popoverRef}
       type="button"
-      onMouseDown={(event) => event.preventDefault()}
+      onMouseDown={(event) => {
+        if (event.button === 0 && !event.ctrlKey) event.preventDefault()
+      }}
       onClick={onAdd}
-      className="fixed z-50 inline-flex h-11 items-center gap-2 rounded-full border border-[var(--color-border)]/70 bg-[var(--color-surface-container-lowest)] px-5 text-[15px] font-semibold text-[var(--color-text-primary)] shadow-[0_10px_28px_rgba(15,23,42,0.14),0_2px_8px_rgba(15,23,42,0.08)] transition-colors hover:bg-[var(--color-surface)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-brand)]/35"
+      className="fixed z-[var(--z-popover)] inline-flex h-11 items-center gap-2 rounded-full border border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] px-5 text-[15px] font-semibold text-[var(--color-text-primary)] shadow-[var(--shadow-overlay)] transition-colors hover:bg-[var(--color-surface)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-border-focus)]"
       style={{ left: selection.x, top: selection.y }}
     >
       <MessageCircle size={21} strokeWidth={2.15} className="shrink-0 text-[var(--color-text-primary)]" aria-hidden="true" />
@@ -213,7 +231,7 @@ function CompactStatusDivider({ message, state }: { message?: CompactSummaryEven
           aria-expanded={hasDetails ? expanded : undefined}
           onClick={() => hasDetails && setExpanded((value) => !value)}
           disabled={!hasDetails}
-          className="group inline-flex min-h-8 max-w-[min(78vw,520px)] items-center gap-2 rounded-md px-2.5 py-1 text-[13px] font-semibold text-[var(--color-text-secondary)] transition-colors hover:text-[var(--color-text-primary)] disabled:cursor-default disabled:hover:text-[var(--color-text-secondary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-brand)]/30"
+          className="group inline-flex min-h-8 max-w-[min(78vw,520px)] items-center gap-2 rounded-[var(--radius-md)] px-2.5 py-1 text-[13px] font-semibold text-[var(--color-text-secondary)] transition-colors hover:text-[var(--color-text-primary)] disabled:cursor-default disabled:hover:text-[var(--color-text-secondary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-border-focus)]"
         >
           {state === 'compacting' ? (
             <LoaderCircle size={16} strokeWidth={2.1} className="shrink-0 animate-spin text-[var(--color-text-tertiary)]" aria-hidden="true" />
@@ -227,7 +245,7 @@ function CompactStatusDivider({ message, state }: { message?: CompactSummaryEven
         <div className="h-px flex-1 bg-[var(--color-border)]" aria-hidden="true" />
       </div>
       {hasDetails && expanded && (
-        <div className="mx-auto mt-1.5 w-full max-w-[620px] rounded-md border border-[var(--color-border)]/65 bg-[var(--color-surface-container-lowest)] px-3 py-2">
+        <div className="mx-auto mt-1.5 w-full max-w-[620px] rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] px-3 py-2">
           {meta.length > 0 && (
             <div className="mb-1.5 flex flex-wrap gap-x-2 gap-y-1 text-[11px] font-medium text-[var(--color-text-tertiary)]">
               {meta.map((item) => <span key={item}>{item}</span>)}
@@ -259,12 +277,12 @@ function GoalEventCard({ message }: { message: GoalEvent }) {
     <div className="mb-2">
       <div
         data-testid="goal-event-card"
-        className="overflow-hidden rounded-lg border border-[var(--color-memory-border)] bg-[var(--color-memory-surface)]"
+        className="overflow-hidden rounded-[var(--radius-lg)] border border-[var(--color-memory-border)] bg-[var(--color-memory-surface)]"
       >
         <button
           type="button"
           onClick={() => setExpanded((value) => !value)}
-          className="flex w-full items-center gap-2 px-3 py-2 text-left transition-colors hover:bg-[var(--color-surface-hover)]/50"
+          className="flex w-full items-center gap-2 px-3 py-2 text-left transition-colors hover:bg-[var(--color-surface-hover)]"
         >
           {expanded ? (
             <ChevronDown size={15} className="shrink-0 text-[var(--color-text-tertiary)]" aria-hidden="true" />
@@ -284,14 +302,14 @@ function GoalEventCard({ message }: { message: GoalEvent }) {
         </button>
 
         {expanded ? (
-          <div className="border-t border-[var(--color-border)]/55 px-3 py-2.5">
+          <div className="border-t border-[var(--color-border)] px-3 py-2.5">
             <div className="space-y-1.5">
               {message.objective ? (
-                <div className="line-clamp-2 rounded-md px-2 py-1 text-[12px] leading-5 text-[var(--color-text-secondary)]">
+                <div className="line-clamp-2 rounded-[var(--radius-md)] px-2 py-1 text-[12px] leading-5 text-[var(--color-text-secondary)]">
                   {t('chat.goalEvent.objective', { value: message.objective })}
                 </div>
               ) : message.message ? (
-                <div className="whitespace-pre-wrap rounded-md px-2 py-1 text-[12px] leading-5 text-[var(--color-text-secondary)]">
+                <div className="whitespace-pre-wrap rounded-[var(--radius-md)] px-2 py-1 text-[12px] leading-5 text-[var(--color-text-secondary)]">
                   {message.message}
                 </div>
               ) : null}
@@ -323,7 +341,7 @@ function GoalContinuationDivider({ message }: { message: GoalEvent }) {
     <section data-testid="goal-continuation-divider" className="my-4 w-full px-1">
       <div className="flex w-full items-center gap-3">
         <div className="h-px flex-1 bg-[var(--color-border)]" aria-hidden="true" />
-        <div className="inline-flex min-h-8 max-w-[min(78vw,620px)] items-center gap-2 rounded-md px-2.5 py-1 text-[13px] font-medium text-[var(--color-text-secondary)]">
+        <div className="inline-flex min-h-8 max-w-[min(78vw,620px)] items-center gap-2 rounded-[var(--radius-md)] px-2.5 py-1 text-[13px] font-medium text-[var(--color-text-secondary)]">
           <Target size={16} strokeWidth={2.1} className="shrink-0 text-[var(--color-memory-accent)]" aria-hidden="true" />
           <span className="shrink-0 font-semibold text-[var(--color-text-primary)]">
             {t('chat.goalEvent.continuing')}
@@ -355,7 +373,7 @@ function BackgroundTaskEventCard({ message }: { message: BackgroundTaskEvent }) 
       <div
         data-testid="background-task-event-card"
         data-status={task.status}
-        className="flex min-w-0 items-start gap-2 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-3 py-2"
+        className="flex min-w-0 items-start gap-2 rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-3 py-2"
       >
         <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center">
           {isRunning ? (
@@ -436,6 +454,9 @@ function SelectableChatMessage({
   const rootRef = useRef<HTMLDivElement>(null)
   const selectionMenuRef = useRef<HTMLButtonElement>(null)
   const lastSelectionPointerRef = useRef<SelectionPointer | null>(null)
+  const selectionGestureEpochRef = useRef(0)
+  const selectionStartedInsideRef = useRef(false)
+  const selectionUpdateAuthorizedRef = useRef(false)
   const selectionUpdateFrameRef = useRef<number | null>(null)
   const addReference = useWorkspaceChatContextStore((state) => state.addReference)
   const [selectionMenu, setSelectionMenu] = useState<ChatSelectionState | null>(null)
@@ -444,10 +465,21 @@ function SelectableChatMessage({
     ? t('chat.assistantMessageReference')
     : t('chat.userMessageReference')
 
+  const cancelPendingSelectionMenuUpdate = useCallback(() => {
+    selectionGestureEpochRef.current += 1
+    if (selectionUpdateFrameRef.current !== null) {
+      window.cancelAnimationFrame(selectionUpdateFrameRef.current)
+      selectionUpdateFrameRef.current = null
+    }
+  }, [])
+
   useEffect(() => {
+    cancelPendingSelectionMenuUpdate()
     setSelectionMenu(null)
     lastSelectionPointerRef.current = null
-  }, [content, messageId])
+    selectionStartedInsideRef.current = false
+    selectionUpdateAuthorizedRef.current = false
+  }, [cancelPendingSelectionMenuUpdate, content, messageId])
 
   const dismissSelectionMenu = useCallback(() => {
     setSelectionMenu(null)
@@ -460,9 +492,16 @@ function SelectableChatMessage({
       window.cancelAnimationFrame(selectionUpdateFrameRef.current)
     }
 
+    const gestureEpoch = selectionGestureEpochRef.current
     selectionUpdateFrameRef.current = window.requestAnimationFrame(() => {
+      if (gestureEpoch !== selectionGestureEpochRef.current) {
+        selectionUpdateFrameRef.current = null
+        return
+      }
       selectionUpdateFrameRef.current = window.requestAnimationFrame(() => {
         selectionUpdateFrameRef.current = null
+        if (gestureEpoch !== selectionGestureEpochRef.current || !selectionUpdateAuthorizedRef.current) return
+
         const root = rootRef.current
         const rootRect = root?.getBoundingClientRect()
         const fallbackPointer = lastSelectionPointerRef.current ?? {
@@ -484,38 +523,58 @@ function SelectableChatMessage({
 
   useEffect(() => {
     const handlePointerDown = (event: PointerEvent) => {
-      lastSelectionPointerRef.current = getSelectionPointer(event)
+      cancelPendingSelectionMenuUpdate()
+      const root = rootRef.current
+      const target = event.target
+      const startsInside = isPrimarySelectionPointer(event)
+        && target instanceof Node
+        && Boolean(root?.contains(target))
+      selectionStartedInsideRef.current = startsInside
+      selectionUpdateAuthorizedRef.current = startsInside
+      if (startsInside) lastSelectionPointerRef.current = getSelectionPointer(event)
     }
 
     const handlePointerUp = (event: PointerEvent) => {
-      queueSelectionMenuUpdate(getSelectionPointer(event))
-    }
-
-    const handleMouseUp = (event: MouseEvent) => {
+      if (!selectionStartedInsideRef.current || !isPrimarySelectionPointer(event)) return
+      selectionStartedInsideRef.current = false
+      selectionUpdateAuthorizedRef.current = true
       queueSelectionMenuUpdate(getSelectionPointer(event))
     }
 
     const handleSelectionChange = () => {
+      if (selectionStartedInsideRef.current || !selectionUpdateAuthorizedRef.current) return
       queueSelectionMenuUpdate()
     }
 
-    const handleKeyUp = () => {
+    const handleKeyUp = (event: KeyboardEvent) => {
+      if (!isKeyboardSelectionKey(event)) return
+      cancelPendingSelectionMenuUpdate()
+      lastSelectionPointerRef.current = null
+      selectionStartedInsideRef.current = false
+      selectionUpdateAuthorizedRef.current = true
       queueSelectionMenuUpdate()
+    }
+
+    const handleContextMenu = () => {
+      cancelPendingSelectionMenuUpdate()
+      selectionStartedInsideRef.current = false
+      selectionUpdateAuthorizedRef.current = false
+      setSelectionMenu(null)
     }
 
     document.addEventListener('pointerdown', handlePointerDown, true)
     document.addEventListener('pointerup', handlePointerUp, true)
-    document.addEventListener('mouseup', handleMouseUp, true)
     document.addEventListener('selectionchange', handleSelectionChange)
     document.addEventListener('keyup', handleKeyUp, true)
+    document.addEventListener('contextmenu', handleContextMenu, true)
     return () => {
       document.removeEventListener('pointerdown', handlePointerDown, true)
       document.removeEventListener('pointerup', handlePointerUp, true)
-      document.removeEventListener('mouseup', handleMouseUp, true)
       document.removeEventListener('selectionchange', handleSelectionChange)
       document.removeEventListener('keyup', handleKeyUp, true)
+      document.removeEventListener('contextmenu', handleContextMenu, true)
     }
-  }, [queueSelectionMenuUpdate])
+  }, [cancelPendingSelectionMenuUpdate, queueSelectionMenuUpdate])
 
   useSelectionPopoverDismiss({
     active: Boolean(selectionMenu),
@@ -541,13 +600,6 @@ function SelectableChatMessage({
     <div
       ref={rootRef}
       data-chat-selectable-message={role}
-      onPointerDown={(event) => {
-        if (event.pointerType === 'mouse' && event.button !== 0) return
-        lastSelectionPointerRef.current = getSelectionPointer(event)
-      }}
-      onMouseUp={(event) => {
-        queueSelectionMenuUpdate(getSelectionPointer(event))
-      }}
       onKeyDown={(event) => {
         if (event.key === 'Escape') setSelectionMenu(null)
       }}
@@ -791,6 +843,7 @@ function buildTurnCardInsertionMap(
 
   const cardsByRenderIndex = new Map<number, TurnChangeCardModel[]>()
   turnChangeCards.forEach((card) => {
+    if (card.checkpoint.code.filesChanged.length === 0) return
     const renderIndex =
       lastResponseIndexByTurnId.get(card.target.messageId) ??
       userIndexByTurnId.get(card.target.messageId)
@@ -818,9 +871,7 @@ function buildChangedFilesByRenderIndex(
 ): Map<number, string[]> {
   const filesByTurnId = new Map<string, string[]>()
   for (const card of turnChangeCards) {
-    if (card.checkpoint.code.filesChanged.length > 0) {
-      filesByTurnId.set(card.target.messageId, card.checkpoint.code.filesChanged)
-    }
+    filesByTurnId.set(card.target.messageId, card.checkpoint.code.filesChanged)
   }
   if (filesByTurnId.size === 0) return new Map()
 
@@ -859,7 +910,9 @@ function isSessionTurnCheckpoint(value: unknown): value is SessionTurnCheckpoint
     typeof checkpoint.target?.userMessageIndex === 'number' &&
     Boolean(checkpoint.code) &&
     typeof checkpoint.code?.available === 'boolean' &&
-    Array.isArray(checkpoint.code?.filesChanged)
+    Array.isArray(checkpoint.code?.filesChanged) &&
+    (checkpoint.restoreAvailable === undefined ||
+      typeof checkpoint.restoreAvailable === 'boolean')
   )
 }
 
@@ -889,9 +942,9 @@ function MemoryEventCard({ message }: { message: MemoryEvent }) {
 
   return (
     <div className="mb-3 flex justify-center px-3">
-      <div className="w-full max-w-2xl rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-3.5 py-3 text-xs shadow-sm">
+      <div className="w-full max-w-2xl rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-3.5 py-3 text-xs shadow-[var(--shadow-card)]">
         <div className="flex items-start gap-3">
-          <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] text-[var(--color-brand)]">
+          <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-surface)] text-[var(--color-brand)]">
             <BookMarked size={15} aria-hidden="true" />
           </div>
           <div className="min-w-0 flex-1">
@@ -899,14 +952,14 @@ function MemoryEventCard({ message }: { message: MemoryEvent }) {
               <div className="font-medium text-[var(--color-text-primary)]">
                 {t('chat.memorySavedTitle', { count: message.files.length })}
               </div>
-              <button
-                type="button"
+              <Button
+                variant="secondary"
+                size="sm"
                 onClick={() => openMemorySettings(message.files[0]?.path)}
-                className="inline-flex h-7 items-center gap-1.5 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-2 text-[11px] font-medium text-[var(--color-text-secondary)] transition-colors hover:border-[var(--color-brand)]/50 hover:text-[var(--color-text-primary)]"
+                icon={<Settings size={13} aria-hidden="true" />}
               >
-                <Settings size={13} aria-hidden="true" />
                 {t('chat.memoryOpenSettings')}
-              </button>
+              </Button>
             </div>
             {message.message ? (
               <div className="mt-1 text-[var(--color-text-tertiary)]">{message.message}</div>
@@ -916,13 +969,13 @@ function MemoryEventCard({ message }: { message: MemoryEvent }) {
                 <span
                   key={file.path}
                   title={file.path}
-                  className="max-w-full truncate rounded-sm border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1 font-mono text-[10px] text-[var(--color-text-secondary)]"
+                  className="max-w-full truncate rounded-[var(--radius-sm)] border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1 font-mono text-[10px] text-[var(--color-text-secondary)]"
                 >
                   {memoryFileLabel(file.path)}
                 </span>
               ))}
               {hiddenCount > 0 ? (
-                <span className="rounded-sm border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1 font-mono text-[10px] text-[var(--color-text-tertiary)]">
+                <span className="rounded-[var(--radius-sm)] border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1 font-mono text-[10px] text-[var(--color-text-tertiary)]">
                   {t('chat.memoryMoreFiles', { count: hiddenCount })}
                 </span>
               ) : null}
@@ -954,9 +1007,9 @@ const VIRTUAL_OVERSCAN_PX = 1200
 const VIRTUAL_DEFAULT_VIEWPORT_HEIGHT = 720
 const VIRTUAL_MIN_ITEM_HEIGHT = 48
 const VIRTUAL_MAX_ITEM_HEIGHT = 24_000
-// Windows WebView2 can report 1px oscillations for live chat content; don't
-// convert those into bottom-scroll corrections.
-const CONTENT_RESIZE_FOLLOW_MIN_DELTA_PX = 2
+// Windows WebView2 can report up to 2px oscillations for live chat content;
+// don't convert those into bottom-scroll corrections.
+const CONTENT_RESIZE_FOLLOW_JITTER_MAX_DELTA_PX = 2
 const USER_SCROLL_INTENT_WINDOW_MS = 500
 const CONVERSATION_NAVIGATION_MIN_ITEMS = 4
 const CONVERSATION_NAVIGATION_FULL_MIN_WIDTH_PX = 960
@@ -1581,11 +1634,20 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
   const addToast = useUIStore((s) => s.addToast)
   const messages = sessionState?.messages ?? EMPTY_MESSAGES
   const chatState = sessionState?.chatState ?? 'idle'
+  const historyMutationEpoch = sessionState?.historyMutationEpoch ?? 0
   const streamingText = sessionState?.streamingText ?? ''
   const streamingToolInput = sessionState?.streamingToolInput ?? ''
   const activeThinkingId = sessionState?.activeThinkingId ?? null
   const agentTaskNotifications = sessionState?.agentTaskNotifications ?? EMPTY_AGENT_TASK_NOTIFICATIONS
-  const hasRunningBackgroundTasks = hasAnyRunningBackgroundTasks(sessionState?.backgroundAgentTasks)
+  const backgroundAgentTasks = sessionState?.backgroundAgentTasks
+  const agentTaskStatuses = useMemo<Record<string, BackgroundAgentTask['status']>>(() => {
+    const statuses: Record<string, BackgroundAgentTask['status']> = {}
+    for (const task of Object.values(backgroundAgentTasks ?? {})) {
+      if (task.toolUseId) statuses[task.toolUseId] = task.status
+    }
+    return statuses
+  }, [backgroundAgentTasks])
+  const hasRunningBackgroundTasks = hasAnyRunningBackgroundTasks(backgroundAgentTasks)
   const pendingPermissions = listPendingPermissions(sessionState)
   const activeAskUserQuestionToolUseId =
     pendingPermissions
@@ -1633,13 +1695,14 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
   const [branchingMessageId, setBranchingMessageId] = useState<string | null>(null)
   const [rewindingTurnId, setRewindingTurnId] = useState<string | null>(null)
   const [turnUndoConfirmTargetId, setTurnUndoConfirmTargetId] = useState<string | null>(null)
-  const [showJumpToLatest, setShowJumpToLatest] = useState(false)
+  const [isAwayFromLatest, setIsAwayFromLatest] = useState(false)
   const [virtualViewport, setVirtualViewport] = useState<VirtualViewport>({
     scrollTop: SCROLL_BOTTOM_SENTINEL,
     viewportHeight: VIRTUAL_DEFAULT_VIEWPORT_HEIGHT,
   })
   const [measuredItemsVersion, setMeasuredItemsVersion] = useState(0)
   const [highlightedNavigationItemKey, setHighlightedNavigationItemKey] = useState<string | null>(null)
+  const [programmaticNavigationItemId, setProgrammaticNavigationItemId] = useState<string | null>(null)
   const [activeConversationFindMatch, setActiveConversationFindMatch] = useState<ConversationFindMatch | null>(null)
   const conversationFindMatchesRef = useRef<ConversationFindMatch[]>([])
   const [messageListWidth, setMessageListWidth] = useState<number | null>(null)
@@ -1730,7 +1793,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
         wasAtBottom: true,
       })
     }
-    setShowJumpToLatest(false)
+    setIsAwayFromLatest(false)
     // Reset flag after the scroll event(s) from scrollIntoView have fired
     requestAnimationFrame(() => {
       const latestContainer = scrollContainerRef.current
@@ -1803,6 +1866,9 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
       syncVirtualViewportFromContainer(container)
       return
     }
+    if (performance.now() < userScrollIntentUntilRef.current) {
+      setProgrammaticNavigationItemId(null)
+    }
     syncVirtualViewportFromContainer(container)
     const isAtBottom = isNearScrollBottom(container)
     const isPermissionLayoutShift =
@@ -1813,7 +1879,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
     if (isPermissionLayoutShift) return
 
     shouldAutoScrollRef.current = isAtBottom
-    setShowJumpToLatest(!isAtBottom)
+    setIsAwayFromLatest(!isAtBottom)
 
     if (resolvedSessionId) {
       rememberSessionScroll(resolvedSessionId, container)
@@ -1828,7 +1894,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
     markUserScrollIntent()
     if (event.deltaY < 0) {
       shouldAutoScrollRef.current = false
-      setShowJumpToLatest(true)
+      setIsAwayFromLatest(true)
     }
   }, [markUserScrollIntent])
 
@@ -1848,7 +1914,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
     markUserScrollIntent()
     if (isUpwardScrollKey) {
       shouldAutoScrollRef.current = false
-      setShowJumpToLatest(true)
+      setIsAwayFromLatest(true)
     }
   }, [markUserScrollIntent])
 
@@ -1857,6 +1923,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
       const snapshot = resolvedSessionId ? sessionScrollSnapshots.get(resolvedSessionId) : undefined
       shouldAutoScrollRef.current = snapshot?.wasAtBottom ?? true
       lastSessionIdRef.current = resolvedSessionId
+      setProgrammaticNavigationItemId(null)
       virtualItemHeightsRef.current = resolvedSessionId
         ? getHeightsForSession(resolvedSessionId)
         : new Map<string, number>()
@@ -1880,7 +1947,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
           scrollTop: snapshot.scrollTop,
           viewportHeight: container.clientHeight || current.viewportHeight || VIRTUAL_DEFAULT_VIEWPORT_HEIGHT,
         }))
-        setShowJumpToLatest(true)
+        setIsAwayFromLatest(true)
       } else if (container) {
         // Switch to a session we were at the bottom of (or first visit): write
         // the bottom sentinel without going through scrollToBottom's read path,
@@ -1894,7 +1961,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
           scrollTop: SCROLL_BOTTOM_SENTINEL,
           viewportHeight: container.clientHeight || current.viewportHeight || VIRTUAL_DEFAULT_VIEWPORT_HEIGHT,
         }))
-        setShowJumpToLatest(false)
+        setIsAwayFromLatest(false)
         if (resolvedSessionId) {
           sessionScrollSnapshots.set(resolvedSessionId, {
             scrollTop: container.scrollTop,
@@ -1927,7 +1994,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
 
   useEffect(() => {
     if (!shouldAutoScrollRef.current) {
-      setShowJumpToLatest(true)
+      setIsAwayFromLatest(true)
       return
     }
 
@@ -1935,6 +2002,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
   }, [messages.length, resolvedSessionId, scrollToBottom, streamingText, streamingToolInput])
 
   const handleJumpToLatest = useCallback(() => {
+    setProgrammaticNavigationItemId(null)
     scrollToBottom('auto')
   }, [scrollToBottom])
 
@@ -1948,7 +2016,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
         const previousFollowHeight = lastContentResizeFollowHeightRef.current
         if (
           previousFollowHeight !== null &&
-          Math.abs(nextHeight - previousFollowHeight) < CONTENT_RESIZE_FOLLOW_MIN_DELTA_PX
+          Math.abs(nextHeight - previousFollowHeight) <= CONTENT_RESIZE_FOLLOW_JITTER_MAX_DELTA_PX
         ) {
           return
         }
@@ -2000,6 +2068,10 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
     () => getCompletedTurnTargets(deferredMessages),
     [deferredMessages],
   )
+  const turnCompletionByMessageId = useMemo(
+    () => buildTurnCompletionByMessageId(deferredMessages, { turnActive: chatState !== 'idle' }),
+    [deferredMessages, chatState],
+  )
   const latestCompletedTurnId =
     completedTurnTargets.length > 0
       ? completedTurnTargets[completedTurnTargets.length - 1]?.messageId ?? null
@@ -2010,8 +2082,8 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
     [renderItems, visibleTurnChangeCards],
   )
   const changedFilesByRenderIndex = useMemo(
-    () => buildChangedFilesByRenderIndex(renderItems, visibleTurnChangeCards),
-    [renderItems, visibleTurnChangeCards],
+    () => buildChangedFilesByRenderIndex(renderItems, turnChangeCards),
+    [renderItems, turnChangeCards],
   )
   const renderItemKeys = useMemo(
     () => renderItems.map(getRenderItemKey),
@@ -2034,7 +2106,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
     }),
     [renderItemKeys, renderItems],
   )
-  const conversationNavigationHistoryItems = useMemo(() => {
+  const conversationNavigationItems = useMemo(() => {
     const sources = renderItems.flatMap((item, renderIndex) => item.kind === 'message'
       ? [{
           message: item.message,
@@ -2045,26 +2117,6 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
 
     return buildConversationNavigationItems(sources)
   }, [renderItems])
-  const streamingConversationNavigationItem = useMemo(() => {
-    if (!streamingText.trim()) return null
-
-    return buildConversationNavigationItems([{
-      message: {
-        id: `${STREAMING_ASSISTANT_NAVIGATION_KEY}-${resolvedSessionId ?? 'session'}`,
-        type: 'assistant_text',
-        content: streamingText,
-        timestamp: 0,
-      },
-      renderIndex: renderItems.length,
-      renderItemKey: STREAMING_ASSISTANT_NAVIGATION_KEY,
-    }])[0] ?? null
-  }, [renderItems, resolvedSessionId, streamingText])
-  const conversationNavigationItems = useMemo(
-    () => streamingConversationNavigationItem
-      ? [...conversationNavigationHistoryItems, streamingConversationNavigationItem]
-      : conversationNavigationHistoryItems,
-    [conversationNavigationHistoryItems, streamingConversationNavigationItem],
-  )
   const virtualTranscriptWindow = useMemo(
     () => buildVirtualTranscriptWindow(
       renderItems,
@@ -2077,14 +2129,20 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
     [measuredItemsVersion, renderItemKeys, renderItemMetrics, renderItems, virtualViewport],
   )
   const activeConversationNavigationItemId = useMemo(
-    () => getActiveConversationNavigationItemId(
-      conversationNavigationItems,
-      virtualTranscriptWindow.offsets,
-      virtualViewport.scrollTop,
-      virtualViewport.viewportHeight,
-    ),
-    [conversationNavigationItems, virtualTranscriptWindow.offsets, virtualViewport],
+    () => isAwayFromLatest
+      ? getActiveConversationNavigationItemId(
+          conversationNavigationItems,
+          virtualTranscriptWindow.offsets,
+          virtualViewport.scrollTop,
+          virtualViewport.viewportHeight,
+        )
+      : null,
+    [conversationNavigationItems, isAwayFromLatest, virtualTranscriptWindow.offsets, virtualViewport],
   )
+  const visibleConversationNavigationItemId =
+    programmaticNavigationItemId && conversationNavigationItems.some((item) => item.id === programmaticNavigationItemId)
+      ? programmaticNavigationItemId
+      : activeConversationNavigationItemId
   const conversationNavigationMode: ConversationNavigationMode =
     messageListWidth === null || messageListWidth >= CONVERSATION_NAVIGATION_FULL_MIN_WIDTH_PX
       ? 'full'
@@ -2174,7 +2232,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
             const target =
               targetByMessageId.get(checkpoint.target.targetUserMessageId) ??
               targetByUserMessageIndex.get(checkpoint.target.userMessageIndex)
-            if (!target || !checkpoint.code.available || checkpoint.code.filesChanged.length === 0) {
+            if (!target || !checkpoint.code.available) {
               return []
             }
             return [{
@@ -2200,7 +2258,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
     return () => {
       cancelled = true
     }
-  }, [chatState, completedTurnTargets, hasRunningBackgroundTasks, isMemberSession, latestCompletedTurnId, resolvedSessionId])
+  }, [chatState, completedTurnTargets, hasRunningBackgroundTasks, historyMutationEpoch, isMemberSession, latestCompletedTurnId, resolvedSessionId])
 
   const handleUndoCurrentTurn = useCallback(async () => {
     if (!resolvedSessionId || !confirmTurnCard || rewindingTurnId || hasRunningBackgroundTasks) return
@@ -2321,9 +2379,8 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
     if (!container) return
 
     const viewportHeight = container.clientHeight || virtualViewport.viewportHeight || VIRTUAL_DEFAULT_VIEWPORT_HEIGHT
-    const isTranscriptTail =
-      item.renderItemKey === STREAMING_ASSISTANT_NAVIGATION_KEY ||
-      item.renderIndex === renderItems.length - 1
+    userScrollIntentUntilRef.current = 0
+    setProgrammaticNavigationItemId(item.id)
     setHighlightedNavigationItemKey(item.renderItemKey)
 
     const scheduleHighlightClear = () => {
@@ -2336,12 +2393,6 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
       }, 1400)
     }
 
-    if (isTranscriptTail) {
-      scrollToBottom('auto')
-      requestAnimationFrame(scheduleHighlightClear)
-      return
-    }
-
     const targetScrollTop = getConversationNavigationTargetScrollTop(
       item,
       virtualTranscriptWindow.offsets,
@@ -2352,7 +2403,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
     const isNearby = Math.abs(container.scrollTop - targetScrollTop) <= viewportHeight * 1.25
 
     shouldAutoScrollRef.current = false
-    setShowJumpToLatest(true)
+    setIsAwayFromLatest(true)
     ignoreProgrammaticScrollUntilRef.current = performance.now() + 250
     ignoreProgrammaticScrollTopRef.current = targetScrollTop
 
@@ -2383,8 +2434,6 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
       scheduleHighlightClear()
     })
   }, [
-    renderItems.length,
-    scrollToBottom,
     syncVirtualViewportFromContainer,
     virtualTranscriptWindow.offsets,
     virtualTranscriptWindow.totalHeight,
@@ -2405,7 +2454,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
 
     setActiveConversationFindMatch(match)
     shouldAutoScrollRef.current = false
-    setShowJumpToLatest(true)
+    setIsAwayFromLatest(true)
     ignoreProgrammaticScrollUntilRef.current = performance.now() + 250
     ignoreProgrammaticScrollTopRef.current = targetScrollTop
     setScrollTopWithoutLayoutRead(container, targetScrollTop)
@@ -2575,6 +2624,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
             resultMap={toolResultMap}
             childToolCallsByParent={childToolCallsByParent}
             agentTaskNotifications={agentTaskNotifications}
+            agentTaskStatuses={agentTaskStatuses}
             isStreaming={
               chatState === 'tool_executing' &&
               item.toolCalls.some((tc) => !toolResultMap.has(tc.toolUseId))
@@ -2593,6 +2643,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
             }
             branchAction={branchActionByMessageId.get(item.message.id)}
             turnChangedFiles={changedFilesByRenderIndex.get(index)}
+            turnCompletion={turnCompletionByMessageId.get(item.message.id)}
           />
         )}
 
@@ -2627,7 +2678,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
       >
         <div
           ref={scrollContentRef}
-          className={compact ? 'mx-auto max-w-full' : 'mx-auto max-w-[860px]'}
+          className={compact ? 'mx-auto max-w-full' : 'mx-auto max-w-[900px]'}
         >
           {virtualTranscriptWindow.enabled ? (
             <VirtualSpacer height={virtualTranscriptWindow.beforeHeight} position="top" />
@@ -2662,10 +2713,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
           ) : null}
 
           {streamingText.trim() && (
-            <div
-              data-chat-render-item-key={STREAMING_ASSISTANT_NAVIGATION_KEY}
-              className={highlightedNavigationItemKey === STREAMING_ASSISTANT_NAVIGATION_KEY ? 'chat-render-item--navigation-target' : ''}
-            >
+            <div data-chat-render-item-key={STREAMING_ASSISTANT_NAVIGATION_KEY}>
               <AssistantMessage content={streamingText} isStreaming={chatState === 'streaming'} />
             </div>
           )}
@@ -2683,7 +2731,7 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
           )}
 
           {!isLoadingTurnChangeCards && visibleTurnChangeCards.length === 0 && turnChangeLoadError && (
-            <div className="mx-auto mb-5 w-full max-w-[860px] rounded-[var(--radius-lg)] border border-[var(--color-error)]/25 bg-[var(--color-error-container)]/18 px-4 py-3 text-xs text-[var(--color-error)]">
+            <div className="mx-auto mb-5 w-full max-w-[900px] rounded-[var(--radius-lg)] border border-[var(--color-error)] bg-[var(--color-error-container)] px-4 py-3 text-xs text-[var(--color-on-error-container)]">
               {turnChangeLoadError}
             </div>
           )}
@@ -2696,22 +2744,25 @@ export function MessageList({ sessionId, compact = false, mobileLayout = false }
         <ConversationNavigator
           mode={conversationNavigationMode}
           items={conversationNavigationItems}
-          activeItemId={activeConversationNavigationItemId}
+          activeItemId={visibleConversationNavigationItemId}
           onNavigate={handleNavigateToConversationItem}
         />
       ) : null}
 
-      {showJumpToLatest && (
-        <button
-          type="button"
+      {isAwayFromLatest && (
+        <Button
+          variant="secondary"
+          size="md"
           onClick={handleJumpToLatest}
           title={t('chat.jumpToLatest')}
           aria-label={t('chat.jumpToLatest')}
-          className="absolute bottom-4 right-5 z-20 flex h-9 items-center gap-2 rounded-full border border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] px-3 text-xs font-medium text-[var(--color-text-primary)] shadow-[var(--shadow-dropdown)] transition-colors hover:border-[var(--color-brand)]/50 hover:bg-[var(--color-surface-container-low)]"
+          // `glass-panel` is unlayered CSS, so it wins over the variant's
+          // layered background/border utilities without a tailwind-merge.
+          className="glass-panel absolute bottom-4 right-5 z-20 rounded-full text-[13.5px] font-medium hover:-translate-y-px motion-reduce:hover:translate-y-0"
+          icon={<ArrowDown size={15} aria-hidden="true" />}
         >
-          <ArrowDown size={15} aria-hidden="true" />
-          <span>{t('chat.jumpToLatest')}</span>
-        </button>
+          {t('chat.jumpToLatest')}
+        </Button>
       )}
 
       <ConfirmDialog
@@ -2747,6 +2798,7 @@ export const MessageBlock = memo(function MessageBlock({
   toolResult,
   branchAction,
   turnChangedFiles,
+  turnCompletion,
 }: {
   sessionId?: string | null
   message: UIMessage
@@ -2759,6 +2811,7 @@ export const MessageBlock = memo(function MessageBlock({
     onBranch: () => void
   }
   turnChangedFiles?: string[]
+  turnCompletion?: TurnCompletion
 }) {
   const t = useTranslation()
 
@@ -2776,6 +2829,7 @@ export const MessageBlock = memo(function MessageBlock({
             attachments={message.attachments}
             branchAction={branchAction}
             timestamp={message.timestamp}
+            sessionId={sessionId ?? undefined}
           />
         </SelectableChatMessage>
       )
@@ -2793,6 +2847,7 @@ export const MessageBlock = memo(function MessageBlock({
             sessionId={sessionId ?? undefined}
             timestamp={message.timestamp}
             turnChangedFiles={turnChangedFiles}
+            turnCompletion={turnCompletion}
           />
         </SelectableChatMessage>
       )
@@ -2809,6 +2864,11 @@ export const MessageBlock = memo(function MessageBlock({
           />
         )
       }
+      // No durationMs prop here on purpose: buildRenderModel only emits a
+      // standalone tool_use item for AskUserQuestion, and this branch is reached
+      // only while such a call is still pending — so there is never a result to
+      // measure against. The badge is wired in ToolCallGroup, the path every
+      // other tool call takes.
       return (
         <ToolCallBlock
           toolName={message.toolName}
@@ -2861,10 +2921,10 @@ export const MessageBlock = memo(function MessageBlock({
         message.message.trim() !== '' &&
         message.message !== displayMessage
       return (
-        <div className="mb-3 px-4 py-2.5 rounded-lg border border-[var(--color-error)]/20 bg-[var(--color-error-container)]/28 text-sm text-[var(--color-error)]">
+        <div className="mb-3 px-4 py-2.5 rounded-[var(--radius-lg)] border border-[var(--color-error)] bg-[var(--color-error-container)] text-sm text-[var(--color-on-error-container)]">
           <strong>{t('common.error')}:</strong> {displayMessage}
           {showRawDetail && (
-            <div className="mt-1 whitespace-pre-wrap text-xs text-[var(--color-on-error-container)]/85">
+            <div className="mt-1 whitespace-pre-wrap text-xs text-[var(--color-on-error-container)]">
               {message.message}
             </div>
           )}

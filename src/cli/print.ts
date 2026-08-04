@@ -241,6 +241,7 @@ import { executeNotificationHooks } from 'src/utils/hooks.js'
 import {
   parseTaskNotificationXml,
   shouldForwardTaskNotificationToModel,
+  TaskNotificationFollowUpBatch,
 } from 'src/utils/taskNotificationPolicy.js'
 import {
   ElicitRequestSchema,
@@ -262,6 +263,7 @@ import {
   toSDKRateLimitInfo,
 } from 'src/utils/messages/mappers.js'
 import { createModelSwitchBreadcrumbs } from 'src/utils/messages.js'
+import { PrintPartialOutputTracker } from './partialOutput.js'
 import { collectContextData } from 'src/commands/context/context-noninteractive.js'
 import { getSessionUsageSnapshot } from 'src/cost-tracker.js'
 import { LOCAL_COMMAND_STDOUT_TAG } from 'src/constants/xml.js'
@@ -854,6 +856,7 @@ export async function runHeadless(
   const needsFullArray = options.outputFormat === 'json' && options.verbose
   const messages: SDKMessage[] = []
   let lastMessage: SDKMessage | undefined
+  const partialOutputTracker = new PrintPartialOutputTracker()
   // Streamlined mode transforms messages when CLAUDE_CODE_STREAMLINED_OUTPUT=true and using stream-json
   // Build flag gates this out of external builds; env var is the runtime opt-in for ant builds
   const transformToStreamlined =
@@ -878,6 +881,8 @@ export async function runHeadless(
     options,
     turnInterruptionState,
   )) {
+    partialOutputTracker.observe(message)
+
     if (transformToStreamlined) {
       // Streamlined mode: transform messages and stream immediately
       const transformed = transformToStreamlined(message)
@@ -938,9 +943,10 @@ export async function runHeadless(
       switch (lastMessage.subtype) {
         case 'success':
           writeToStdout(
-            lastMessage.result.endsWith('\n')
-              ? lastMessage.result
-              : lastMessage.result + '\n',
+            partialOutputTracker.formatResultLine(
+              lastMessage.result,
+              lastMessage.is_error,
+            ),
           )
           break
         case 'error_during_execution':
@@ -1021,6 +1027,7 @@ function runHeadlessStreaming(
   let inputClosed = false
   let shutdownPromptInjected = false
   let heldBackResult: StdoutMessage | null = null
+  const deferredAgentNotifications = new TaskNotificationFollowUpBatch()
   let abortController: AbortController | undefined
   // Same queue sendRequest() enqueues to — one FIFO for everything.
   const output = structuredIO.outbound
@@ -2047,6 +2054,7 @@ function runHeadlessStreaming(
                 structuredOutput: options.outputFormat === 'stream-json',
               })
             ) {
+              deferredAgentNotifications.defer(notificationText)
               for (const uuid of batchUuids) {
                 notifyCommandLifecycle(uuid, 'completed')
               }
@@ -2354,9 +2362,13 @@ function runHeadlessStreaming(
             t => isBackgroundTask(t) && t.type !== 'in_process_teammate',
           )
           const hasMainThreadQueued = peek(isMainThread) !== undefined
-          if (hasRunningBg || hasMainThreadQueued) {
+          const agentFollowUp = deferredAgentNotifications.takeIfSettled(hasRunningBg || hasMainThreadQueued)
+          if (agentFollowUp) {
+            enqueue({ mode: 'prompt', value: agentFollowUp, priority: 'later', isMeta: true })
+          }
+          if (hasRunningBg || hasMainThreadQueued || agentFollowUp) {
             waitingForAgents = true
-            if (!hasMainThreadQueued) {
+            if (!hasMainThreadQueued && !agentFollowUp) {
               runPhase = 'waiting_for_agents'
               // No commands ready yet, wait for tasks to complete
               await sleep(100)

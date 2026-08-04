@@ -9,9 +9,15 @@ import { useTabStore } from './tabStore'
 import { randomSpinnerVerb } from '../config/spinnerVerbs'
 import { notifyDesktop } from '../lib/desktopNotifications'
 import { deriveSessionTitle, isPlaceholderSessionTitle } from '../lib/sessionTitle'
-import { hasRunningBackgroundTasks } from '../lib/backgroundTasks'
+import { t } from '../i18n'
+import {
+  VISUAL_SELECTION_BATCH_PROMPT_HEADER,
+  VISUAL_SELECTION_PROMPT_FOOTER,
+} from '../lib/selectionComposer'
+import { hasRunningBackgroundTasks, hasRunningSubagentTasks } from '../lib/backgroundTasks'
 import { AGENT_LIFECYCLE_TYPES } from '../types/team'
 import type { ComposerAttachment } from '../lib/composerAttachments'
+import type { ComposerMention } from '../lib/composerMentions'
 import type { MessageEntry } from '../types/session'
 import type { PermissionMode } from '../types/settings'
 import type { RuntimeSelection } from '../types/runtime'
@@ -34,6 +40,11 @@ import type {
   TokenUsage,
   PermissionUpdate,
 } from '../types/chat'
+import type {
+  SlashCommandKind,
+  SlashCommandOption,
+  SlashCommandSource,
+} from '../types/slashCommand'
 
 type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'reconnecting'
 type ToolCall = Extract<UIMessage, { type: 'tool_use' }>
@@ -42,6 +53,14 @@ type CompactSummaryMessage = Extract<UIMessage, { type: 'compact_summary' }>
 export type ComposerDraftState = {
   input: string
   attachments: ComposerAttachment[]
+  /** Inline @-mention pills in the draft, in document order. */
+  mentions?: ComposerMention[]
+}
+
+export type RepositoryLaunchDraftState = {
+  workDir: string
+  branch: string | null
+  useWorktree: boolean
 }
 
 export type QueuedUserMessage = {
@@ -112,6 +131,8 @@ export type PerSessionState = {
    * Optional: legacy persisted sessions predate the field.
    */
   compactCount?: number
+  /** Bumped when the server confirms the selected runtime is applied. */
+  runtimeConfigReadyCount?: number
   /**
    * Characters streamed by the assistant during the current turn (text,
    * thinking, tool input). ÷4 approximates output tokens for the streaming
@@ -126,10 +147,13 @@ export type PerSessionState = {
   apiRetry?: ApiRetryState | null
   // 流式恢复/非流式降级提示（活动回合状态，与 apiRetry 同清除时机）。
   streamingFallback?: StreamingFallbackState | null
-  slashCommands: Array<{ name: string; description: string; argumentHint?: string }>
+  slashCommands: SlashCommandOption[]
   agentTaskNotifications: Record<string, AgentTaskNotification>
   backgroundAgentTasks?: Record<string, BackgroundAgentTask>
   stoppingBackgroundTaskIds?: Record<string, boolean>
+  pendingBackgroundTaskStopFailures?: Record<string, string>
+  stopAllSubagentsRequested?: boolean
+  historyMutationEpoch?: number
   suppressNextTaskNotificationResponse?: boolean
   replaceHistoryOnCompletion?: boolean
   activeGoal?: ActiveGoalState | null
@@ -142,6 +166,7 @@ export type PerSessionState = {
   } | null
   composerInsertion?: ComposerReferenceInsertion | null
   composerDraft?: ComposerDraftState | null
+  repositoryLaunchDraft?: RepositoryLaunchDraftState | null
   queuedUserMessages?: QueuedUserMessage[]
 }
 
@@ -163,6 +188,7 @@ const DEFAULT_SESSION_STATE: PerSessionState = {
   pendingComputerUsePermissions: {},
   tokenUsage: { input_tokens: 0, output_tokens: 0 },
   compactCount: 0,
+  runtimeConfigReadyCount: 0,
   streamingResponseChars: 0,
   elapsedSeconds: 0,
   statusVerb: '',
@@ -172,6 +198,9 @@ const DEFAULT_SESSION_STATE: PerSessionState = {
   agentTaskNotifications: {},
   backgroundAgentTasks: {},
   stoppingBackgroundTaskIds: {},
+  pendingBackgroundTaskStopFailures: {},
+  stopAllSubagentsRequested: false,
+  historyMutationEpoch: 0,
   suppressNextTaskNotificationResponse: false,
   replaceHistoryOnCompletion: false,
   activeGoal: null,
@@ -179,6 +208,7 @@ const DEFAULT_SESSION_STATE: PerSessionState = {
   composerPrefill: null,
   composerInsertion: null,
   composerDraft: null,
+  repositoryLaunchDraft: null,
   queuedUserMessages: [],
 }
 
@@ -317,6 +347,8 @@ type ChatStore = {
   clearComposerInsertion: (sessionId: string, nonce?: number) => void
   setComposerDraft: (sessionId: string, draft: ComposerDraftState) => void
   clearComposerDraft: (sessionId: string) => void
+  setRepositoryLaunchDraft: (sessionId: string, draft: RepositoryLaunchDraftState) => void
+  clearRepositoryLaunchDraft: (sessionId: string) => void
   queueUserMessage: (
     sessionId: string,
     message: Omit<QueuedUserMessage, 'id' | 'createdAt'>,
@@ -444,6 +476,16 @@ function buildPartialToolInputPreview(
   previousInput: unknown,
 ): Record<string, unknown> {
   const previous = isRecord(previousInput) ? previousInput : {}
+
+  try {
+    const complete = JSON.parse(partialInput) as unknown
+    if (isRecord(complete)) {
+      return { ...previous, ...complete }
+    }
+  } catch {
+    // Keep exposing useful scalar fields while the JSON object is incomplete.
+  }
+
   const preview: Record<string, unknown> = { ...previous }
   for (const field of ['file_path', 'filePath', 'path', 'command', 'pattern', 'url', 'query', 'description']) {
     const value = extractPartialJsonStringField(partialInput, field)
@@ -557,6 +599,24 @@ function clearPendingToolInputDelta(sessionId: string): void {
   pendingToolInputDeltaBySession.delete(sessionId)
 }
 
+/**
+ * 后台（异步）子 agent 的工具活动会带着 parentToolUseId 冒泡进主消息流，但
+ * 渲染层把它们折叠进父 agent 卡片、不在主流单独显示（MessageList 的
+ * childToolCallsByParent）。合并流式块时必须跳过这些"隐形"消息去看真正的上一
+ * 条主流消息，否则主 agent 一段连续的 thinking / 正文会被它们切成好几块 ——
+ * 块之间还什么都不显示（#1108）。
+ */
+function findStreamMergeTargetIndex(messages: UIMessage[]): number {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]!
+    const isBubbledChildActivity =
+      (message.type === 'tool_use' || message.type === 'tool_result') &&
+      Boolean(message.parentToolUseId)
+    if (!isBubbledChildActivity) return index
+  }
+  return -1
+}
+
 function appendAssistantTextMessage(
   messages: UIMessage[],
   content: string,
@@ -567,7 +627,8 @@ function appendAssistantTextMessage(
   const trimmedContent = content.trim()
   if (!trimmedContent) return messages
 
-  const last = messages[messages.length - 1]
+  const lastIndex = findStreamMergeTargetIndex(messages)
+  const last = lastIndex >= 0 ? messages[lastIndex] : undefined
   // Wake/reconnect replay can resend persisted assistant text without a
   // transcript id. Ignore chunks that are already present in the hydrated tail.
   if (
@@ -578,7 +639,21 @@ function appendAssistantTextMessage(
   ) {
     return messages
   }
-
+  // 这里曾经还有一道守卫：扫描整个 messages，只要某条 hydrated 回复与来文逐字相同
+  // 就丢弃。它必须去掉 —— 内容相等原理上区分不了「重放」和「模型真的又答了一遍同样
+  // 的话」。一轮里出现两次「好的」、两次「完成了」、两次同样的一行命令输出毫不稀奇，
+  // 而 mergeRestoredTranscriptMessageIds 会按逐字相同把 transcript id 回填到 live
+  // 消息上，于是第一条就成了第二条的毒药。用户眼看着流式输出完的回复会在
+  // message_complete 时凭空消失，且没有任何路径能找回来。
+  //
+  // d39e82b62 试过把扫描限定在当前轮次，被 3a630db11 回退：同轮重复照样丢，而且
+  // 尾部只要有一条 user_text 就让守卫彻底失效。换任何扫描边界都不成立。
+  //
+  // 真正挡住重放的是服务端按 uuid 去重（conversationService.isReplayedSdkMessage，
+  // 与这道守卫同一个提交 de52656bb 加入）。那里的容量是 2000 条 uuid，而 de52656bb
+  // 记录的最坏情况是 858 条消息重放 31 次 —— 858 < 2000，整个重放窗口都在集合里，
+  // 逐条按身份挡掉。上面那道尾部子串守卫保留：它只在尾部仍是那条 hydrated 消息时
+  // 才生效，够不到一轮之内被工具调用隔开的重复。
   const canMergeIntoLast =
     last?.type === 'assistant_text' &&
     (
@@ -595,7 +670,9 @@ function appendAssistantTextMessage(
         ? { transcriptMessageId: transcriptMessageId ?? last.transcriptMessageId }
         : {}),
     }
-    return [...messages.slice(0, -1), merged]
+    const next = [...messages]
+    next[lastIndex] = merged
+    return next
   }
 
   return [
@@ -759,6 +836,12 @@ function isAgentBackgroundTask(task: Pick<BackgroundAgentTask, 'taskType' | 'sum
   )
 }
 
+function isCancellableSubagentTask(task: BackgroundAgentTask): boolean {
+  return task.status === 'running' && (
+    task.taskType === 'local_agent' || task.taskType === 'remote_agent'
+  )
+}
+
 function shouldSuppressTaskNotificationResponse(session: PerSessionState): boolean {
   if (session.chatState !== 'idle') return false
   const lastMessage = session.messages[session.messages.length - 1]
@@ -854,13 +937,142 @@ function dropDuplicateTranscriptTextMessages(messages: UIMessage[]): UIMessage[]
   return changed ? deduped : messages
 }
 
+type ParentLinkedToolMessage = Extract<
+  UIMessage,
+  { type: 'tool_use' | 'tool_result' }
+>
+
+type ParentLinkedToolMergeRecord = {
+  toolUseId: string
+  messageTypes: Set<ParentLinkedToolMessage['type']>
+  liveMessages: Partial<
+    Record<ParentLinkedToolMessage['type'], ParentLinkedToolMessage>
+  >
+}
+
+function parentLinkedToolIdentity(message: UIMessage): {
+  parentToolUseId: string
+  originalToolUseId: string
+  messageType: ParentLinkedToolMessage['type']
+} | null {
+  if (
+    (message.type !== 'tool_use' && message.type !== 'tool_result') ||
+    !message.parentToolUseId
+  ) {
+    return null
+  }
+  return {
+    parentToolUseId: message.parentToolUseId,
+    originalToolUseId: message.originalToolUseId ?? message.toolUseId,
+    messageType: message.type,
+  }
+}
+
+function mergeRestoredParentToolMessages(
+  messages: UIMessage[],
+  restoredMessages: UIMessage[],
+): UIMessage[] {
+  const liveToolUseIds = new Set<string>()
+  const recordsByParent = new Map<
+    string,
+    Map<string, ParentLinkedToolMergeRecord>
+  >()
+
+  for (const message of messages) {
+    if (message.type === 'tool_use') liveToolUseIds.add(message.toolUseId)
+    const identity = parentLinkedToolIdentity(message)
+    if (!identity) continue
+    const toolMessage = message as ParentLinkedToolMessage
+
+    let parentRecords = recordsByParent.get(identity.parentToolUseId)
+    if (!parentRecords) {
+      parentRecords = new Map()
+      recordsByParent.set(identity.parentToolUseId, parentRecords)
+    }
+    const existing = parentRecords.get(identity.originalToolUseId)
+    if (existing) {
+      existing.messageTypes.add(identity.messageType)
+      existing.liveMessages[identity.messageType] = toolMessage
+    } else {
+      parentRecords.set(identity.originalToolUseId, {
+        toolUseId: toolMessage.toolUseId,
+        messageTypes: new Set([identity.messageType]),
+        liveMessages: { [identity.messageType]: toolMessage },
+      })
+    }
+  }
+
+  const insertBefore = new Map<UIMessage, ParentLinkedToolMessage[]>()
+  const insertAfter = new Map<UIMessage, ParentLinkedToolMessage[]>()
+  const unanchored: ParentLinkedToolMessage[] = []
+
+  for (const restoredMessage of restoredMessages) {
+    const identity = parentLinkedToolIdentity(restoredMessage)
+    if (!identity || !liveToolUseIds.has(identity.parentToolUseId)) continue
+
+    let parentRecords = recordsByParent.get(identity.parentToolUseId)
+    if (!parentRecords) {
+      parentRecords = new Map()
+      recordsByParent.set(identity.parentToolUseId, parentRecords)
+    }
+    const existing = parentRecords.get(identity.originalToolUseId)
+    if (existing?.messageTypes.has(identity.messageType)) continue
+
+    const restoredToolMessage = restoredMessage as ParentLinkedToolMessage
+    const toolUseId = existing?.toolUseId ?? restoredToolMessage.toolUseId
+    const recoveredMessage = toolUseId === restoredToolMessage.toolUseId
+      ? restoredToolMessage
+      : { ...restoredToolMessage, toolUseId }
+    const counterpart = identity.messageType === 'tool_use'
+      ? existing?.liveMessages.tool_result
+      : existing?.liveMessages.tool_use
+
+    if (counterpart) {
+      const insertionMap = identity.messageType === 'tool_use'
+        ? insertBefore
+        : insertAfter
+      const additions = insertionMap.get(counterpart) ?? []
+      additions.push(recoveredMessage)
+      insertionMap.set(counterpart, additions)
+    } else {
+      unanchored.push(recoveredMessage)
+    }
+
+    if (existing) {
+      existing.messageTypes.add(identity.messageType)
+    } else {
+      parentRecords.set(identity.originalToolUseId, {
+        toolUseId,
+        messageTypes: new Set([identity.messageType]),
+        liveMessages: {},
+      })
+    }
+  }
+
+  if (insertBefore.size === 0 && insertAfter.size === 0 && unanchored.length === 0) {
+    return messages
+  }
+
+  const merged: UIMessage[] = []
+  for (const message of messages) {
+    merged.push(...(insertBefore.get(message) ?? []))
+    merged.push(message)
+    merged.push(...(insertAfter.get(message) ?? []))
+  }
+  merged.push(...unanchored)
+  return merged
+}
+
 function mergeRestoredHistoryIntoLiveMessages(
   messages: UIMessage[],
   restoredMessages: UIMessage[],
 ): UIMessage[] {
   return mergeRestoredTerminalGoalEvents(
-    dropDuplicateTranscriptTextMessages(
-      mergeRestoredTranscriptMessageIds(messages, restoredMessages),
+    mergeRestoredParentToolMessages(
+      dropDuplicateTranscriptTextMessages(
+        mergeRestoredTranscriptMessageIds(messages, restoredMessages),
+      ),
+      restoredMessages,
     ),
     restoredMessages,
   )
@@ -978,14 +1190,30 @@ type SlashCommandState = PerSessionState['slashCommands'][number]
 
 function normalizeSlashCommand(command: unknown): SlashCommandState | null {
   if (!command || typeof command !== 'object') return null
-  const candidate = command as { name?: unknown; description?: unknown; argumentHint?: unknown }
+  const candidate = command as {
+    name?: unknown
+    description?: unknown
+    argumentHint?: unknown
+    kind?: unknown
+    source?: unknown
+  }
   if (typeof candidate.name !== 'string' || !candidate.name) return null
+  const kind: SlashCommandKind | undefined =
+    candidate.kind === 'command' || candidate.kind === 'skill' || candidate.kind === 'agent'
+      ? candidate.kind
+      : undefined
+  const source: SlashCommandSource | undefined =
+    candidate.source === 'user' || candidate.source === 'project' || candidate.source === 'plugin'
+      ? candidate.source
+      : undefined
   return {
     name: candidate.name,
     description: typeof candidate.description === 'string' ? candidate.description : '',
     ...(typeof candidate.argumentHint === 'string' && candidate.argumentHint
       ? { argumentHint: candidate.argumentHint }
       : {}),
+    ...(kind ? { kind } : {}),
+    ...(source ? { source } : {}),
   }
 }
 
@@ -1004,7 +1232,18 @@ function mergeSlashCommandUpdates(
     if (command.name) merged.set(command.name, command)
   }
   for (const command of incoming) {
-    if (command.name) merged.set(command.name, command)
+    if (!command.name) continue
+    const currentCommand = merged.get(command.name)
+    merged.set(command.name, {
+      ...currentCommand,
+      ...command,
+      ...(command.kind ?? currentCommand?.kind
+        ? { kind: command.kind ?? currentCommand?.kind }
+        : {}),
+      ...(command.source ?? currentCommand?.source
+        ? { source: command.source ?? currentCommand?.source }
+        : {}),
+    })
   }
   return [...merged.values()]
 }
@@ -1060,6 +1299,28 @@ async function fetchAndMapSessionHistory(sessionId: string) {
 }
 
 const historyLoadsInFlight = new Map<string, Promise<void>>()
+const historyReloadGenerations = new Map<string, number>()
+
+const HISTORY_LOAD_ABORT_RETRY_DELAY_MS = 150
+const HISTORY_LOAD_ABORT_MAX_RETRIES = 5
+const historyLoadAbortRetries = new Map<string, number>()
+
+// A history load aborted by a concurrent task mutation (epoch bump) used to be
+// silently dropped, leaving the session empty until the next mount/connect.
+// Retry while the session still has no messages, bounded so a stream of task
+// events cannot spin the fetch loop forever.
+function scheduleAbortedHistoryLoadRetry(get: () => ChatStore, sessionId: string): void {
+  const session = get().sessions[sessionId]
+  if (!session || session.messages.length > 0) return
+  const attempts = (historyLoadAbortRetries.get(sessionId) ?? 0) + 1
+  if (attempts > HISTORY_LOAD_ABORT_MAX_RETRIES) return
+  historyLoadAbortRetries.set(sessionId, attempts)
+  setTimeout(() => {
+    const current = get().sessions[sessionId]
+    if (!current || current.messages.length > 0 || current.historyStatus === 'loading') return
+    void get().loadHistory(sessionId)
+  }, HISTORY_LOAD_ABORT_RETRY_DELAY_MS)
+}
 
 function shouldPrewarmSession(sessionId: string): boolean {
   const knownSession = useSessionStore.getState().sessions.find((session) => session.id === sessionId)
@@ -1098,7 +1359,10 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           messages: existing?.messages ?? [],
           activeGoal: existing?.activeGoal ?? null,
           composerDraft: existing?.composerDraft ?? null,
+          repositoryLaunchDraft: existing?.repositoryLaunchDraft ?? null,
           queuedUserMessages: existing?.queuedUserMessages ?? [],
+          backgroundAgentTasks: existing?.backgroundAgentTasks ?? {},
+          agentTaskNotifications: existing?.agentTaskNotifications ?? {},
         },
       },
     }))
@@ -1108,9 +1372,13 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     wsManager.onConnectionState(sessionId, (connectionState) => {
       if (!get().sessions[sessionId]) return
       set((s) => ({
-        sessions: updateSessionIn(s.sessions, sessionId, () => ({
+        sessions: updateSessionIn(s.sessions, sessionId, (session) => ({
           connectionState,
           connectionSnapshotReady: false,
+          stoppingBackgroundTaskIds:
+            connectionState === 'connected' || session.stopAllSubagentsRequested
+              ? session.stoppingBackgroundTaskIds
+              : {},
         })),
       }))
     })
@@ -1193,6 +1461,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             hunkId: a.hunkId,
             note: a.note,
             quote: a.quote,
+            selectionNumber: a.selectionNumber,
           }))
         : undefined
 
@@ -1253,6 +1522,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             ...session,
             messages: newMessages,
             chatState: 'thinking',
+            historyMutationEpoch: (session.historyMutationEpoch ?? 0) + 1,
             elapsedSeconds: 0,
             suppressNextTaskNotificationResponse: false,
             replaceHistoryOnCompletion: false,
@@ -1373,6 +1643,12 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       if (!session) return s
       hasRunningBackgroundAgents = hasRunningBackgroundTasks(session.backgroundAgentTasks)
       if (session.elapsedTimer) clearInterval(session.elapsedTimer)
+      const stoppingBackgroundTaskIds = { ...session.stoppingBackgroundTaskIds }
+      for (const task of Object.values(session.backgroundAgentTasks ?? {})) {
+        if (isCancellableSubagentTask(task)) {
+          stoppingBackgroundTaskIds[task.taskId] = true
+        }
+      }
       const pendingAssistantText = `${session.streamingText}${bufferedText}`
       const messagesWithFlushedText = pendingAssistantText.trim()
         ? appendAssistantTextMessage(session.messages, pendingAssistantText, Date.now())
@@ -1397,6 +1673,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             apiRetry: null,
             streamingFallback: null,
             suppressNextTaskNotificationResponse: false,
+            stoppingBackgroundTaskIds,
+            stopAllSubagentsRequested: true,
             elapsedTimer: null,
           },
         },
@@ -1425,6 +1703,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     const existingLoad = historyLoadsInFlight.get(sessionId)
     if (existingLoad) return existingLoad
 
+    const requestedMutationEpoch = get().sessions[sessionId]?.historyMutationEpoch ?? 0
     let load!: Promise<void>
     load = (async () => {
       try {
@@ -1447,39 +1726,74 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           hasMessagesAfterTaskCompletion,
           tokenUsage,
         } = await fetchAndMapSessionHistory(sessionId)
+        let historyApplied = false
         set((state) => {
           const session = state.sessions[sessionId]
           if (!session) return state
+          if ((session.historyMutationEpoch ?? 0) !== requestedMutationEpoch) {
+            const abortedLoadUpdate = buildAbortedHistoryLoadUpdate(session)
+            return Object.keys(abortedLoadUpdate).length > 0
+              ? {
+                  sessions: updateSessionIn(
+                    state.sessions,
+                    sessionId,
+                    () => abortedLoadUpdate,
+                  ),
+                }
+              : state
+          }
+          historyApplied = true
           if (session.messages.length > 0) {
-            return { sessions: updateSessionIn(state.sessions, sessionId, (s) => ({
-              historyStatus: 'ready',
-              historyError: null,
-              activeGoal: activeGoal ?? s.activeGoal ?? null,
-              agentTaskNotifications: { ...s.agentTaskNotifications, ...restoredNotifications },
-              backgroundAgentTasks: mergeBackgroundAgentTaskRecords(
+            return { sessions: updateSessionIn(state.sessions, sessionId, (s) => {
+              const backgroundAgentTasks = mergeBackgroundAgentTaskRecords(
                 s.backgroundAgentTasks ?? {},
                 restoredBackgroundTasks,
-              ),
-              tokenUsage: tokenUsage ?? s.tokenUsage,
-              messages: mergeRestoredHistoryIntoLiveMessages(
-                mergeBackgroundTaskMessages(s.messages, restoredBackgroundTasks),
+              )
+              const messages = mergeRestoredHistoryIntoLiveMessages(
+                mergeBackgroundTaskMessages(s.messages, backgroundAgentTasks),
                 uiMessages,
-              ),
-            })) }
+              )
+              return {
+                historyStatus: 'ready',
+                historyError: null,
+                activeGoal: activeGoal ?? s.activeGoal ?? null,
+                agentTaskNotifications: { ...restoredNotifications, ...s.agentTaskNotifications },
+                backgroundAgentTasks,
+                tokenUsage: tokenUsage ?? s.tokenUsage,
+                ...reconcilePendingBackgroundTaskStopFailures(
+                  s,
+                  backgroundAgentTasks,
+                  messages,
+                ),
+              }
+            }) }
           }
-          return { sessions: updateSessionIn(state.sessions, sessionId, (s) => ({
-            historyStatus: 'ready',
-            historyError: null,
-            messages: mergeBackgroundTaskMessages(uiMessages, restoredBackgroundTasks),
-            activeGoal,
-            agentTaskNotifications: { ...s.agentTaskNotifications, ...restoredNotifications },
-            backgroundAgentTasks: mergeBackgroundAgentTaskRecords(
+          return { sessions: updateSessionIn(state.sessions, sessionId, (s) => {
+            const backgroundAgentTasks = mergeBackgroundAgentTaskRecords(
               s.backgroundAgentTasks ?? {},
               restoredBackgroundTasks,
-            ),
-            tokenUsage: tokenUsage ?? s.tokenUsage,
-          })) }
+            )
+            const messages = mergeBackgroundTaskMessages(uiMessages, backgroundAgentTasks)
+            return {
+              historyStatus: 'ready',
+              historyError: null,
+              activeGoal,
+              agentTaskNotifications: { ...restoredNotifications, ...s.agentTaskNotifications },
+              backgroundAgentTasks,
+              tokenUsage: tokenUsage ?? s.tokenUsage,
+              ...reconcilePendingBackgroundTaskStopFailures(
+                s,
+                backgroundAgentTasks,
+                messages,
+              ),
+            }
+          }) }
         })
+        if (!historyApplied) {
+          scheduleAbortedHistoryLoadRetry(get, sessionId)
+          return
+        }
+        historyLoadAbortRetries.delete(sessionId)
         if (lastTodos && lastTodos.length > 0) {
           const taskStore = useCLITaskStore.getState()
           if (taskStore.sessionId === sessionId && taskStore.tasks.length === 0) taskStore.setTasksFromTodos(lastTodos, sessionId)
@@ -1491,16 +1805,37 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         }
       } catch (error) {
         // Session may not have messages yet
+        let loadAborted = false
         set((state) => {
           const session = state.sessions[sessionId]
           if (!session) return state
+          if ((session.historyMutationEpoch ?? 0) !== requestedMutationEpoch) {
+            loadAborted = true
+            const abortedLoadUpdate = buildAbortedHistoryLoadUpdate(session)
+            return Object.keys(abortedLoadUpdate).length > 0
+              ? {
+                  sessions: updateSessionIn(
+                    state.sessions,
+                    sessionId,
+                    () => abortedLoadUpdate,
+                  ),
+                }
+              : state
+          }
+          const pendingFailureUpdate = reconcilePendingBackgroundTaskStopFailures(
+            session,
+            session.backgroundAgentTasks ?? {},
+            session.messages,
+          )
           return {
             sessions: updateSessionIn(state.sessions, sessionId, () => ({
               historyStatus: 'error',
               historyError: error instanceof Error ? error.message : String(error),
+              ...pendingFailureUpdate,
             })),
           }
         })
+        if (loadAborted) scheduleAbortedHistoryLoadRetry(get, sessionId)
       } finally {
         if (historyLoadsInFlight.get(sessionId) === load) {
           historyLoadsInFlight.delete(sessionId)
@@ -1513,7 +1848,12 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 
   reloadHistory: async (sessionId, guard) => {
+    const reloadGeneration = (historyReloadGenerations.get(sessionId) ?? 0) + 1
+    historyReloadGenerations.set(sessionId, reloadGeneration)
     try {
+      const requestedMutationEpoch = get().sessions[sessionId]?.historyMutationEpoch ?? 0
+      const pendingLoad = historyLoadsInFlight.get(sessionId)
+      if (pendingLoad) await pendingLoad
       const {
         uiMessages,
         activeGoal,
@@ -1524,30 +1864,37 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         tokenUsage,
       } = await fetchAndMapSessionHistory(sessionId)
 
+      if (historyReloadGenerations.get(sessionId) !== reloadGeneration) return
+
       if (guard) {
         const current = get().sessions[sessionId]
         if (
           !current ||
           current.chatState !== 'idle' ||
-          current.messages !== guard.messages ||
-          current.backgroundAgentTasks !== guard.backgroundAgentTasks
+          (current.historyMutationEpoch ?? 0) !== requestedMutationEpoch
         ) {
           return
         }
       }
 
+      let historyApplied = false
       set((state) => {
         const session = state.sessions[sessionId]
         if (!session) return state
         if (session.elapsedTimer) clearInterval(session.elapsedTimer)
+        const backgroundAgentTasks = mergeBackgroundAgentTaskRecords(
+          session.backgroundAgentTasks ?? {},
+          restoredBackgroundTasks,
+        )
+        const messages = mergeBackgroundTaskMessages(uiMessages, backgroundAgentTasks)
+        historyApplied = true
         return {
           sessions: updateSessionIn(state.sessions, sessionId, () => ({
             historyStatus: 'ready',
             historyError: null,
-            messages: mergeBackgroundTaskMessages(uiMessages, restoredBackgroundTasks),
             activeGoal,
-            agentTaskNotifications: restoredNotifications,
-            backgroundAgentTasks: restoredBackgroundTasks,
+            agentTaskNotifications: { ...restoredNotifications, ...session.agentTaskNotifications },
+            backgroundAgentTasks,
             tokenUsage: tokenUsage ?? session.tokenUsage,
             chatState: 'idle',
             activeThinkingId: null,
@@ -1563,9 +1910,26 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             statusVerb: '',
             apiRetry: null,
             streamingFallback: null,
+            ...reconcilePendingBackgroundTaskStopFailures(
+              session,
+              backgroundAgentTasks,
+              messages,
+            ),
           })),
         }
       })
+
+      if (historyApplied) {
+        const reloadedSession = get().sessions[sessionId]
+        if (reloadedSession) {
+          const isRunning = reloadedSession.chatState !== 'idle' ||
+            hasRunningBackgroundTasks(reloadedSession.backgroundAgentTasks)
+          useTabStore.getState().updateTabStatus(
+            sessionId,
+            isRunning ? 'running' : 'idle',
+          )
+        }
+      }
 
       if (lastTodos && lastTodos.length > 0) {
         useCLITaskStore.getState().setTasksFromTodos(lastTodos, sessionId)
@@ -1576,7 +1940,23 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         useCLITaskStore.getState().markCompletedAndDismissed(sessionId)
       }
     } catch {
-      // Session may not have messages yet
+      // A stop failure can arrive before the task history that identifies it.
+      // If that history request fails, surface the failure instead of leaving it
+      // cached forever waiting for a reconciliation that may never happen.
+      set((state) => {
+        const session = state.sessions[sessionId]
+        if (!session || Object.keys(session.pendingBackgroundTaskStopFailures ?? {}).length === 0) {
+          return state
+        }
+        return {
+          sessions: updateSessionIn(state.sessions, sessionId, (current) =>
+            reconcilePendingBackgroundTaskStopFailures(
+              current,
+              current.backgroundAgentTasks ?? {},
+              current.messages,
+            )),
+        }
+      })
     }
   },
 
@@ -1641,6 +2021,29 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     set((state) => ({
       sessions: updateSessionIn(state.sessions, sessionId, () => ({
         composerDraft: null,
+      })),
+    }))
+  },
+
+  setRepositoryLaunchDraft: (sessionId, draft) => {
+    set((state) => {
+      const session = state.sessions[sessionId] ?? createDefaultSessionState()
+      return {
+        sessions: {
+          ...state.sessions,
+          [sessionId]: {
+            ...session,
+            repositoryLaunchDraft: draft,
+          },
+        },
+      }
+    })
+  },
+
+  clearRepositoryLaunchDraft: (sessionId) => {
+    set((state) => ({
+      sessions: updateSessionIn(state.sessions, sessionId, () => ({
+        repositoryLaunchDraft: null,
       })),
     }))
   },
@@ -1833,7 +2236,20 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           break
         }
 
-        if (session.chatState === 'idle') break
+        if (session.chatState === 'idle') {
+          if (
+            hasRunningSubagentTasks(session.backgroundAgentTasks) ||
+            session.stopAllSubagentsRequested
+          ) {
+            // A terminal task event may have been persisted while this renderer
+            // was offline. Reconcile it without overwriting a newly started turn.
+            void get().reloadHistory(sessionId, {
+              messages: session.messages,
+              backgroundAgentTasks: session.backgroundAgentTasks,
+            })
+          }
+          break
+        }
 
         const text = `${session.streamingText}${consumePendingDelta(sessionId)}`
         clearPendingToolInputDelta(sessionId)
@@ -1936,6 +2352,20 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         )
         break
 
+      case 'runtime_config_applied': {
+        const selected = useSessionRuntimeStore.getState().selections[sessionId]
+        const matchesCurrentSelection = Boolean(selected) &&
+          (selected?.providerId ?? null) === msg.providerId &&
+          selected?.modelId === msg.modelId &&
+          selected?.effortLevel === msg.effortLevel
+        if (matchesCurrentSelection) {
+          update((session) => ({
+            runtimeConfigReadyCount: (session.runtimeConfigReadyCount ?? 0) + 1,
+          }))
+        }
+        break
+      }
+
       case 'permission_mode_changed': {
         // CLI 是权限模式的真相来源。这里把它恢复/切换后的权威值校正到本地镜像。
         // 注意：只更新本地状态，**不要**走 setSessionPermissionMode —— 那会把
@@ -1962,6 +2392,13 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         }
         if (session.suppressNextTaskNotificationResponse) {
           update(() => ({ suppressNextTaskNotificationResponse: false }))
+        }
+        // The server keeps a stopped-turn fence until it attributes a replay
+        // (or a pure local command's first output) to the replacement turn.
+        // Mirror that boundary instead of clearing the SubAgent stop latch on
+        // the optimistic send, which may still be rejected or remain pending.
+        if (session.stopAllSubagentsRequested) {
+          update(() => ({ stopAllSubagentsRequested: false }))
         }
         const pendingText = `${session.streamingText}${consumePendingDelta(sessionId)}`
         if (msg.blockType !== 'text' && pendingText.trim()) {
@@ -1991,6 +2428,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
                     type: 'tool_use',
                     toolName,
                     toolUseId,
+                    originalToolUseId: msg.originalToolUseId ?? existing?.originalToolUseId,
                     input: existing?.input ?? {},
                     timestamp: existing?.timestamp ?? Date.now(),
                     parentToolUseId: msg.parentToolUseId ?? existing?.parentToolUseId,
@@ -2140,6 +2578,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
                             type: 'tool_use',
                             toolName,
                             toolUseId: activeToolUseId,
+                            originalToolUseId: existing?.originalToolUseId,
                             input: buildPartialToolInputPreview(partialInput, existing?.input),
                             timestamp: existing?.timestamp ?? Date.now(),
                             parentToolUseId: existing?.parentToolUseId ?? getPendingToolParentUseId(sessionId, activeToolUseId),
@@ -2158,7 +2597,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         if (receivedLiveDelta && get().sessions[sessionId]?.chatState !== 'idle') ensureElapsedTimer()
         break
 
-      case 'thinking':
+      case 'thinking': {
         if (get().sessions[sessionId]?.suppressNextTaskNotificationResponse) {
           consumePendingDelta(sessionId)
           update(() => ({
@@ -2168,15 +2607,36 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           }))
           break
         }
+        // 重放/空块都不该冒出一个新的「已思考」气泡，也不该把会话拖回 thinking 态
+        // 或者启动计时器 —— 那正是"打开一个早就结束的会话，它自己开始输出"的观感。
+        let skippedThinkingBlock = false
         update((s) => {
           const pendingText = `${s.streamingText}${consumePendingDelta(sessionId)}`
           const base = pendingText.trim()
             ? appendAssistantTextMessage(s.messages, pendingText, Date.now())
             : s.messages
-          const last = base[base.length - 1]
+          // 服务端两个 thinking 发射点都做了非空过滤，但 `&& delta.thinking` 是真值
+          // 判断，纯空白仍能漏过来，落到下面就是一个点开什么都没有的空壳气泡。
+          if (!msg.text.trim()) {
+            skippedThinkingBlock = true
+            return { messages: base, streamingText: '' }
+          }
+          // 真正的重放源已在服务端按 uuid 挡掉（conversationService.isReplayedSdkMessage）。
+          // 这里再兜一道：thinking 没有 transcriptMessageId 之类的身份，任何漏网的
+          // 重放都只能靠"整块内容与已有 thinking 逐字相同"来认。流式 delta 是碎片，
+          // 不会命中；命中的必然是被整块重发的同一段思考。
+          if (base.some((message) => message.type === 'thinking' && message.content === msg.text)) {
+            skippedThinkingBlock = true
+            return { messages: base, streamingText: '' }
+          }
+          const lastIndex = findStreamMergeTargetIndex(base)
+          const last = lastIndex >= 0 ? base[lastIndex] : undefined
           if (last && last.type === 'thinking') {
             const updated = [...base]
-            updated[updated.length - 1] = { ...last, content: last.content + msg.text }
+            updated[lastIndex] = {
+              ...last,
+              content: joinThinkingContent(last.content, msg.text, msg.complete === true),
+            }
             return {
               messages: updated,
               chatState: 'thinking',
@@ -2194,8 +2654,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             streamingResponseChars: s.streamingResponseChars + msg.text.length,
           }
         })
-        ensureElapsedTimer()
+        if (!skippedThinkingBlock) ensureElapsedTimer()
         break
+      }
 
       case 'tool_use_complete': {
         clearPendingToolInputDelta(sessionId)
@@ -2204,29 +2665,42 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         const toolUseId = msg.toolUseId || session?.activeToolUseId || ''
         const parentToolUseId = msg.parentToolUseId ?? getPendingToolParentUseId(sessionId, toolUseId)
         rememberPendingToolParentUseId(sessionId, toolUseId, parentToolUseId)
-        update((s) => ({
-          messages: toolUseId
-            ? upsertToolUseMessage(s.messages, toolUseId, (existing) => ({
-                id: existing?.id ?? nextId(),
-                type: 'tool_use',
-                toolName,
-                toolUseId,
-                input: msg.input,
-                timestamp: existing?.timestamp ?? Date.now(),
-                parentToolUseId,
-                isPending: false,
-              }))
-            : [...s.messages, {
-                id: nextId(), type: 'tool_use', toolName,
-                toolUseId,
-                input: msg.input, timestamp: Date.now(), parentToolUseId,
-                isPending: false,
-              }],
-          activeToolUseId: null, activeToolName: null, activeThinkingId: null, streamingToolInput: '',
-        }))
-        if (toolName === 'TodoWrite' && Array.isArray((msg.input as any)?.todos)) {
+        update((s) => {
+          // 流式路径上，工具块的 content_start 已经把待定正文冲刷成一条消息了
+          // （见 case 'content_start' 里 blockType !== 'text' 的分支）。但整块兜底
+          // 路径只发 tool_use_complete、不发 content_start —— 不在这里补一次冲刷，
+          // 工具调用前后的两段正文就会跨消息粘成一条。
+          const pendingText = `${s.streamingText}${consumePendingDelta(sessionId)}`
+          const base = pendingText.trim()
+            ? appendAssistantTextMessage(s.messages, pendingText, Date.now())
+            : s.messages
+          return {
+            messages: toolUseId
+              ? upsertToolUseMessage(base, toolUseId, (existing) => ({
+                  id: existing?.id ?? nextId(),
+                  type: 'tool_use',
+                  toolName,
+                  toolUseId,
+                  originalToolUseId: msg.originalToolUseId ?? existing?.originalToolUseId,
+                  input: msg.input,
+                  timestamp: existing?.timestamp ?? Date.now(),
+                  parentToolUseId,
+                  isPending: false,
+                }))
+              : [...base, {
+                  id: nextId(), type: 'tool_use', toolName,
+                  toolUseId,
+                  originalToolUseId: msg.originalToolUseId,
+                  input: msg.input, timestamp: Date.now(), parentToolUseId,
+                  isPending: false,
+                }],
+            streamingText: '',
+            activeToolUseId: null, activeToolName: null, activeThinkingId: null, streamingToolInput: '',
+          }
+        })
+        if (!parentToolUseId && toolName === 'TodoWrite' && Array.isArray((msg.input as any)?.todos)) {
           useCLITaskStore.getState().setTasksFromTodos((msg.input as any).todos, sessionId)
-        } else if (TASK_TOOL_NAMES.has(toolName)) {
+        } else if (!parentToolUseId && TASK_TOOL_NAMES.has(toolName)) {
           const useId = msg.toolUseId || session?.activeToolUseId
           if (useId) addPendingTaskToolUseId(sessionId, useId)
         }
@@ -2240,6 +2714,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         update((s) => {
           let messages: UIMessage[] = [...s.messages, {
             id: nextId(), type: 'tool_result', toolUseId: msg.toolUseId,
+            originalToolUseId: msg.originalToolUseId,
             content: msg.content, isError: msg.isError, timestamp: now, parentToolUseId,
           }]
           let backgroundAgentTasks = s.backgroundAgentTasks ?? {}
@@ -2256,10 +2731,12 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           return {
             messages,
             ...(stoppedTask ? { backgroundAgentTasks } : {}),
-            chatState: hasPendingPermissionRequests(s)
-              ? 'permission_pending'
-              : 'thinking',
-            activeThinkingId: null,
+            chatState: parentToolUseId
+              ? s.chatState
+              : hasPendingPermissionRequests(s)
+                ? 'permission_pending'
+                : 'thinking',
+            activeThinkingId: parentToolUseId ? s.activeThinkingId : null,
           }
         })
         if (consumePendingTaskToolUseId(sessionId, msg.toolUseId)) {
@@ -2441,7 +2918,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           clearPendingToolInputDelta(sessionId)
           if (session.elapsedTimer) clearInterval(session.elapsedTimer)
           const hasRunningBackgroundAgents = hasRunningBackgroundTasks(session.backgroundAgentTasks)
-          update(() => ({
+          update((current) => ({
             tokenUsage: msg.usage,
             chatState: 'idle',
             activeThinkingId: null,
@@ -2456,6 +2933,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             streamingToolInput: '',
             suppressNextTaskNotificationResponse: false,
             replaceHistoryOnCompletion: false,
+            historyMutationEpoch: (current.historyMutationEpoch ?? 0) + 1,
           }))
           useTabStore.getState().updateTabStatus(sessionId, hasRunningBackgroundAgents ? 'running' : 'idle')
           reconcileCompletedTranscriptHistory(
@@ -2485,7 +2963,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         const finalMessages = markPendingToolUseMessagesStopped(completionMessages)
         const hasRunningBackgroundAgents = hasRunningBackgroundTasks(session.backgroundAgentTasks)
         if (session.elapsedTimer) clearInterval(session.elapsedTimer)
-        update(() => ({
+        update((current) => ({
           messages: finalMessages,
           tokenUsage: msg.usage,
           chatState: 'idle',
@@ -2498,6 +2976,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           apiRetry: null,
           streamingFallback: null,
           replaceHistoryOnCompletion: false,
+          historyMutationEpoch: (current.historyMutationEpoch ?? 0) + 1,
         }))
         useTabStore.getState().updateTabStatus(sessionId, hasRunningBackgroundAgents ? 'running' : 'idle')
         const notification = wasAgentRunning && appendedCompletionMessage
@@ -2535,6 +3014,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             activeThinkingId: null,
             suppressNextTaskNotificationResponse: false,
             replaceHistoryOnCompletion: false,
+            stopAllSubagentsRequested: false,
+            historyMutationEpoch: (session.historyMutationEpoch ?? 0) + 1,
           }
         })
         break
@@ -2572,6 +3053,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             apiRetry: null,
             streamingFallback: null,
             suppressNextTaskNotificationResponse: false,
+            historyMutationEpoch: (s.historyMutationEpoch ?? 0) + 1,
           }
         })
         useTabStore.getState().updateTabStatus(sessionId, 'error')
@@ -2588,7 +3070,17 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         update((session) => {
           const stoppingBackgroundTaskIds = { ...session.stoppingBackgroundTaskIds }
           delete stoppingBackgroundTaskIds[msg.taskId]
-          const taskAlreadyFinished = session.backgroundAgentTasks?.[msg.taskId]?.status !== 'running'
+          const task = session.backgroundAgentTasks?.[msg.taskId]
+          if (!task && session.historyStatus === 'loading') {
+            return {
+              stoppingBackgroundTaskIds,
+              pendingBackgroundTaskStopFailures: {
+                ...session.pendingBackgroundTaskStopFailures,
+                [msg.taskId]: msg.message,
+              },
+            }
+          }
+          const taskAlreadyFinished = task !== undefined && task.status !== 'running'
           return {
             stoppingBackgroundTaskIds,
             ...(taskAlreadyFinished ? {} : {
@@ -2602,6 +3094,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
                   timestamp: Date.now(),
                 },
               ],
+              historyMutationEpoch: (session.historyMutationEpoch ?? 0) + 1,
             }),
           }
         })
@@ -2668,6 +3161,12 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             backgroundAgentTasks: {},
             stoppingBackgroundTaskIds: {},
             agentTaskNotifications: {},
+            pendingBackgroundTaskStopFailures: {},
+            stopAllSubagentsRequested: false,
+            queuedUserMessages: [],
+            historyMutationEpoch: (session?.historyMutationEpoch ?? 0) + 1,
+            historyStatus: 'ready',
+            historyError: null,
           }))
           clearPendingDelta(sessionId)
           clearPendingTaskToolUseIds(sessionId)
@@ -2738,6 +3237,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           if (goalEvent) {
             update((session) => ({
               activeGoal: applyGoalEventToActiveGoal(session.activeGoal ?? null, goalEvent, Date.now()),
+              stopAllSubagentsRequested: false,
               messages: [
                 ...session.messages,
                 {
@@ -2765,7 +3265,20 @@ export const useChatStore = create<ChatStore>((set, get) => ({
               shouldUpdateIdleTabStatus = session.chatState === 'idle'
               hasRunningBackgroundAgentsAfterUpdate = hasRunningBackgroundTasks(backgroundAgentTasks)
               const task = backgroundAgentTasks[taskEvent.taskId]
-              return buildBackgroundTaskSessionUpdate(session, backgroundAgentTasks, task, now)
+              const stoppingBackgroundTaskIds = { ...session.stoppingBackgroundTaskIds }
+              if (
+                msg.subtype === 'task_started' &&
+                session.stopAllSubagentsRequested &&
+                task &&
+                isCancellableSubagentTask(task)
+              ) {
+                stoppingBackgroundTaskIds[task.taskId] = true
+              }
+              return {
+                ...buildBackgroundTaskSessionUpdate(session, backgroundAgentTasks, task, now),
+                stoppingBackgroundTaskIds,
+                historyMutationEpoch: (session.historyMutationEpoch ?? 0) + 1,
+              }
             })
             if (shouldUpdateIdleTabStatus) {
               useTabStore.getState().updateTabStatus(
@@ -2827,6 +3340,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
                       }
                     : {}),
                 },
+                historyMutationEpoch: (session.historyMutationEpoch ?? 0) + 1,
               }
             })
             if (shouldUpdateIdleTabStatus) {
@@ -2857,8 +3371,8 @@ function updateOptimisticSessionTitle(sessionId: string, content: string): void 
 
 // ─── History mapping helpers ─────────
 
-type AssistantHistoryBlock = { type: string; text?: string; thinking?: string; name?: string; id?: string; input?: unknown }
-type UserHistoryBlock = { type: string; text?: string; tool_use_id?: string; content?: unknown; is_error?: boolean; source?: { data?: string; media_type?: string }; mimeType?: string; media_type?: string; name?: string }
+type AssistantHistoryBlock = { type: string; text?: string; thinking?: string; name?: string; id?: string; original_tool_use_id?: string; input?: unknown }
+type UserHistoryBlock = { type: string; text?: string; tool_use_id?: string; original_tool_use_id?: string; content?: unknown; is_error?: boolean; source?: { data?: string; media_type?: string }; mimeType?: string; media_type?: string; name?: string }
 
 const TASK_NOTIFICATION_RE = /^<task-notification>\s*[\s\S]*<\/task-notification>$/i
 const GOAL_EVENT_ACTIONS = new Set<GoalEventAction>([
@@ -2885,12 +3399,17 @@ const SIMPLE_IMAGE_SOURCE_RE = /^\[Image source: (.+)\]$/
 const DETAILED_IMAGE_SOURCE_RE = /^\[Image: source: (.+?)(?:, original \d+x\d+, displayed at \d+x\d+\. Multiply coordinates by \d+(?:\.\d+)? to map to original image\.)?\]$/
 const IMAGE_RESIZE_METADATA_RE = /^\[Image: original \d+x\d+, displayed at \d+x\d+\. Multiply coordinates by \d+(?:\.\d+)? to map to original image\.\]$/
 const VISUAL_SELECTION_PROMPT_HEADER = '请根据截图中编号 1 的蓝色标注修改本地前端。'
-const VISUAL_SELECTION_PROMPT_FOOTER = '请优先依据截图里的编号标注定位元素，selector 只作为辅助线索。'
 
-type VisualSelectionHistoryDisplay = {
+type VisualSelectionHistoryItem = {
+  number: number
   displayName: string
   selector?: string
   note?: string
+}
+
+type VisualSelectionHistoryDisplay = {
+  batch: boolean
+  items: VisualSelectionHistoryItem[]
 }
 
 function getHistoryImageMediaType(block: UserHistoryBlock): string {
@@ -2938,13 +3457,40 @@ export function stripGeneratedImageMetadataLines(text: string): string {
 
 function parseVisualSelectionHistoryPrompt(text: string): VisualSelectionHistoryDisplay | null {
   const lines = text.replace(/\r\n?/g, '\n').split('\n')
-  if (lines[0]?.trim() !== VISUAL_SELECTION_PROMPT_HEADER) return null
+  const header = lines[0]?.trim()
+  if (header === VISUAL_SELECTION_BATCH_PROMPT_HEADER) {
+    const items: VisualSelectionHistoryDisplay['items'] = []
+    for (let index = 1; index < lines.length; index += 1) {
+      const match = lines[index]?.trim().match(/^\[元素 (\d+)\]$/)
+      if (!match) continue
+      const number = Number(match[1])
+      const endMarker = `[元素 ${number} 结束]`
+      const block: string[] = []
+      index += 1
+      while (index < lines.length && lines[index]?.trim() !== endMarker) {
+        block.push(lines[index] ?? '')
+        index += 1
+      }
+      const parsedItem = parseVisualSelectionItem(block, number)
+      if (parsedItem) items.push(parsedItem)
+    }
+    return items.length ? { batch: true, items } : null
+  }
+  if (header !== VISUAL_SELECTION_PROMPT_HEADER) return null
 
+  const item = parseVisualSelectionItem(lines.slice(1), 1)
+  return item ? { batch: false, items: [item] } : null
+}
+
+function parseVisualSelectionItem(
+  lines: string[],
+  number: number,
+): VisualSelectionHistoryItem | null {
   let displayName: string | undefined
   let selector: string | undefined
   let note: string | undefined
 
-  for (let index = 1; index < lines.length; index += 1) {
+  for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index]?.trim() ?? ''
     if (line.startsWith('目标元素：')) {
       displayName = line.slice('目标元素：'.length).trim()
@@ -2963,21 +3509,24 @@ function parseVisualSelectionHistoryPrompt(text: string): VisualSelectionHistory
     }
   }
 
-  return displayName
-    ? {
-        displayName,
-        ...(selector ? { selector } : {}),
-        ...(note ? { note } : {}),
-      }
-    : null
+  return displayName ? {
+    number,
+    displayName,
+    ...(selector ? { selector } : {}),
+    ...(note ? { note } : {}),
+  } : null
 }
 
 function applyVisualSelectionHistoryDisplay(attachments: UIAttachment[], display: VisualSelectionHistoryDisplay): void {
-  const imageAttachment = attachments.find((attachment) => attachment.type === 'image')
-  if (!imageAttachment) return
-  imageAttachment.name = display.displayName
-  if (display.selector) imageAttachment.quote = display.selector
-  if (display.note) imageAttachment.note = display.note
+  const imageAttachments = attachments.filter((attachment) => attachment.type === 'image')
+  display.items.forEach((item, index) => {
+    const imageAttachment = imageAttachments[index]
+    if (!imageAttachment) return
+    imageAttachment.name = item.displayName
+    if (item.selector) imageAttachment.quote = item.selector
+    if (item.note) imageAttachment.note = item.note
+    if (display.batch) imageAttachment.selectionNumber = item.number
+  })
 }
 
 function normalizeHistoryImageAttachment(block: UserHistoryBlock): UIAttachment {
@@ -3477,9 +4026,80 @@ function mergeBackgroundAgentTaskRecords(
   restored: Record<string, BackgroundAgentTask>,
 ): Record<string, BackgroundAgentTask> {
   return Object.values(restored).reduce(
-    (tasks, task) => upsertBackgroundAgentTask(tasks, task, task.updatedAt),
+    (tasks, task) => {
+      const existing = tasks[task.taskId] ?? (task.toolUseId
+        ? Object.values(tasks).find((candidate) => candidate.toolUseId === task.toolUseId)
+        : undefined)
+      if (
+        existing?.status === 'running' &&
+        task.status !== 'running' &&
+        task.updatedAt < existing.startedAt
+      ) {
+        return tasks
+      }
+      return upsertBackgroundAgentTask(tasks, task, task.updatedAt)
+    },
     current,
   )
+}
+
+function reconcilePendingBackgroundTaskStopFailures(
+  session: PerSessionState,
+  backgroundAgentTasks: Record<string, BackgroundAgentTask>,
+  messages: UIMessage[],
+): Pick<
+  PerSessionState,
+  | 'messages'
+  | 'pendingBackgroundTaskStopFailures'
+  | 'stoppingBackgroundTaskIds'
+  | 'historyMutationEpoch'
+> {
+  const pendingFailures = { ...session.pendingBackgroundTaskStopFailures }
+  const hasPendingFailures = Object.keys(pendingFailures).length > 0
+  const stoppingBackgroundTaskIds = { ...session.stoppingBackgroundTaskIds }
+  let nextMessages = messages
+
+  for (const [taskId, message] of Object.entries(pendingFailures)) {
+    const task = backgroundAgentTasks[taskId]
+    if (!task || task.status === 'running') {
+      nextMessages = [
+        ...nextMessages,
+        {
+          id: nextId(),
+          type: 'error',
+          message,
+          code: 'STOP_BACKGROUND_TASK_FAILED',
+          timestamp: Date.now(),
+        },
+      ]
+    }
+    delete pendingFailures[taskId]
+    delete stoppingBackgroundTaskIds[taskId]
+  }
+
+  return {
+    messages: nextMessages,
+    pendingBackgroundTaskStopFailures: pendingFailures,
+    stoppingBackgroundTaskIds,
+    historyMutationEpoch: (session.historyMutationEpoch ?? 0) + (hasPendingFailures ? 1 : 0),
+  }
+}
+
+function buildAbortedHistoryLoadUpdate(
+  session: PerSessionState,
+): Partial<PerSessionState> {
+  const hasPendingStopFailures =
+    Object.keys(session.pendingBackgroundTaskStopFailures ?? {}).length > 0
+  return {
+    ...(session.historyStatus === 'loading' ? { historyStatus: 'idle' as const } : {}),
+    ...(hasPendingStopFailures
+      ? reconcilePendingBackgroundTaskStopFailures(
+          session,
+          session.backgroundAgentTasks ?? {},
+          session.messages,
+        )
+      : {}),
+  }
 }
 
 const TEAMMATE_CONTENT_REGEX = /<teammate-message\s+teammate_id="([^"]+)"[^>]*>\n?([\s\S]*?)\n?<\/teammate-message>/g
@@ -3542,6 +4162,51 @@ function pushAssistantHistoryText(
     ...(transcriptMessageId ? { transcriptMessageId } : {}),
     ...(model ? { model } : {}),
   })
+}
+
+/**
+ * Joins a thinking block onto the one before it.
+ *
+ * Two granularities arrive under the same `thinking` message: stream fragments, which
+ * must be concatenated raw to rebuild one thought, and finished blocks, which are
+ * separate thoughts and need a break between them. Gluing the second kind produced
+ * "plan the fix carefullythen run tests" — and the test that shipped with it copied
+ * that string into its expectation, so the run-together words became the pinned
+ * behaviour rather than the bug they were.
+ *
+ * Merging adjacent blocks into one bubble is deliberate (see the history-mapping
+ * test); only the missing separator was not.
+ */
+export function joinThinkingContent(previous: string, next: string, nextIsWholeBlock: boolean): string {
+  if (!nextIsWholeBlock) return previous + next
+  if (!previous) return next
+  return `${previous}\n\n${next}`
+}
+
+function pushAssistantHistoryThinking(
+  messages: UIMessage[],
+  id: string,
+  content: string,
+  timestamp: number,
+): void {
+  // 与流式路径（case 'thinking'）保持同等防护：纯空白块不产生空壳气泡。
+  if (!content.trim()) return
+
+  const last = messages[messages.length - 1]
+  if (last?.type === 'thinking') {
+    // 流式落盘的快照会让同一段思考在 jsonl 里以"整块重发"或"前缀增长"的
+    // 形态重复出现，逐字相同直接丢弃，前缀包含则用更全的新块替换旧块。
+    // 合并时保留首个块的确定性 id，保证轮询重映射时 React key 稳定。
+    if (last.content === content) return
+    if (content.startsWith(last.content)) {
+      last.content = content
+      return
+    }
+    last.content = joinThinkingContent(last.content, content, true)
+    return
+  }
+
+  messages.push({ id, type: 'thinking', content, timestamp })
 }
 
 type HistoryMappingOptions = {
@@ -3727,6 +4392,7 @@ function extractRestoredUserDisplay(text: string): RestoredUserDisplay {
 // ConversationService stores data-only files as `${randomUUID()}-${sanitizedName}`
 // and omits successfully inlined images from the replayed text content.
 const MATERIALIZED_UPLOAD_NAME_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}-(.+)$/i
+const IMAGE_ONLY_REPLAY_FALLBACK = 'Please analyze the attached image.'
 
 function isLikelyInlineImageAttachment(attachment: UIAttachment): boolean {
   if (attachment.type === 'image') return true
@@ -3770,6 +4436,16 @@ function replayAttachmentsMatchCurrent(
   )
 }
 
+// The server-side replay normalizes whitespace that the optimistic bubble
+// keeps verbatim: `readXmlTag` trims <command-args> and
+// formatCommandDisplayText re-joins name + args with a single space, so
+// `/ego-browser␣␣https://…` replays as `/ego-browser https://…`. HTML
+// collapses the extra space anyway, so a literal comparison would append a
+// visually identical duplicate bubble. Compare with whitespace runs collapsed.
+function collapseWhitespaceRuns(text: string): string {
+  return text.replace(/\s+/g, ' ').trim()
+}
+
 function replayMatchesCurrentUserMessage(
   message: Extract<UIMessage, { type: 'user_text' }>,
   replayDisplay: RestoredUserDisplay,
@@ -3777,13 +4453,33 @@ function replayMatchesCurrentUserMessage(
 ): boolean {
   const currentModelContent = (message.modelContent ?? message.content).trim()
   if (currentModelContent === replayModelContent) return true
+  if (
+    collapseWhitespaceRuns(currentModelContent) === collapseWhitespaceRuns(replayModelContent)
+  ) {
+    return true
+  }
+
+  const currentAttachments = message.attachments ?? []
+  if (
+    message.content.trim() === '' &&
+    replayDisplay.content.trim() === IMAGE_ONLY_REPLAY_FALLBACK &&
+    !replayDisplay.attachments?.length &&
+    currentAttachments.length > 0 &&
+    currentAttachments.every(isLikelyInlineImageAttachment)
+  ) {
+    return true
+  }
 
   const currentDisplay = extractRestoredUserDisplay(currentModelContent)
-  if (currentDisplay.content.trim() !== replayDisplay.content.trim()) return false
+  if (
+    collapseWhitespaceRuns(currentDisplay.content) !== collapseWhitespaceRuns(replayDisplay.content)
+  ) {
+    return false
+  }
 
   return replayAttachmentsMatchCurrent(
     replayDisplay.attachments ?? [],
-    message.attachments ?? [],
+    currentAttachments,
   )
 }
 
@@ -3868,6 +4564,7 @@ function mapQueuedDisplayAttachments(attachments?: AttachmentRef[]): UIAttachmen
     hunkId: attachment.hunkId,
     note: attachment.note,
     quote: attachment.quote,
+    selectionNumber: attachment.selectionNumber,
   }))
 }
 
@@ -4128,12 +4825,12 @@ export function mapHistoryMessagesToUiMessages(
       continue
     }
     if ((msg.type === 'assistant' || msg.type === 'tool_use') && Array.isArray(msg.content)) {
-      for (const block of msg.content as AssistantHistoryBlock[]) {
-        if (block.type === 'thinking' && block.thinking) uiMessages.push({ id: nextId(), type: 'thinking', content: block.thinking, timestamp })
+      for (const [blockIndex, block] of (msg.content as AssistantHistoryBlock[]).entries()) {
+        if (block.type === 'thinking' && block.thinking) pushAssistantHistoryThinking(uiMessages, `${msg.id}-block-${blockIndex}`, block.thinking, timestamp)
         else if (block.type === 'text' && block.text) {
           pushAssistantHistoryText(uiMessages, block.text, timestamp, msg.model, msg.id || undefined)
         }
-        else if (block.type === 'tool_use') uiMessages.push({ id: nextId(), type: 'tool_use', toolName: block.name ?? 'unknown', toolUseId: block.id ?? '', input: block.input, timestamp, parentToolUseId: msg.parentToolUseId })
+        else if (block.type === 'tool_use') uiMessages.push({ id: `${msg.id}-block-${blockIndex}`, type: 'tool_use', toolName: block.name ?? 'unknown', toolUseId: block.id ?? '', originalToolUseId: block.original_tool_use_id, input: block.input, timestamp, parentToolUseId: msg.parentToolUseId })
       }
       continue
     }
@@ -4143,7 +4840,7 @@ export function mapHistoryMessagesToUiMessages(
       const attachments: UIAttachment[] = []
       const imageSourcePaths: string[] = []
       const hasImageBlock = (msg.content as UserHistoryBlock[]).some((block) => block.type === 'image')
-      for (const block of msg.content as UserHistoryBlock[]) {
+      for (const [blockIndex, block] of (msg.content as UserHistoryBlock[]).entries()) {
         if (block.type === 'text' && block.text && isTeammateMessage(block.text)) {
           modelTextParts.push(block.text)
           if (!includeTeammateMessages) continue
@@ -4161,9 +4858,10 @@ export function mapHistoryMessagesToUiMessages(
         else if (block.type === 'image') attachments.push(normalizeHistoryImageAttachment(block))
         else if (block.type === 'file') attachments.push({ type: 'file', name: block.name || 'file' })
         else if (block.type === 'tool_result') uiMessages.push({
-          id: nextId(),
+          id: `${msg.id}-block-${blockIndex}`,
           type: 'tool_result',
           toolUseId: block.tool_use_id ?? '',
+          originalToolUseId: block.original_tool_use_id,
           content: normalizeHistoryToolResultContent(block.content, msg.toolUseResult),
           isError: !!block.is_error,
           timestamp,
@@ -4182,7 +4880,11 @@ export function mapHistoryMessagesToUiMessages(
           applyVisualSelectionHistoryDisplay(attachments, visualSelectionDisplay)
         }
         const parsed = extractRestoredUserDisplay(visibleText)
-        const userContent = visualSelectionDisplay ? '' : parsed.content
+        const userContent = visualSelectionDisplay
+          ? visualSelectionDisplay.batch
+            ? t('browser.selection.batchMessage', { count: visualSelectionDisplay.items.length })
+            : ''
+          : parsed.content
         const modelContent = visualSelectionDisplay || modelText !== visibleText ? modelText : parsed.modelContent
         const allAttachments = [...(parsed.attachments ?? []), ...attachments]
         uiMessages.push({
@@ -4224,6 +4926,7 @@ function extractLastTodoWriteFromHistory(messages: MessageEntry[]): Array<{ cont
   let todos: Array<{ content: string; status: string; activeForm?: string }> | null = null
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i]!
+    if (msg.parentToolUseId) continue
     if ((msg.type === 'assistant' || msg.type === 'tool_use') && Array.isArray(msg.content)) {
       const blocks = msg.content as AssistantHistoryBlock[]
       for (let j = blocks.length - 1; j >= 0; j--) {
@@ -4244,7 +4947,7 @@ function extractLastTodoWriteFromHistory(messages: MessageEntry[]): Array<{ cont
   const allDone = todos.every((t) => t.status === 'completed')
   if (allDone) {
     for (let i = foundIndex + 1; i < messages.length; i++) {
-      if (messages[i]!.type === 'user' && messages[i]!.content) return null
+      if (messages[i]!.type === 'user' && !messages[i]!.parentToolUseId && messages[i]!.content) return null
     }
   }
   return todos
@@ -4256,12 +4959,15 @@ function hasUserMessagesAfterTaskCompletion(messages: MessageEntry[]): boolean {
   let lastTaskIndex = -1
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i]!
+    if (msg.parentToolUseId) continue
     if ((msg.type === 'assistant' || msg.type === 'tool_use') && Array.isArray(msg.content)) {
       const blocks = msg.content as AssistantHistoryBlock[]
       if (blocks.some((b) => b.type === 'tool_use' && TASK_RELATED_TOOL_NAMES.has(b.name ?? ''))) { lastTaskIndex = i; break }
     }
   }
   if (lastTaskIndex < 0) return false
-  for (let i = lastTaskIndex + 1; i < messages.length; i++) { if (messages[i]!.type === 'user') return true }
+  for (let i = lastTaskIndex + 1; i < messages.length; i++) {
+    if (messages[i]!.type === 'user' && !messages[i]!.parentToolUseId) return true
+  }
   return false
 }

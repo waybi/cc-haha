@@ -7,6 +7,10 @@ import type {
   UpdateProviderInput,
   TestProviderConfigInput,
   ProviderTestResult,
+  CcSwitchScanResult,
+  CcSwitchImportResult,
+  ProviderModelsInput,
+  ProviderModelsResult,
 } from '../types/provider'
 
 type ProvidersResponse = { providers: SavedProvider[]; activeId: string | null }
@@ -16,7 +20,7 @@ type ProviderResponse = { provider: SavedProvider }
 type TestResultResponse = { result: ProviderTestResult }
 type AuthStatusResponse = {
   hasAuth: boolean
-  source: 'cc-haha-provider' | 'openai-oauth' | 'grok-oauth' | 'original-settings' | 'env' | 'none'
+  source: 'cc-haha-provider' | 'claude-oauth' | 'openai-oauth' | 'grok-oauth' | 'original-settings' | 'env' | 'none'
   activeProvider?: string
 }
 
@@ -61,11 +65,27 @@ export const providersApi = {
     return api.put<ProvidersReorderResponse>('/api/providers/reorder', { orderedIds })
   },
 
-  test(id: string, overrides?: { baseUrl?: string; modelId?: string; apiFormat?: string; authStrategy?: string }) {
+  test(id: string, overrides?: { modelId?: string }) {
     return api.post<TestResultResponse>(`/api/providers/${id}/test`, overrides)
   },
 
   testConfig(input: TestProviderConfigInput) {
     return api.post<TestResultResponse>('/api/providers/test', input)
+  },
+
+  scanCcSwitch() {
+    return api.get<CcSwitchScanResult>('/api/providers/cc-switch/scan')
+  },
+
+  importCcSwitch(sourceIds: string[]) {
+    return api.post<CcSwitchImportResult>('/api/providers/cc-switch/import', { sourceIds })
+  },
+
+  /**
+   * Upstream failures are reported as HTTP 200 with `ok: false`, so this only
+   * rejects when our own server is unreachable.
+   */
+  fetchModels(input: ProviderModelsInput) {
+    return api.post<ProviderModelsResult>('/api/providers/models', input)
   },
 }

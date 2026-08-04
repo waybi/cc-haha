@@ -141,13 +141,27 @@ const ADAPTERS_SCOPE: CoverageScope = {
   excludeSuffixes: ['.test.ts', '.test.tsx', '.d.ts'],
 }
 
+/**
+ * Coverage answers "is this tested", never "should this exist". Three components sat
+ * at zero because nothing imported them any more, and the gate read that as missing
+ * tests: 598b968ee wrote suites for two of them to clear the threshold, and the dead
+ * code was then carried through a UI redesign. `desktop/src/__tests__/componentReachability.test.ts`
+ * asks the question this scope cannot, and it runs inside the same desktop suite that
+ * produces this LCOV — so an unreachable component fails the run before its coverage
+ * is ever scored.
+ */
 const DESKTOP_SCOPE: CoverageScope = {
   id: 'desktop',
   title: 'Desktop React',
   includePrefixes: ['desktop/src/'],
   excludePrefixes: [
-    'desktop/src/mocks/',
     'desktop/src/types/',
+    // Dev-only tooling, same category as mocks/. `dev/` holds the component
+    // gallery, which Vite never bundles (its build input is index.html alone)
+    // and which exists precisely to be looked at by a person — unit-testing a
+    // page whose whole job is rendering every primitive would assert that the
+    // primitives render, which their own tests already do.
+    'desktop/src/dev/',
   ],
   excludeSuffixes: ['.test.ts', '.test.tsx', '.d.ts', 'vite-env.d.ts', '.css'],
 }

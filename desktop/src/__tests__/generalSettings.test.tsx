@@ -6,7 +6,7 @@ import { Settings } from '../pages/Settings'
 import { useSettingsStore } from '../stores/settingsStore'
 import { useUIStore } from '../stores/uiStore'
 import { useUpdateStore } from '../stores/updateStore'
-import type { SavedProvider } from '../types/provider'
+import type { ProviderModelsResult, SavedProvider } from '../types/provider'
 import type { ProviderPreset } from '../types/providerPreset'
 import type { AppMode, ChatSendBehavior, PermissionMode, ThemeMode, UpdateProxySettings } from '../types/settings'
 import { browserHost } from '../lib/desktopHost/browserHost'
@@ -48,6 +48,30 @@ const providerStoreState = {
   createProvider: vi.fn(),
   updateProvider: vi.fn(),
   testConfig: vi.fn(),
+  scanCcSwitch: vi.fn(),
+  importCcSwitch: vi.fn(),
+  fetchModels: vi.fn(),
+}
+
+const ZHIPU_REGIONAL_PRESET: ProviderPreset = {
+  id: 'zhipuglm',
+  name: 'Zhipu GLM',
+  baseUrl: 'https://open.bigmodel.cn/api/anthropic',
+  regionalEndpoints: [
+    { region: 'cn_zh', baseUrl: 'https://open.bigmodel.cn/api/anthropic' },
+    { region: 'global_en', baseUrl: 'https://api.z.ai/api/anthropic' },
+  ],
+  apiFormat: 'anthropic',
+  defaultModels: {
+    main: 'glm-5.2[1m]',
+    haiku: 'glm-4.7',
+    sonnet: 'glm-5.2[1m]',
+    opus: 'glm-5.2[1m]',
+  },
+  needsApiKey: true,
+  websiteUrl: 'https://open.bigmodel.cn',
+  apiKeyUrl: 'https://www.bigmodel.cn/api-keys',
+  promoText: 'Mainland China promotion',
 }
 
 vi.mock('../api/agents', () => ({
@@ -68,7 +92,7 @@ vi.mock('../api/providers', () => ({
 }))
 
 vi.mock('../lib/desktopNotifications', () => desktopNotificationsMock)
-vi.mock('../components/chat/clipboard', () => clipboardMock)
+vi.mock('@/lib/clipboard', () => clipboardMock)
 vi.mock('@tauri-apps/api/core', () => tauriCoreMock)
 vi.mock('@tauri-apps/plugin-dialog', () => tauriDialogMock)
 vi.mock('@tauri-apps/plugin-process', () => tauriProcessMock)
@@ -146,6 +170,7 @@ function installElectronDesktopHost() {
       zoom: true,
     },
     app: {
+      ...browserHost.app,
       getVersion: vi.fn().mockResolvedValue('0.3.2'),
     },
     dialogs: {
@@ -204,10 +229,12 @@ describe('Settings > General tab', () => {
     providerStoreState.createProvider = vi.fn()
     providerStoreState.updateProvider = vi.fn()
     providerStoreState.testConfig = vi.fn()
+    providerStoreState.scanCcSwitch = vi.fn()
+    providerStoreState.importCcSwitch = vi.fn()
+    providerStoreState.fetchModels = vi.fn()
 
     useSettingsStore.setState({
       locale: 'en',
-      theme: 'light',
       permissionMode: 'default',
       autoModeOptInAccepted: false,
       thinkingEnabled: true,
@@ -258,7 +285,7 @@ describe('Settings > General tab', () => {
         useSettingsStore.setState({ autoDreamEnabled: enabled })
       }),
       setTheme: vi.fn().mockImplementation(async (theme: ThemeMode) => {
-        useSettingsStore.setState({ theme })
+        useUIStore.setState({ theme })
       }),
       setPermissionMode: vi.fn().mockImplementation(async (permissionMode: PermissionMode) => {
         useSettingsStore.setState({ permissionMode })
@@ -348,7 +375,16 @@ describe('Settings > General tab', () => {
       updateH5AccessSettings: vi.fn(),
     })
 
-    useUIStore.setState({ activeSettingsTab: 'providers', pendingSettingsTab: null, toasts: [] })
+    useUIStore.setState({
+      activeSettingsTab: 'providers',
+      pendingSettingsTab: null,
+      toasts: [],
+      // Fresh installs follow the system, which narrows the theme picker to
+      // its light half. Tests that exercise the full picker opt out here and
+      // the follow-the-system cases turn it back on.
+      followSystemTheme: false,
+      lightTheme: 'white',
+    })
     useUpdateStore.setState({
       status: 'idle',
       availableVersion: null,
@@ -387,29 +423,132 @@ describe('Settings > General tab', () => {
     expect(screen.getByLabelText('Skip WebFetch domain preflight')).toBeInTheDocument()
   })
 
-  it('offers the pure white appearance theme', () => {
+  it('offers all six palettes, paper grounds before ink ones', () => {
     render(<Settings />)
 
     fireEvent.click(screen.getByText('General'))
-    const pureWhite = screen.getByRole('button', { name: 'Pure White' })
-    const warmClassic = screen.getByRole('button', { name: 'Warm Classic' })
-    const dark = screen.getByRole('button', { name: 'Dark' })
+    // The picker order is load-bearing: the four paper grounds come first, then
+    // the two ink ones, so the list reads light-to-dark rather than shuffled.
+    const order = ['Pure White', 'Paper', 'Warm Classic', 'Celadon', 'Ink Night', 'Ink Blue']
+      .map((name) => screen.getByRole('button', { name }))
 
-    expect((pureWhite.compareDocumentPosition(warmClassic) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0).toBe(true)
-    expect((warmClassic.compareDocumentPosition(dark) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0).toBe(true)
+    for (const [index, chip] of order.slice(0, -1).entries()) {
+      const next = order[index + 1]!
+      expect(
+        (chip.compareDocumentPosition(next) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0,
+        `${order[index + 1]} should follow ${order[index]}`,
+      ).toBe(true)
+    }
+
     fireEvent.click(screen.getByRole('button', { name: 'Pure White' }))
-
     expect(useSettingsStore.getState().setTheme).toHaveBeenCalledWith('white')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Ink Blue' }))
+    expect(useSettingsStore.getState().setTheme).toHaveBeenCalledWith('ink-blue')
+  })
+
+  it('gives the settings rail the handoff width and a rounded selected item', () => {
+    useUIStore.setState({ activeSettingsTab: 'general', pendingSettingsTab: null })
+    render(<Settings />)
+
+    const activeItem = screen.getByRole('button', { name: 'General' })
+    // Selection is a rounded ground inside the rail, not a full-bleed band:
+    // the rail is padded, so a square highlight would touch the divider.
+    expect(activeItem.className).toContain('rounded-[var(--radius-md)]')
+    expect(activeItem.className).toContain('bg-[var(--color-surface-hover)]')
+    expect(activeItem).toHaveAttribute('aria-current', 'page')
+
+    const rail = activeItem.parentElement?.parentElement
+    expect(rail?.className).toContain('w-[195px]')
+    expect(rail?.className).toContain('pl-3')
+    expect(rail?.className).toContain('pr-1')
+    expect(activeItem.className).toContain('pl-3')
+    expect(activeItem.className).toContain('pr-2')
   })
 
   it('marks the pure white appearance theme as selected', () => {
-    useSettingsStore.setState({ theme: 'white' })
+    useUIStore.setState({ theme: 'white' })
     render(<Settings />)
 
     fireEvent.click(screen.getByText('General'))
 
     expect(screen.getByRole('button', { name: 'Pure White' })).toHaveAttribute('aria-pressed', 'true')
     expect(screen.getByRole('button', { name: 'Warm Classic' })).toHaveAttribute('aria-pressed', 'false')
+  })
+
+  it('offers a switch for following the system appearance', () => {
+    render(<Settings />)
+
+    fireEvent.click(screen.getByText('General'))
+
+    const followSwitch = screen.getByRole('switch', { name: 'Follow the system' })
+    expect(followSwitch).not.toBeChecked()
+
+    fireEvent.click(followSwitch)
+
+    expect(useUIStore.getState().followSystemTheme).toBe(true)
+  })
+
+  it('splits the picker into one row per ground while following the system', () => {
+    // The OS picks the ground; what is left to choose is the palette on each
+    // one, so both rows are offered rather than only the light half.
+    useUIStore.setState({ followSystemTheme: true, lightTheme: 'celadon', darkTheme: 'ink-blue', theme: 'ink-blue' })
+    render(<Settings />)
+
+    fireEvent.click(screen.getByText('General'))
+
+    expect(screen.getByText('Use in light mode')).toBeInTheDocument()
+    expect(screen.getByText('Use in dark mode')).toBeInTheDocument()
+    for (const label of ['Pure White', 'Paper', 'Warm Classic', 'Celadon', 'Ink Night', 'Ink Blue']) {
+      expect(screen.getByRole('button', { name: label }), label).toBeInTheDocument()
+    }
+  })
+
+  it('marks each ground preference rather than the applied palette', () => {
+    // Evening: the app is on ink-blue, but the light row is asking which
+    // palette to return to in the morning — that is warm classic, not ink-blue.
+    useUIStore.setState({ followSystemTheme: true, lightTheme: 'warm-classic', darkTheme: 'ink-blue', theme: 'ink-blue' })
+    render(<Settings />)
+
+    fireEvent.click(screen.getByText('General'))
+
+    expect(screen.getByRole('button', { name: 'Warm Classic' })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('button', { name: 'Ink Blue' })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('button', { name: 'Pure White' })).toHaveAttribute('aria-pressed', 'false')
+    expect(screen.getByRole('button', { name: 'Ink Night' })).toHaveAttribute('aria-pressed', 'false')
+  })
+
+  it('hides the light-half hint when not following the system', () => {
+    render(<Settings />)
+
+    fireEvent.click(screen.getByText('General'))
+
+    expect(screen.queryByText('Use in light mode')).not.toBeInTheDocument()
+  })
+
+  it('highlights the theme on screen after the OS flipped it and the switch is released', () => {
+    // Going through the real transition, not a hand-set state: the OS turned
+    // dark during the session, then the user releases the switch to freeze it.
+    // The picker must point at the palette that is actually rendered.
+    useUIStore.setState({
+      followSystemTheme: true,
+      lightTheme: 'white',
+      darkTheme: 'ink-blue',
+      theme: 'white',
+    })
+    render(<Settings />)
+    fireEvent.click(screen.getByText('General'))
+
+    act(() => {
+      // Stand in for the OS flip the media-query listener would deliver.
+      useUIStore.setState({ theme: 'ink-blue' })
+    })
+    act(() => {
+      useUIStore.getState().setFollowSystemTheme(false)
+    })
+
+    expect(screen.getByRole('button', { name: 'Ink Blue' })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('button', { name: 'Pure White' })).toHaveAttribute('aria-pressed', 'false')
   })
 
   it('keeps UI zoom below system notifications because it is a secondary setting', () => {
@@ -883,7 +1022,7 @@ describe('Settings > General tab', () => {
     const trigger = screen.getByRole('button', { name: 'Response Language' })
     expect(trigger).toHaveTextContent('Default (English)')
     fireEvent.click(trigger)
-    fireEvent.click(screen.getByRole('button', { name: '中文 (Chinese)' }))
+    fireEvent.click(screen.getByRole('option', { name: '中文 (Chinese)' }))
 
     expect(useSettingsStore.getState().setResponseLanguage).toHaveBeenCalledWith('chinese')
   })
@@ -1576,6 +1715,18 @@ describe('Settings > Providers tab', () => {
     providerStoreState.hasLoadedProviders = true
   })
 
+  it('outlines the default provider in terracotta rather than the focus color', () => {
+    providerStoreState.activeId = 'provider-1'
+    render(<Settings />)
+
+    const card = screen.getByTestId('provider-provider-1')
+    // 1.5px so the default row reads as chosen at a glance without the heavier
+    // ring the focus border gave it, which collided with the real focus ring.
+    expect(card.className).toContain('border-[1.5px]')
+    expect(card.className).toContain('border-[var(--color-primary-fixed-dim)]')
+    expect(card.className).not.toContain('border-[var(--color-border-focus)]')
+  })
+
   it('does not query official OAuth status before providers finish loading', () => {
     providerStoreState.providers = []
     providerStoreState.activeId = null
@@ -1683,7 +1834,7 @@ describe('Settings > Providers tab', () => {
     expect(MOCK_DELETE_PROVIDER).toHaveBeenCalledWith('provider-1')
   })
 
-  it('keeps custom provider creation available when presets are unavailable', () => {
+  it('keeps custom provider creation available when presets are unavailable', async () => {
     providerStoreState.presets = []
 
     render(<Settings />)
@@ -1695,7 +1846,88 @@ describe('Settings > Providers tab', () => {
 
     const dialog = screen.getByRole('dialog')
     expect(within(dialog).getByLabelText(/Name/i)).toHaveValue('Custom')
-    expect(within(dialog).getByLabelText(/Base URL/i)).toBeEnabled()
+    expect(within(dialog).getByRole('textbox', { name: /Base URL/i })).toBeEnabled()
+
+    const baseUrlInfo = within(dialog).getByRole('button', { name: 'Base URL help' })
+    fireEvent.mouseEnter(baseUrlInfo)
+    expect(await screen.findByRole('tooltip')).toHaveTextContent('Enter the endpoint before /v1. The remaining path is added automatically.')
+  })
+
+  it.each(['resolves', 'rejects'] as const)(
+    'keeps the selected regional endpoint when settings loading %s late',
+    async (outcome) => {
+      let settleSettings: (() => void) | undefined
+      MOCK_GET_SETTINGS.mockImplementationOnce(() => new Promise((resolve, reject) => {
+        settleSettings = () => outcome === 'resolves'
+          ? resolve({})
+          : reject(new Error('settings unavailable'))
+      }))
+      providerStoreState.presets = [ZHIPU_REGIONAL_PRESET]
+
+      render(<Settings />)
+      fireEvent.click(screen.getByRole('button', { name: /Add Provider/i }))
+
+      const dialog = screen.getByRole('dialog')
+      await waitFor(() => expect(settleSettings).toBeTypeOf('function'))
+      expect(within(dialog).queryByRole('combobox')).not.toBeInTheDocument()
+      const regionTrigger = within(dialog).getByRole('button', { name: /China mainland/ })
+      const baseUrlInput = within(dialog).getByRole('textbox', { name: /Base URL/i })
+      expect(baseUrlInput).toHaveValue('https://open.bigmodel.cn/api/anthropic')
+      expect(within(dialog).getByRole('button', { name: /Get API Key/i })).toBeInTheDocument()
+      expect(within(dialog).getByText('Mainland China promotion')).toBeInTheDocument()
+
+      fireEvent.click(regionTrigger)
+      fireEvent.click(within(dialog).getByRole('option', { name: /Global/ }))
+
+      expect(baseUrlInput).toHaveValue('https://api.z.ai/api/anthropic')
+      expect(within(dialog).queryByRole('button', { name: /Get API Key/i })).not.toBeInTheDocument()
+      expect(within(dialog).queryByText('Mainland China promotion')).not.toBeInTheDocument()
+      await act(async () => settleSettings?.())
+      await waitFor(() => {
+        expect(dialog.querySelector('textarea')?.value).toContain(
+          '"ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic"',
+        )
+      })
+    },
+  )
+
+  it('preserves pasted regional settings when the initial settings load finishes late', async () => {
+    let resolveSettings: (() => void) | undefined
+    MOCK_GET_SETTINGS.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveSettings = () => resolve({ fromDisk: true })
+    }))
+    providerStoreState.presets = [ZHIPU_REGIONAL_PRESET]
+
+    render(<Settings />)
+    fireEvent.click(screen.getByRole('button', { name: /Add Provider/i }))
+
+    const dialog = screen.getByRole('dialog')
+    await waitFor(() => expect(resolveSettings).toBeTypeOf('function'))
+    const settingsTextarea = dialog.querySelector('textarea') as HTMLTextAreaElement
+    fireEvent.change(settingsTextarea, {
+      target: {
+        value: JSON.stringify({
+          customSetting: 'keep-me',
+          env: {
+            ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+            ANTHROPIC_MODEL: 'glm-global',
+          },
+        }),
+      },
+    })
+
+    expect(within(dialog).getByRole('button', { name: /Global/ })).toBeInTheDocument()
+    expect(within(dialog).getByRole('textbox', { name: /Base URL/i })).toHaveValue('https://api.z.ai/api/anthropic')
+    await act(async () => resolveSettings?.())
+    await waitFor(() => {
+      expect(JSON.parse(settingsTextarea.value)).toMatchObject({
+        customSetting: 'keep-me',
+        env: {
+          ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+          ANTHROPIC_MODEL: 'glm-global',
+        },
+      })
+    })
   })
 
   it('uses the shared dropdown for API format in the provider form', () => {
@@ -1724,8 +1956,9 @@ describe('Settings > Providers tab', () => {
     expect(within(dialog).queryByRole('combobox')).not.toBeInTheDocument()
 
     fireEvent.click(within(dialog).getByRole('button', { name: /Anthropic Messages \(native\)/i }))
-    fireEvent.click(within(dialog).getByRole('button', { name: /OpenAI Responses API \(proxy\)/i }))
+    fireEvent.click(within(dialog).getByRole('option', { name: /OpenAI Responses API \(proxy\)/i }))
 
+    // The panel is closed now; this finds the trigger, which reflects the pick.
     expect(within(dialog).getByRole('button', { name: /OpenAI Responses API \(proxy\)/i })).toBeInTheDocument()
     expect(within(dialog).getByText('Requests will be translated via the local proxy')).toBeInTheDocument()
   })
@@ -1754,8 +1987,9 @@ describe('Settings > Providers tab', () => {
     fireEvent.click(screen.getByRole('button', { name: /添加服务商/i }))
 
     const dialog = screen.getByRole('dialog')
-    expect(within(dialog).getByPlaceholderText('模型 ID')).toBeInTheDocument()
-    expect(within(dialog).queryByPlaceholderText('Model ID')).not.toBeInTheDocument()
+    expect(within(dialog).getByPlaceholderText('例如： deepseek-v4-flash')).toBeInTheDocument()
+    expect(within(dialog).getByText('要填写 API Key 才能获取模型列表')).toBeInTheDocument()
+    expect(within(dialog).queryByPlaceholderText('e.g. deepseek-v4-flash')).not.toBeInTheDocument()
   })
 
   it('normalizes blank model mappings to the main model when saving a provider', async () => {
@@ -1906,6 +2140,20 @@ describe('Settings > Providers tab', () => {
     expect(providerStoreState.testConfig).not.toHaveBeenCalledWith(expect.objectContaining({
       modelId: 'deepseek-v4-pro',
     }))
+
+    fireEvent.click(within(dialog).getByRole('button', { name: /Save|Add|保存|添加/i }))
+
+    await waitFor(() => {
+      expect(providerStoreState.createProvider).toHaveBeenCalledWith(expect.objectContaining({
+        models: expect.objectContaining({
+          fable: 'Qwen3Coder',
+          main: 'claude-sonnet-4-6',
+          haiku: 'claude-haiku-4-5',
+          sonnet: 'claude-sonnet-4-6',
+          opus: 'claude-opus-4-8',
+        }),
+      }))
+    })
   })
 
   it('keeps the provider form locked while save is in flight', async () => {
@@ -2233,6 +2481,430 @@ describe('Settings > Providers tab', () => {
     expect(apiKeyInput).toHaveAttribute('type', 'text')
     expect(within(dialog).getByRole('button', { name: 'Hide API Key' })).toBeInTheDocument()
   })
+
+  function setCustomPreset() {
+    providerStoreState.presets = [
+      {
+        id: 'custom',
+        name: 'Custom',
+        baseUrl: 'https://api.example.com/anthropic',
+        apiFormat: 'anthropic',
+        defaultModels: {
+          main: 'custom-main',
+          haiku: '',
+          sonnet: '',
+          opus: '',
+        },
+        needsApiKey: true,
+        websiteUrl: '',
+      },
+    ]
+  }
+
+  /** Opens the create form with a base URL and key already filled in. */
+  async function openProviderForm() {
+    setCustomPreset()
+
+    render(<Settings />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Add Provider|添加服务商/i }))
+    const dialog = screen.getByRole('dialog')
+    await waitFor(() => {
+      expect(dialog.querySelector('textarea')?.value).toContain('"ANTHROPIC_MODEL"')
+    })
+    fireEvent.change(within(dialog).getByPlaceholderText('sk-...'), { target: { value: 'sk-test' } })
+    return dialog
+  }
+
+  async function openProviderFormWithModels(result: ProviderModelsResult) {
+    providerStoreState.fetchModels = vi.fn().mockResolvedValue(result)
+    return openProviderForm()
+  }
+
+  it('opens the cc-switch import dialog from the providers header', async () => {
+    providerStoreState.scanCcSwitch = vi.fn().mockResolvedValue({
+      available: false,
+      reason: 'not-found',
+      configDir: '/Users/tester/.cc-switch',
+      candidates: [],
+    })
+
+    render(<Settings />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Import from cc-switch|从 cc-switch 导入/i }))
+
+    await waitFor(() => {
+      expect(providerStoreState.scanCcSwitch).toHaveBeenCalled()
+    })
+    expect(await screen.findByText(/No cc-switch configuration was found/i)).toBeInTheDocument()
+  })
+
+  it('explains that an API key is required before models can be fetched', () => {
+    setCustomPreset()
+
+    render(<Settings />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Add Provider|添加服务商/i }))
+    const dialog = screen.getByRole('dialog')
+    const fetchButton = within(dialog).getByRole('button', { name: /Fetch models|获取模型/i })
+
+    expect(fetchButton).toBeDisabled()
+    expect(within(dialog).getByText(/Enter an API key to fetch the model list/i)).toBeInTheDocument()
+
+    fireEvent.change(within(dialog).getByPlaceholderText('sk-...'), { target: { value: 'sk-test' } })
+
+    expect(fetchButton).toBeEnabled()
+    expect(within(dialog).getByText(/only when the upstream provider publishes a model list endpoint/i)).toBeInTheDocument()
+  })
+
+  it('gives every model slot a picker once the model list is fetched', async () => {
+    const dialog = await openProviderFormWithModels({
+      ok: true,
+      endpoint: 'https://api.example.com/v1/models',
+      models: [
+        { id: 'gpt-5-mini', ownedBy: 'openai' },
+        { id: 'claude-sonnet-4-6', ownedBy: 'anthropic' },
+      ],
+    })
+
+    fireEvent.click(within(dialog).getByRole('button', { name: /Fetch models|获取模型/i }))
+
+    await waitFor(() => {
+      expect(providerStoreState.fetchModels).toHaveBeenCalledWith({
+        baseUrl: 'https://api.example.com/anthropic',
+        apiKey: 'sk-test',
+      })
+    })
+    expect(await within(dialog).findByText(/Model list loaded \(2\)/i)).toBeInTheDocument()
+    expect(within(dialog).getAllByRole('button', { name: /from the fetched list/i })).toHaveLength(4)
+
+    // The picker supplements the field; a model id that is not on the list must
+    // still be typeable. Queried by role because the picker's own accessible
+    // name also contains the slot label.
+    const mainInput = within(dialog).getByRole('combobox', { name: /Main Model|主模型/i })
+    fireEvent.change(mainInput, { target: { value: 'gpt-5-mini[1m]' } })
+    expect(mainInput).toHaveValue('gpt-5-mini')
+    expect(within(dialog).getByRole('option', { name: 'gpt-5-mini' })).toBeInTheDocument()
+    expect(within(dialog).queryByText(/No matching models/i)).not.toBeInTheDocument()
+
+    fireEvent.change(mainInput, { target: { value: 'typed-by-hand' } })
+    expect(mainInput).toHaveValue('typed-by-hand')
+    const noMatches = within(dialog).getByRole('option', { name: /No matching models/i })
+    expect(noMatches).toHaveAttribute('aria-disabled', 'true')
+  })
+
+  it('toasts that the fetched list is now pickable from the dropdown', async () => {
+    const dialog = await openProviderFormWithModels({
+      ok: true,
+      endpoint: 'https://api.example.com/v1/models',
+      models: [
+        { id: 'gpt-5-mini', ownedBy: 'openai' },
+        { id: 'claude-sonnet-4-6', ownedBy: 'anthropic' },
+      ],
+    })
+
+    fireEvent.click(within(dialog).getByRole('button', { name: /Fetch models|获取模型/i }))
+
+    await waitFor(() => {
+      expect(useUIStore.getState().toasts[useUIStore.getState().toasts.length - 1]).toMatchObject({
+        type: 'success',
+        message: 'Model list loaded. Pick a model from the dropdown now.',
+      })
+    })
+  })
+
+  it('does not toast when the fetched model list is empty', async () => {
+    const dialog = await openProviderFormWithModels({
+      ok: true,
+      endpoint: 'https://api.example.com/v1/models',
+      models: [],
+    })
+
+    fireEvent.click(within(dialog).getByRole('button', { name: /Fetch models|获取模型/i }))
+
+    await waitFor(() => {
+      expect(providerStoreState.fetchModels).toHaveBeenCalled()
+    })
+    expect(useUIStore.getState().toasts).toHaveLength(0)
+  })
+
+  it('routes a picked model through the shared model change handler', async () => {
+    const dialog = await openProviderFormWithModels({
+      ok: true,
+      endpoint: 'https://api.example.com/v1/models',
+      models: [
+        { id: 'gpt-5-mini', ownedBy: 'openai' },
+        { id: 'claude-sonnet-4-6', ownedBy: 'anthropic' },
+      ],
+    })
+
+    fireEvent.click(within(dialog).getByRole('button', { name: /Fetch models|获取模型/i }))
+    const mainCombobox = await within(dialog).findByRole('combobox', { name: /Main Model|主模型/i })
+    const pickerButton = within(dialog).getByRole('button', { name: /Main Model.*fetched list/i })
+    expect(pickerButton).toHaveAttribute('tabindex', '-1')
+
+    fireEvent.click(mainCombobox)
+    expect(mainCombobox).toHaveAttribute('aria-expanded', 'true')
+    expect(within(dialog).getByRole('option', { name: /gpt-5-mini/i })).toHaveAttribute('tabindex', '-1')
+    fireEvent.keyDown(mainCombobox, { key: 'ArrowDown' })
+    fireEvent.keyDown(mainCombobox, { key: 'Enter' })
+
+    expect(mainCombobox).toHaveValue('gpt-5-mini')
+    expect(mainCombobox).toHaveAttribute('aria-expanded', 'false')
+    // Going through handleModelChange is what keeps the settings JSON in sync —
+    // a bare setState would leave the textarea on the old model id.
+    await waitFor(() => {
+      expect(dialog.querySelector('textarea')?.value).toContain('"ANTHROPIC_MODEL": "gpt-5-mini"')
+    })
+  })
+
+  it('closes the previous model popup when keyboard focus moves to another field', async () => {
+    const dialog = await openProviderFormWithModels({
+      ok: true,
+      endpoint: 'https://api.example.com/v1/models',
+      models: [
+        { id: 'gpt-5-mini', ownedBy: 'openai' },
+        { id: 'claude-sonnet-4-6', ownedBy: 'anthropic' },
+      ],
+    })
+
+    fireEvent.click(within(dialog).getByRole('button', { name: /Fetch models|获取模型/i }))
+    const comboboxes = await within(dialog).findAllByRole('combobox')
+    const mainCombobox = comboboxes[0]!
+    const haikuCombobox = comboboxes[1]!
+
+    fireEvent.focus(mainCombobox)
+    expect(mainCombobox).toHaveAttribute('aria-expanded', 'true')
+    expect(within(dialog).getAllByRole('listbox')).toHaveLength(1)
+
+    fireEvent.blur(mainCombobox, { relatedTarget: haikuCombobox })
+    fireEvent.focus(haikuCombobox)
+
+    expect(mainCombobox).toHaveAttribute('aria-expanded', 'false')
+    expect(haikuCombobox).toHaveAttribute('aria-expanded', 'true')
+    expect(within(dialog).getAllByRole('listbox')).toHaveLength(1)
+  })
+
+  it('limits a large catalog until the user narrows the model input', async () => {
+    const dialog = await openProviderFormWithModels({
+      ok: true,
+      endpoint: 'https://api.example.com/v1/models',
+      models: Array.from({ length: 101 }, (_, index) => ({
+        id: `model-${String(index).padStart(3, '0')}`,
+        ownedBy: 'openai',
+      })),
+    })
+
+    fireEvent.click(within(dialog).getByRole('button', { name: /Fetch models|获取模型/i }))
+    const mainCombobox = await within(dialog).findByRole('combobox', { name: /Main Model|主模型/i })
+    fireEvent.click(mainCombobox)
+
+    expect(within(dialog).getAllByRole('option')).toHaveLength(100)
+    expect(within(dialog).getByText(/More models are available/i)).toBeInTheDocument()
+
+    fireEvent.change(mainCombobox, { target: { value: 'model-100' } })
+
+    expect(within(dialog).getAllByRole('option')).toHaveLength(1)
+    expect(within(dialog).getByRole('option', { name: 'model-100' })).toBeInTheDocument()
+    expect(within(dialog).queryByText(/More models are available/i)).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ['auth-failed' as const, /API key was rejected/i],
+    ['not-supported' as const, /does not publish a model list/i],
+    ['endpoint-not-found' as const, /No model list endpoint/i],
+    ['timeout' as const, /did not respond in time/i],
+  ])('explains a failed model fetch for errorCode=%s', async (errorCode, expected) => {
+    const dialog = await openProviderFormWithModels({
+      ok: false,
+      errorCode,
+      // Free text that must never steer the headline — that still comes from
+      // the code.
+      message: 'upstream said no',
+      endpointsTried: ['https://api.example.com/v1/models'],
+    })
+
+    fireEvent.click(within(dialog).getByRole('button', { name: /Fetch models|获取模型/i }))
+
+    expect(await within(dialog).findByText(expected)).toBeInTheDocument()
+    // Changed from asserting the upstream text is hidden. Dropping it made a
+    // 200-cloaked auth failure read as "this provider has no model list"; the
+    // code still picks the headline, the raw text only rides along under it.
+    expect(within(dialog).getByText(/upstream said no/)).toBeInTheDocument()
+    expect(within(dialog).queryByRole('button', { name: /from the fetched list/i })).not.toBeInTheDocument()
+    expect(within(dialog).queryByRole('combobox')).not.toBeInTheDocument()
+  })
+
+  it('surfaces the upstream message when a 200 response cloaks an auth failure', async () => {
+    // 智谱 answers HTTP 200 with {"code":1000,"msg":"身份验证失败。"}, which the
+    // server can only classify as `not-supported`. On the code alone the user is
+    // told to type model ids by hand, when the actual fix is the rejected key.
+    const dialog = await openProviderFormWithModels({
+      ok: false,
+      errorCode: 'not-supported',
+      message: '身份验证失败。',
+      httpStatus: 200,
+      endpointsTried: ['https://open.bigmodel.cn/api/anthropic/v1/models'],
+    })
+
+    fireEvent.click(within(dialog).getByRole('button', { name: /Fetch models|获取模型/i }))
+
+    const alert = await within(dialog).findByRole('alert')
+    expect(alert).toHaveTextContent(/does not publish a model list/i)
+    expect(alert).toHaveTextContent('身份验证失败。')
+  })
+
+  it('renders the error on its own when the server sends no upstream message', async () => {
+    const dialog = await openProviderFormWithModels({
+      ok: false,
+      errorCode: 'network',
+      message: '   ',
+      endpointsTried: [],
+    })
+
+    fireEvent.click(within(dialog).getByRole('button', { name: /Fetch models|获取模型/i }))
+
+    const alert = await within(dialog).findByRole('alert')
+    // No dangling "Provider response:" label with nothing behind it.
+    expect(alert.textContent).toBe('Could not reach the provider. Check the base URL and your network.')
+  })
+
+  it('does not echo an upstream message that already matches the explanation', async () => {
+    const dialog = await openProviderFormWithModels({
+      ok: false,
+      errorCode: 'timeout',
+      message: 'The provider did not respond in time.',
+      endpointsTried: ['https://api.example.com/v1/models'],
+    })
+
+    fireEvent.click(within(dialog).getByRole('button', { name: /Fetch models|获取模型/i }))
+
+    const alert = await within(dialog).findByRole('alert')
+    expect(alert.textContent).toBe('The provider did not respond in time.')
+  })
+
+  it('discards a model list that arrives after the base URL changed', async () => {
+    let resolveFetch!: (result: ProviderModelsResult) => void
+    providerStoreState.fetchModels = vi.fn().mockReturnValue(
+      new Promise<ProviderModelsResult>((resolve) => {
+        resolveFetch = resolve
+      }),
+    )
+    const dialog = await openProviderForm()
+
+    fireEvent.click(within(dialog).getByRole('button', { name: /Fetch models|获取模型/i }))
+    await waitFor(() => {
+      expect(providerStoreState.fetchModels).toHaveBeenCalledTimes(1)
+    })
+
+    fireEvent.change(within(dialog).getByRole('textbox', { name: /Base URL|接口地址/i }), {
+      target: { value: 'https://other.example.com/anthropic' },
+    })
+
+    // The probe walks up to three candidate endpoints at 15s each, so landing
+    // after the edit is the ordinary case rather than a corner one.
+    await act(async () => {
+      resolveFetch({
+        ok: true,
+        endpoint: 'https://api.example.com/v1/models',
+        models: [{ id: 'gpt-5-mini', ownedBy: 'openai' }],
+      })
+    })
+
+    // These models belong to the base URL the user just replaced.
+    expect(within(dialog).queryByText(/Model list loaded/i)).not.toBeInTheDocument()
+    expect(within(dialog).queryByRole('button', { name: /from the fetched list/i })).not.toBeInTheDocument()
+    // ...and the discarded response must not leave the button spinning either.
+    expect(within(dialog).getByRole('button', { name: /Fetch models|获取模型/i })).toBeEnabled()
+  })
+
+  it('discards a failed model fetch that arrives after the base URL changed', async () => {
+    let resolveFetch!: (result: ProviderModelsResult) => void
+    providerStoreState.fetchModels = vi.fn().mockReturnValue(
+      new Promise<ProviderModelsResult>((resolve) => {
+        resolveFetch = resolve
+      }),
+    )
+    const dialog = await openProviderForm()
+
+    fireEvent.click(within(dialog).getByRole('button', { name: /Fetch models|获取模型/i }))
+    await waitFor(() => {
+      expect(providerStoreState.fetchModels).toHaveBeenCalledTimes(1)
+    })
+
+    fireEvent.change(within(dialog).getByRole('textbox', { name: /Base URL|接口地址/i }), {
+      target: { value: 'https://other.example.com/anthropic' },
+    })
+
+    await act(async () => {
+      resolveFetch({
+        ok: false,
+        errorCode: 'auth-failed',
+        message: 'stale key rejected',
+        endpointsTried: ['https://api.example.com/v1/models'],
+      })
+    })
+
+    // Blaming the key the user is halfway through replacing is its own bug.
+    expect(within(dialog).queryByRole('alert')).not.toBeInTheDocument()
+    expect(within(dialog).getByRole('button', { name: /Fetch models|获取模型/i })).toBeEnabled()
+  })
+
+  it('treats an empty model list as a neutral result rather than an error', async () => {
+    const dialog = await openProviderFormWithModels({
+      ok: true,
+      endpoint: 'https://api.example.com/v1/models',
+      models: [],
+    })
+
+    fireEvent.click(within(dialog).getByRole('button', { name: /Fetch models|获取模型/i }))
+
+    expect(await within(dialog).findByText(/No models found/i)).toBeInTheDocument()
+    expect(within(dialog).queryByRole('alert')).not.toBeInTheDocument()
+    expect(within(dialog).queryByRole('button', { name: /from the fetched list/i })).not.toBeInTheDocument()
+  })
+
+  it('drops a fetched model list once the base URL changes', async () => {
+    const dialog = await openProviderFormWithModels({
+      ok: true,
+      endpoint: 'https://api.example.com/v1/models',
+      models: [{ id: 'gpt-5-mini', ownedBy: 'openai' }],
+    })
+
+    fireEvent.click(within(dialog).getByRole('button', { name: /Fetch models|获取模型/i }))
+    expect(await within(dialog).findByText(/Model list loaded \(1\)/i)).toBeInTheDocument()
+
+    fireEvent.change(within(dialog).getByRole('textbox', { name: /Base URL|接口地址/i }), {
+      target: { value: 'https://other.example.com/anthropic' },
+    })
+
+    // A list fetched from a different endpoint would be a lie about this one.
+    expect(within(dialog).queryByText(/Model list loaded/i)).not.toBeInTheDocument()
+    expect(within(dialog).queryByRole('button', { name: /from the fetched list/i })).not.toBeInTheDocument()
+  })
+
+  it('drops an open model list when the API key changes and does not reopen it after refetching', async () => {
+    const dialog = await openProviderFormWithModels({
+      ok: true,
+      endpoint: 'https://api.example.com/v1/models',
+      models: [{ id: 'gpt-5-mini', ownedBy: 'openai' }],
+    })
+
+    fireEvent.click(within(dialog).getByRole('button', { name: /Fetch models|获取模型/i }))
+    expect(await within(dialog).findByText(/Model list loaded \(1\)/i)).toBeInTheDocument()
+    fireEvent.click(within(dialog).getByRole('combobox', { name: /Main Model|主模型/i }))
+    expect(within(dialog).getByRole('listbox')).toBeInTheDocument()
+
+    fireEvent.change(within(dialog).getByPlaceholderText('sk-...'), { target: { value: 'sk-other' } })
+
+    expect(within(dialog).queryByText(/Model list loaded/i)).not.toBeInTheDocument()
+    expect(within(dialog).queryByRole('listbox')).not.toBeInTheDocument()
+
+    fireEvent.click(within(dialog).getByRole('button', { name: /Fetch models|获取模型/i }))
+    const mainCombobox = await within(dialog).findByRole('combobox', { name: /Main Model|主模型/i })
+    expect(mainCombobox).toHaveAttribute('aria-expanded', 'false')
+    expect(within(dialog).queryByRole('listbox')).not.toBeInTheDocument()
+  })
 })
 
 describe('Settings > About tab', () => {
@@ -2280,6 +2952,7 @@ describe('Settings > About tab', () => {
         updates: true,
       },
       app: {
+        ...browserHost.app,
         getVersion: vi.fn().mockRejectedValue(new Error('version IPC failed')),
       },
     }

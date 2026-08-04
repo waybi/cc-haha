@@ -8,6 +8,7 @@
 import { getMainLoopModelOverride } from '../../bootstrap/state.js'
 import {
   getSubscriptionType,
+  is1PApiCustomer,
   isClaudeAISubscriber,
   isMaxSubscriber,
   isOpenAIAuthActive,
@@ -24,7 +25,10 @@ import { getModelStrings, resolveOverriddenModel } from './modelStrings.js'
 import { formatModelPricing, getOpus46CostTier } from '../modelCost.js'
 import { getSettings_DEPRECATED } from '../settings/settings.js'
 import type { PermissionMode } from '../permissions/PermissionMode.js'
-import { getAPIProvider } from './providers.js'
+import {
+  getAPIProvider,
+  hasAnthropicCompatibleThirdPartyConfig,
+} from './providers.js'
 import { LIGHTNING_BOLT } from '../../constants/figures.js'
 import { isModelAllowed } from './modelAllowlist.js'
 import { type ModelAlias, isModelAlias } from './aliases.js'
@@ -47,7 +51,8 @@ export function isNonCustomOpusModel(model: ModelName): boolean {
     model === getModelStrings().opus40 ||
     model === getModelStrings().opus41 ||
     model === getModelStrings().opus45 ||
-    model === getModelStrings().opus46
+    model === getModelStrings().opus46 ||
+    model === getModelStrings().opus48
   )
 }
 
@@ -103,7 +108,11 @@ export function getMainLoopModel(): ModelName {
 }
 
 export function getBestModel(): ModelName {
-  return getDefaultOpusModel()
+  return getDefaultFableModel()
+}
+
+function shouldUseThirdPartyAnthropicModelDefaults(): boolean {
+  return !isClaudeAISubscriber() && hasAnthropicCompatibleThirdPartyConfig()
 }
 
 export function getDefaultFableModel(): ModelName {
@@ -112,6 +121,9 @@ export function getDefaultFableModel(): ModelName {
   }
   if (process.env.ANTHROPIC_DEFAULT_FABLE_MODEL) {
     return process.env.ANTHROPIC_DEFAULT_FABLE_MODEL
+  }
+  if (shouldUseThirdPartyAnthropicModelDefaults()) {
+    return getDefaultOpusModel()
   }
   return getModelStrings().fable5
 }
@@ -127,10 +139,10 @@ export function getDefaultOpusModel(): ModelName {
   // 3P providers (Bedrock, Vertex, Foundry) — kept as a separate branch
   // even when values match, since 3P availability lags firstParty and
   // these will diverge again at the next model launch.
-  if (getAPIProvider() !== 'firstParty') {
+  if (shouldUseThirdPartyAnthropicModelDefaults()) {
     return getModelStrings().opus46
   }
-  return getModelStrings().opus46
+  return getModelStrings().opus48
 }
 
 // @[MODEL LAUNCH]: Update the default Sonnet model (3P providers may lag so keep defaults unchanged).
@@ -142,10 +154,10 @@ export function getDefaultSonnetModel(): ModelName {
     return process.env.ANTHROPIC_DEFAULT_SONNET_MODEL
   }
   // Default to Sonnet 4.5 for 3P since they may not have 4.6 yet
-  if (getAPIProvider() !== 'firstParty') {
+  if (shouldUseThirdPartyAnthropicModelDefaults()) {
     return getModelStrings().sonnet45
   }
-  return getModelStrings().sonnet46
+  return getModelStrings().sonnet50
 }
 
 // @[MODEL LAUNCH]: Update the default Haiku model (3P providers may lag so keep defaults unchanged).
@@ -194,8 +206,9 @@ export function getRuntimeMainLoopModel(params: {
  * Get the default main loop model setting.
  *
  * This handles the built-in default:
- * - Opus for Max and Team Premium users
- * - Sonnet 4.6 for all other users (including Team Standard, Pro, Enterprise)
+ * - Opus for Anthropic API/PAYG, Max, and Team Premium users
+ * - Sonnet for Pro, Team Standard, and Enterprise subscription users
+ * - Sonnet for third-party providers, where built-in aliases may lag
  *
  * @returns The default model setting to use
  */
@@ -216,6 +229,10 @@ export function getDefaultMainLoopModelSetting(): ModelName | ModelAlias {
     return resolveOpenAICodexModel('opus')
   }
 
+  if (is1PApiCustomer()) {
+    return getDefaultOpusModel()
+  }
+
   // Max users get Opus as default
   if (isMaxSubscriber()) {
     return getDefaultOpusModel() + (isOpus1mMergeEnabled() ? '[1m]' : '')
@@ -226,8 +243,8 @@ export function getDefaultMainLoopModelSetting(): ModelName | ModelAlias {
     return getDefaultOpusModel() + (isOpus1mMergeEnabled() ? '[1m]' : '')
   }
 
-  // PAYG (1P and 3P), Enterprise, Team Standard, and Pro get Sonnet as default
-  // Note that PAYG (3P) may default to an older Sonnet model
+  // Third-party provider defaults and subscription tiers that are not
+  // Opus-defaulted above use Sonnet. Third-party provider aliases may lag.
   return getDefaultSonnetModel()
 }
 
@@ -253,6 +270,9 @@ export function firstPartyNameToCanonical(name: ModelName): ModelShortName {
   if (name.includes('claude-fable-5')) {
     return 'claude-fable-5'
   }
+  if (name.includes('claude-opus-4-8')) {
+    return 'claude-opus-4-8'
+  }
   if (name.includes('claude-opus-4-7')) {
     return 'claude-opus-4-7'
   }
@@ -264,6 +284,9 @@ export function firstPartyNameToCanonical(name: ModelName): ModelShortName {
   }
   if (name.includes('claude-opus-4')) {
     return 'claude-opus-4'
+  }
+  if (name.includes('claude-sonnet-5')) {
+    return 'claude-sonnet-5'
   }
   if (name.includes('claude-sonnet-4-6')) {
     return 'claude-sonnet-4-6'
@@ -329,18 +352,18 @@ export function getClaudeAiUserDefaultModelDescription(
   }
   if (isMaxSubscriber() || isTeamPremiumSubscriber()) {
     if (isOpus1mMergeEnabled()) {
-      return `Opus 4.7 with 1M context · Most capable for complex work${fastMode ? getOpus46PricingSuffix(true) : ''}`
+      return `Opus 4.8 with 1M context · Most capable for complex work${fastMode ? getOpus46PricingSuffix(true) : ''}`
     }
-    return `Opus 4.7 · Most capable for complex work${fastMode ? getOpus46PricingSuffix(true) : ''}`
+    return `Opus 4.8 · Most capable for complex work${fastMode ? getOpus46PricingSuffix(true) : ''}`
   }
-  return 'Sonnet 4.6 · Best for everyday tasks'
+  return 'Sonnet 5 · Best for everyday tasks'
 }
 
 export function renderDefaultModelSetting(
   setting: ModelName | ModelAlias,
 ): string {
   if (setting === 'opusplan') {
-    return 'Opus 4.7 in plan mode, else Sonnet 4.6'
+    return `${renderModelName(getDefaultOpusModel())} in plan mode, else ${renderModelName(getDefaultSonnetModel())}`
   }
   return renderModelName(parseUserSpecifiedModel(setting))
 }
@@ -397,6 +420,10 @@ export function getPublicModelDisplayName(model: ModelName): string | null {
       return 'Fable 5'
     case getModelStrings().fable5 + '[1m]':
       return 'Fable 5 (1M context)'
+    case getModelStrings().opus48:
+      return 'Opus 4.8'
+    case getModelStrings().opus48 + '[1m]':
+      return 'Opus 4.8 (1M context)'
     case getModelStrings().opus46:
       return 'Opus 4.7'
     case getModelStrings().opus46 + '[1m]':
@@ -411,6 +438,10 @@ export function getPublicModelDisplayName(model: ModelName): string | null {
       return 'Sonnet 4.6 (1M context)'
     case getModelStrings().sonnet46:
       return 'Sonnet 4.6'
+    case getModelStrings().sonnet50 + '[1m]':
+      return 'Sonnet 5 (1M context)'
+    case getModelStrings().sonnet50:
+      return 'Sonnet 5'
     case getModelStrings().sonnet45 + '[1m]':
       return 'Sonnet 4.5 (1M context)'
     case getModelStrings().sonnet45:
@@ -634,6 +665,9 @@ export function getMarketingNameForModel(modelId: string): string | undefined {
   if (canonical.includes('claude-fable-5')) {
     return has1m ? 'Fable 5 (with 1M context)' : 'Fable 5'
   }
+  if (canonical.includes('claude-opus-4-8')) {
+    return has1m ? 'Opus 4.8 (with 1M context)' : 'Opus 4.8'
+  }
   if (canonical.includes('claude-opus-4-7')) {
     return has1m ? 'Opus 4.7 (with 1M context)' : 'Opus 4.7'
   }
@@ -645,6 +679,9 @@ export function getMarketingNameForModel(modelId: string): string | undefined {
   }
   if (canonical.includes('claude-opus-4')) {
     return 'Opus 4'
+  }
+  if (canonical.includes('claude-sonnet-5')) {
+    return has1m ? 'Sonnet 5 (with 1M context)' : 'Sonnet 5'
   }
   if (canonical.includes('claude-sonnet-4-6')) {
     return has1m ? 'Sonnet 4.6 (with 1M context)' : 'Sonnet 4.6'

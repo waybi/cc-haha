@@ -1,3 +1,4 @@
+import { Profiler } from 'react'
 import { act, render, screen } from '@testing-library/react'
 import '@testing-library/jest-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -130,6 +131,23 @@ describe('PetRenderer', () => {
     expect(document.querySelector('[data-pet-frame-transition="previous"]')).not.toBeInTheDocument()
   })
 
+  it('updates atlas frames without committing a React render for every frame', () => {
+    vi.useFakeTimers()
+    const commits: string[] = []
+    render(
+      <Profiler id="pet" onRender={(_id, phase) => commits.push(phase)}>
+        <PetRenderer pet={customPet} state="waving" size={96} motionEnabled />
+      </Profiler>,
+    )
+
+    const pet = screen.getByRole('img', { name: 'Mochi' })
+    expect(commits).toHaveLength(1)
+    act(() => vi.advanceTimersByTime(140))
+
+    expect(pet).toHaveAttribute('data-pet-column', '1')
+    expect(commits).toHaveLength(1)
+  })
+
   it('changes rows immediately when the requested state changes', () => {
     vi.useFakeTimers()
     const { rerender } = render(
@@ -144,7 +162,7 @@ describe('PetRenderer', () => {
     expect(pet).toHaveAttribute('data-pet-column', '0')
   })
 
-  it('plays an active row three times, then remains in the slow idle loop', () => {
+  it('plays an active row three times, rests, then starts another work burst', () => {
     vi.useFakeTimers()
     render(<PetRenderer pet={builtinPet} state="running" size={96} motionEnabled />)
 
@@ -159,8 +177,25 @@ describe('PetRenderer', () => {
     expect(pet).toHaveAttribute('data-pet-column', '0')
 
     advanceTimersByDurations([1680, 660, 660, 840, 840, 1920])
-    expect(pet).toHaveAttribute('data-pet-motion-state', 'idle')
-    expect(pet).toHaveAttribute('data-pet-row', '0')
+    expect(pet).toHaveAttribute('data-pet-motion-state', 'running')
+    expect(pet).toHaveAttribute('data-pet-row', '7')
+    expect(pet).toHaveAttribute('data-pet-column', '0')
+  })
+
+  it('adds a calm gesture after two slow idle loops', () => {
+    vi.useFakeTimers()
+    render(<PetRenderer pet={builtinPet} state="idle" size={96} motionEnabled />)
+
+    const pet = screen.getByRole('img', { name: 'Dada' })
+    advanceTimersByDurations([
+      1680, 660, 660, 840, 840, 1920,
+      1680, 660, 660, 840, 840, 1920,
+    ])
+
+    expect(pet).toHaveAttribute('data-pet-state', 'idle')
+    expect(pet).toHaveAttribute('data-pet-motion-state', 'waving')
+    expect(pet).toHaveAttribute('data-pet-motion-phase', 'action')
+    expect(pet).toHaveAttribute('data-pet-row', '3')
     expect(pet).toHaveAttribute('data-pet-column', '0')
   })
 

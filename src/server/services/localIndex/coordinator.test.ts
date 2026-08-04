@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path'
 import type { LocalIndexDatabase } from './database.js'
 import {
   createLocalIndexCoordinator,
+  discoverActivityTranscriptSources,
   discoverTranscriptSources,
   type LocalIndexCoordinator,
 } from './coordinator.js'
@@ -20,7 +21,9 @@ import {
   type ProjectionProgress,
   type SessionProjector,
   type SessionSourceCandidate,
+  SESSION_SUMMARY_PARSER_VERSION,
 } from './sessionProjector.js'
+import { LOCAL_INDEX_SCHEMA_VERSION } from './migrations.js'
 import type {
   ReconciliationWatcher,
   ReconciliationWatcherOptions,
@@ -373,7 +376,7 @@ describe('local index coordinator', () => {
     expect(coordinator.listSessions({ limit: 10 }).sessions[0]?.messageCount).toBe(1)
     expect(coordinator.getSessionEntryLocators?.(first.path, ['user']))
       .toMatchObject({
-        source: { path: first.path, parserVersion: 2 },
+        source: { path: first.path, parserVersion: SESSION_SUMMARY_PARSER_VERSION },
         entries: [{ ordinal: 0, jsonlLine: 1, entryType: 'user' }],
       })
 
@@ -604,6 +607,72 @@ describe('local index coordinator', () => {
       expect(coordinator.isActivityScopeReady()).toBe(true)
     } finally {
       await coordinator.stop()
+    }
+  })
+
+  it('withholds persisted activity totals while a parser upgrade is waiting to rebuild', async () => {
+    const root = await createTempDir('coordinator-activity-parser-upgrade')
+    const configDir = join(root, 'config')
+    const databasePath = join(configDir, 'cc-haha', 'db', 'index-v1.sqlite')
+    const source = await createRealTranscript(
+      configDir,
+      '-repo',
+      'activity-upgrade',
+      'Initial',
+    )
+
+    const createIdleWatcher = (): ReconciliationWatcher => ({
+      async start() {},
+      async stop() {},
+      queueTranscriptPath() {},
+      queueFullSweep() {},
+      getMetrics: () => ({
+        queuedPaths: 0,
+        maxBatchSize: 0,
+        yielded: 0,
+        fullSweeps: 0,
+        watchFailures: 0,
+      }),
+    })
+    const previousVersion = SESSION_SUMMARY_PARSER_VERSION - 1
+    const previousCoordinator = createLocalIndexCoordinator({
+      resolveMode: () => ({ mode: 'on', warningCode: null }),
+      resolveScope: () => configDir,
+      resolveDatabasePath: () => databasePath,
+      createProjector: options => createSessionProjector({
+        ...options,
+        parserVersion: previousVersion,
+      }),
+      createWatcher: createIdleWatcher,
+    })
+
+    await previousCoordinator.start()
+    await waitFor(() => previousCoordinator.isActivityScopeReady())
+    await previousCoordinator.stop()
+
+    let runScheduledDiscovery: (() => void) | undefined
+    const upgradedCoordinator = createLocalIndexCoordinator({
+      resolveMode: () => ({ mode: 'on', warningCode: null }),
+      resolveScope: () => configDir,
+      resolveDatabasePath: () => databasePath,
+      schedule: operation => { runScheduledDiscovery = operation },
+      createWatcher: createIdleWatcher,
+    })
+
+    try {
+      await upgradedCoordinator.start()
+
+      expect(runScheduledDiscovery).toBeDefined()
+      expect(upgradedCoordinator.isActivityScopeReady()).toBe(false)
+      expect(upgradedCoordinator.getActivityStats('all')).toBeNull()
+
+      runScheduledDiscovery?.()
+      await waitFor(() => upgradedCoordinator.isActivityScopeReady())
+      expect(upgradedCoordinator.getActivityStats('all')?.totalMessages).toBe(1)
+      expect(upgradedCoordinator.getSessionEntryLocators?.(source.path)?.source.parserVersion)
+        .toBe(SESSION_SUMMARY_PARSER_VERSION)
+    } finally {
+      await upgradedCoordinator.stop()
     }
   })
 
@@ -853,7 +922,7 @@ describe('local index coordinator', () => {
 
     const { Database } = await import('bun:sqlite')
     const future = new Database(databasePath)
-    future.exec('PRAGMA user_version = 4')
+    future.exec(`PRAGMA user_version = ${LOCAL_INDEX_SCHEMA_VERSION + 1}`)
     future.close(true)
     const unsupported = createCoordinator()
     await unsupported.start()
@@ -2081,3 +2150,67 @@ async function createRealTranscript(
     modifiedAtMs: snapshot.mtimeMs,
   }
 }
+
+describe('discoverActivityTranscriptSources', () => {
+  async function seedSubagentTree(root: string): Promise<void> {
+    const project = join(root, 'projects', '-repo')
+    const session = join(project, 'session-a')
+    await mkdir(join(session, 'subagents', 'workflows', 'wf_abc123'), { recursive: true })
+    await mkdir(join(session, 'subagents', 'nested', 'deeper', 'too-deep'), { recursive: true })
+    await writeFile(join(project, 'session-a.jsonl'), '')
+    await writeFile(join(session, 'subagents', 'agent-plain.jsonl'), '')
+    await writeFile(join(session, 'subagents', 'workflows', 'wf_abc123', 'agent-wf.jsonl'), '')
+    await writeFile(join(session, 'subagents', 'nested', 'agent-nested.jsonl'), '')
+    await writeFile(join(session, 'subagents', 'nested', 'deeper', 'too-deep', 'agent-x.jsonl'), '')
+    // Neither of these is a subagent transcript and both must stay out of the index.
+    await writeFile(join(session, 'subagents', 'notes.txt'), '')
+    await writeFile(join(session, 'subagents', 'summary.jsonl'), '')
+  }
+
+  it('finds workflow agent transcripts nested under subagents/', async () => {
+    const root = await createTempDir('activity-discovery')
+    await seedSubagentTree(root)
+
+    const result = await discoverActivityTranscriptSources(root, new AbortController().signal)
+
+    const names = result.candidates.map(candidate => candidate.path.split('/').pop()).sort()
+    // agent-wf.jsonl lives at subagents/workflows/<wf_id>/ — the level that used to be skipped
+    // entirely, leaving every workflow agent's tokens and tool calls out of the stats.
+    expect(names).toEqual([
+      'agent-nested.jsonl',
+      'agent-plain.jsonl',
+      'agent-wf.jsonl',
+      'session-a.jsonl',
+    ])
+    expect(result.complete).toBe(true)
+  })
+
+  it('attributes nested workflow agents to their owning session', async () => {
+    const root = await createTempDir('activity-discovery-owner')
+    await seedSubagentTree(root)
+
+    const result = await discoverActivityTranscriptSources(root, new AbortController().signal)
+
+    const workflowAgent = result.candidates.find(candidate =>
+      candidate.path.endsWith('agent-wf.jsonl'))
+    expect(workflowAgent).toMatchObject({
+      sessionId: 'session-a',
+      projectPath: '-repo',
+      isSubagent: true,
+    })
+    expect(result.candidates.find(candidate => candidate.path.endsWith('session-a.jsonl')))
+      .toMatchObject({ isSubagent: false })
+  })
+
+  it('stops walking below the bounded subagent depth', async () => {
+    const root = await createTempDir('activity-discovery-depth')
+    await seedSubagentTree(root)
+
+    const result = await discoverActivityTranscriptSources(root, new AbortController().signal)
+
+    // A deeper tree than workflows need is a sign of something unexpected; discovery must not turn
+    // into a full filesystem walk.
+    expect(result.candidates.some(candidate => candidate.path.endsWith('agent-x.jsonl')))
+      .toBe(false)
+  })
+})

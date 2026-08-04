@@ -521,6 +521,7 @@ describe('packaged artifact inspection', () => {
 
     writeFile(rootDir, 'desktop/build-artifacts/electron/Claude-Code-Haha-0.3.1-linux-x86_64.AppImage')
     writeFile(rootDir, 'desktop/build-artifacts/electron/Claude-Code-Haha-0.3.1-linux-amd64.deb')
+    writeFile(rootDir, 'desktop/build-artifacts/electron/Claude-Code-Haha-0.3.1-linux-x86_64.rpm')
     writeFile(rootDir, 'desktop/build-artifacts/electron/linux-unpacked/resources/app.asar')
     writeFile(rootDir, 'desktop/build-artifacts/electron/linux-unpacked/resources/app-update.yml')
     writeFile(rootDir, 'desktop/build-artifacts/electron/linux-unpacked/resources/app.asar.unpacked/src-tauri/binaries/claude-sidecar-x86_64-unknown-linux-gnu')
@@ -536,6 +537,7 @@ describe('packaged artifact inspection', () => {
 
     expect(report.passed).toBe(true)
     expect(report.missingChecks.some((check) => check.label.includes('blockmap'))).toBe(false)
+    expect(report.packagedArtifacts.some((artifact) => artifact.label === 'Linux RPM package')).toBe(true)
   })
 
   test('accepts Electron Builder linux-arm64-unpacked output directory', async () => {
@@ -544,6 +546,7 @@ describe('packaged artifact inspection', () => {
 
     writeFile(rootDir, 'desktop/build-artifacts/electron/Claude-Code-Haha-0.3.1-linux-arm64.AppImage')
     writeFile(rootDir, 'desktop/build-artifacts/electron/Claude-Code-Haha-0.3.1-linux-arm64.deb')
+    writeFile(rootDir, 'desktop/build-artifacts/electron/Claude-Code-Haha-0.3.1-linux-aarch64.rpm')
     writeFile(rootDir, 'desktop/build-artifacts/electron/linux-arm64-unpacked/resources/app.asar')
     writeFile(rootDir, 'desktop/build-artifacts/electron/linux-arm64-unpacked/resources/app-update.yml')
     writeFile(rootDir, 'desktop/build-artifacts/electron/linux-arm64-unpacked/resources/app.asar.unpacked/src-tauri/binaries/claude-sidecar-aarch64-unknown-linux-gnu')
@@ -559,6 +562,7 @@ describe('packaged artifact inspection', () => {
 
     expect(report.passed).toBe(true)
     expect(report.passedChecks.some((check) => check.path.includes('linux-arm64-unpacked/resources/app.asar'))).toBe(true)
+    expect(report.packagedArtifacts.some((artifact) => artifact.label === 'Linux RPM package')).toBe(true)
   })
 
   test('passes Linux directory-only checks for electron-builder --dir output', async () => {

@@ -1,9 +1,10 @@
+import { resolvePromptCacheKey } from '../../server/proxy/promptCacheKey.js'
 import { anthropicToOpenaiResponses } from '../../server/proxy/transform/anthropicToOpenaiResponses.js'
 import { openaiResponsesStreamToAnthropic } from '../../server/proxy/streaming/openaiResponsesStreamToAnthropic.js'
 import { openaiResponsesStreamToAnthropicResponse } from '../../server/proxy/streaming/openaiResponsesStreamToAnthropicResponse.js'
 import type { AnthropicRequest } from '../../server/proxy/transform/types.js'
 import { ensureFreshGrokTokens, forceRefreshGrokTokens } from './refresh.js'
-import { grokModelRejectsReasoningEffort, resolveGrokModel } from './models.js'
+import { resolveGrokModel, resolveGrokReasoningEffort } from './models.js'
 import { getGrokOAuthTokens } from './storage.js'
 
 export const GROK_CLI_BASE_URL = 'https://cli-chat-proxy.grok.com/v1'
@@ -22,6 +23,9 @@ export function buildGrokIdentityHeaders(accessToken: string): Headers {
     'Content-Type': 'application/json',
     'X-XAI-Token-Auth': 'xai-grok-cli',
     'x-grok-client-version': GROK_CLI_VERSION,
+    // The CLI gateway distinguishes interactive sessions from batch traffic;
+    // the official client always declares one.
+    'x-grok-client-mode': 'interactive',
     'User-Agent': `xai-grok-workspace/${GROK_CLI_VERSION}`,
   })
 }
@@ -38,13 +42,26 @@ export function buildGrokFetch(
 
     const originalBody = await readAnthropicBody(input, init)
     const requestedModel = resolveGrokModel(originalBody.model)
-    const transformedBody = anthropicToOpenaiResponses({
-      ...originalBody,
-      model: requestedModel,
-    })
+    // One conversation must route to one cache entry, or every turn re-bills
+    // the whole prefix. xAI reads it from the body; the CLI proxy also keys its
+    // conversation state off a header, so both carry the same identity.
+    const cacheKey = resolvePromptCacheKey(originalBody, readSessionId(input, init))
+    const transformedBody = anthropicToOpenaiResponses(
+      { ...originalBody, model: requestedModel },
+      cacheKey ? { cacheKey } : {},
+    )
     transformedBody.model = requestedModel
     transformedBody.stream = true
-    if (grokModelRejectsReasoningEffort(requestedModel)) {
+    const reasoningEffort = resolveGrokReasoningEffort(
+      requestedModel,
+      transformedBody.reasoning?.effort,
+    )
+    if (reasoningEffort) {
+      transformedBody.reasoning = {
+        ...(transformedBody.reasoning ?? {}),
+        effort: reasoningEffort,
+      }
+    } else {
       delete transformedBody.reasoning
     }
 
@@ -54,8 +71,14 @@ export function buildGrokFetch(
         'Grok OAuth token is missing or expired. Authorize Grok again in the desktop app.',
       )
     }
-    const headers = buildGrokIdentityHeaders(tokens.accessToken)
-    headers.set('x-grok-model-override', requestedModel)
+    const applyRequestIdentity = (requestHeaders: Headers): Headers => {
+      requestHeaders.set('x-grok-model-override', requestedModel)
+      if (cacheKey) requestHeaders.set('x-grok-conv-id', cacheKey)
+      return requestHeaders
+    }
+    const headers = applyRequestIdentity(
+      buildGrokIdentityHeaders(tokens.accessToken),
+    )
 
     void source
     const requestUpstream = (requestHeaders: Headers) => inner(GROK_CLI_API_ENDPOINT, {
@@ -69,9 +92,9 @@ export function buildGrokFetch(
     if (upstream.status === 401) {
       const refreshed = await forceRefreshGrokTokens({ fetchOverride: inner })
       if (refreshed) {
-        const refreshedHeaders = buildGrokIdentityHeaders(refreshed.accessToken)
-        refreshedHeaders.set('x-grok-model-override', requestedModel)
-        upstream = await requestUpstream(refreshedHeaders)
+        upstream = await requestUpstream(
+          applyRequestIdentity(buildGrokIdentityHeaders(refreshed.accessToken)),
+        )
       }
     }
 
@@ -116,6 +139,22 @@ export function buildGrokFetch(
       ),
     )
   }
+}
+
+/**
+ * The CLI stamps its session id on every request as a default header, which is
+ * the last-resort cache identity when the body carries no session metadata.
+ */
+function readSessionId(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+): string | null {
+  const header = 'x-claude-code-session-id'
+  if (init?.headers) {
+    const fromInit = new Headers(init.headers).get(header)
+    if (fromInit) return fromInit
+  }
+  return input instanceof Request ? input.headers.get(header) : null
 }
 
 async function readAnthropicBody(

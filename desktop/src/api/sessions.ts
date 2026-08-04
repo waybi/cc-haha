@@ -1,4 +1,5 @@
 import { api } from './client'
+import type { SlashCommandOption } from '../types/slashCommand'
 import type { AgentTaskNotification } from '../types/chat'
 import type { LocalIndexStatus, SessionListItem, MessageEntry } from '../types/session'
 import type { PermissionMode } from '../types/settings'
@@ -106,6 +107,7 @@ export type SessionRewindResponse = {
     insertions: number
     deletions: number
   }
+  restoreAvailable?: boolean
 }
 
 export type RecentProject = {
@@ -298,6 +300,7 @@ export type SessionTurnCheckpoint = {
   conversation?: SessionRewindResponse['conversation']
   code: SessionRewindResponse['code']
   workDir?: string
+  restoreAvailable?: boolean
 }
 
 export type SessionTurnCheckpointsResponse = {
@@ -387,7 +390,7 @@ export const sessionsApi = {
   },
 
   getSlashCommands(sessionId: string) {
-    return api.get<{ commands: Array<{ name: string; description: string; argumentHint?: string }> }>(`/api/sessions/${sessionId}/slash-commands`)
+    return api.get<{ commands: SlashCommandOption[] }>(`/api/sessions/${sessionId}/slash-commands`)
   },
 
   getInspection(sessionId: string, options?: { includeContext?: boolean; timeout?: number; contextOnly?: boolean }) {

@@ -4,10 +4,10 @@ import * as os from 'os'
 import * as path from 'path'
 
 import {
+  getManagedEnvKeys,
   mergeActiveProviderManagedEnv,
   readActiveProviderManagedEnv,
 } from '../services/providerRuntimeEnv.js'
-import { resolveAppliedEffort } from '../../utils/effort.js'
 import { get3PModelCapabilityOverride } from '../../utils/model/modelSupportOverrides.js'
 
 let tmpDir: string
@@ -56,6 +56,9 @@ describe('providerRuntimeEnv', () => {
     expect(env).toMatchObject({
       CC_HAHA_GROK_OAUTH_PROVIDER: '1',
       GROK_OAUTH_FILE: path.join(tmpDir, 'cc-haha', 'grok-oauth.json'),
+      CC_HAHA_IMAGE_PROVIDER_KIND: 'grok_oauth',
+      CC_HAHA_IMAGE_PROVIDER_ID: 'grok-official',
+      CC_HAHA_IMAGE_MODEL: 'grok-imagine-image-quality',
       ANTHROPIC_MODEL: 'grok-4.5',
       ANTHROPIC_DEFAULT_HAIKU_MODEL: 'grok-4.5',
       ANTHROPIC_DEFAULT_SONNET_MODEL: 'grok-4.5',
@@ -68,7 +71,75 @@ describe('providerRuntimeEnv', () => {
     expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
   })
 
-  test('derives native Anthropic provider env from the active provider index', async () => {
+  test('routes custom image generation through its own optional credentials', async () => {
+    await writeJson(path.join(tmpDir, 'cc-haha', 'providers.json'), {
+      activeId: 'provider-images',
+      providers: [{
+        id: 'provider-images',
+        presetId: 'custom',
+        name: 'Sub2API',
+        apiKey: 'chat-secret',
+        baseUrl: 'https://chat.example.test',
+        apiFormat: 'anthropic',
+        models: {
+          main: 'chat-model',
+          haiku: 'chat-model',
+          sonnet: 'chat-model',
+          opus: 'chat-model',
+        },
+        imageGeneration: {
+          model: '  upstream-image-model  ',
+          baseUrl: '  https://images.example.test/v1  ',
+          apiKey: '  image-secret  ',
+        },
+      }],
+    })
+
+    const env = readActiveProviderManagedEnv(tmpDir)
+    expect(env).toMatchObject({
+      CC_HAHA_IMAGE_PROVIDER_KIND: 'openai_images',
+      CC_HAHA_IMAGE_PROVIDER_ID: 'provider-images',
+      CC_HAHA_IMAGE_BASE_URL: 'https://images.example.test/v1',
+      CC_HAHA_IMAGE_API_KEY: 'image-secret',
+      CC_HAHA_IMAGE_MODEL: 'upstream-image-model',
+    })
+  })
+
+  test('clears stale image routing when the next active provider has no image capability', async () => {
+    await writeJson(path.join(tmpDir, 'cc-haha', 'providers.json'), {
+      activeId: 'provider-chat-only',
+      providers: [{
+        id: 'provider-chat-only',
+        presetId: 'custom',
+        name: 'Chat only',
+        apiKey: 'chat-secret',
+        baseUrl: 'https://chat.example.test',
+        apiFormat: 'anthropic',
+        models: {
+          main: 'chat-model',
+          haiku: 'chat-model',
+          sonnet: 'chat-model',
+          opus: 'chat-model',
+        },
+      }],
+    })
+
+    const env = mergeActiveProviderManagedEnv({
+      CC_HAHA_IMAGE_PROVIDER_KIND: 'openai_images',
+      CC_HAHA_IMAGE_PROVIDER_ID: 'stale-provider',
+      CC_HAHA_IMAGE_BASE_URL: 'https://stale.example.test/v1',
+      CC_HAHA_IMAGE_API_KEY: 'stale-secret',
+      CC_HAHA_IMAGE_MODEL: 'stale-model',
+    }, tmpDir)
+
+    expect(env.CC_HAHA_IMAGE_PROVIDER_KIND).toBeUndefined()
+    expect(env.CC_HAHA_IMAGE_PROVIDER_ID).toBeUndefined()
+    expect(env.CC_HAHA_IMAGE_BASE_URL).toBeUndefined()
+    expect(env.CC_HAHA_IMAGE_API_KEY).toBeUndefined()
+    expect(env.CC_HAHA_IMAGE_MODEL).toBeUndefined()
+  })
+
+  test('keeps Claude Code effort capabilities for an unlisted custom model', async () => {
     await writeJson(path.join(tmpDir, 'cc-haha', 'providers.json'), {
       activeId: 'provider-1',
       providers: [
@@ -82,6 +153,7 @@ describe('providerRuntimeEnv', () => {
           apiFormat: 'anthropic',
           models: {
             main: 'active-main',
+            fable: 'active-fable',
             haiku: '',
             sonnet: 'active-sonnet',
             opus: '',
@@ -98,6 +170,9 @@ describe('providerRuntimeEnv', () => {
       ANTHROPIC_AUTH_TOKEN: 'sk-active',
       ENABLE_TOOL_SEARCH: 'true',
       ANTHROPIC_MODEL: 'active-main',
+      ANTHROPIC_DEFAULT_FABLE_MODEL: 'active-fable',
+      ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES:
+        'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
       ANTHROPIC_DEFAULT_HAIKU_MODEL: 'active-main',
       ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES:
         'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
@@ -127,7 +202,9 @@ describe('providerRuntimeEnv', () => {
       delete process.env.CLAUDE_CODE_EFFORT_LEVEL
       clearCapabilityCache()
 
-      expect(resolveAppliedEffort('active-main', 'xhigh')).toBe('xhigh')
+      expect(get3PModelCapabilityOverride('active-main', 'effort')).toBe(true)
+      expect(get3PModelCapabilityOverride('active-main', 'xhigh_effort')).toBe(true)
+      expect(get3PModelCapabilityOverride('active-main', 'max_effort')).toBe(true)
     } finally {
       for (const key of runtimeKeys) {
         const value = originalRuntimeEnv[key]
@@ -136,6 +213,39 @@ describe('providerRuntimeEnv', () => {
       }
       clearCapabilityCache()
     }
+  })
+
+  test('does not let legacy preset metadata disable compatible model effort', async () => {
+    await writeJson(path.join(tmpDir, 'cc-haha', 'providers.json'), {
+      activeId: 'provider-xuanshu',
+      providers: [
+        {
+          id: 'provider-xuanshu',
+          presetId: 'xuanshuapi',
+          name: 'XuanShu API',
+          apiKey: 'sk-xuanshu',
+          authStrategy: 'auth_token',
+          baseUrl: 'https://www.xuanshuapi.com',
+          apiFormat: 'anthropic',
+          models: {
+            main: 'claude-opus-5',
+            haiku: 'claude-haiku-4-5',
+            sonnet: 'claude-sonnet-5',
+            opus: 'claude-opus-5',
+          },
+        },
+      ],
+    })
+
+    const env = readActiveProviderManagedEnv(tmpDir)
+
+    expect(env).toMatchObject({
+      ANTHROPIC_MODEL: 'claude-opus-5',
+      ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES:
+        'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
+      ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES:
+        'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
+    })
   })
 
   test('active provider env overrides stale proxy settings while preserving unrelated env', async () => {
@@ -327,7 +437,7 @@ describe('providerRuntimeEnv', () => {
       ANTHROPIC_API_KEY: 'sk-kimi',
       ANTHROPIC_MODEL: 'k3',
       ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES:
-        'thinking,required_thinking,effort,max_effort',
+        'thinking,required_thinking,effort,xhigh_effort,max_effort',
     })
     expect(kimiEnv?.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
     expect(JSON.parse(kimiEnv!.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS)).toMatchObject({
@@ -364,7 +474,8 @@ describe('providerRuntimeEnv', () => {
       ANTHROPIC_API_KEY: '',
       ANTHROPIC_AUTH_TOKEN: 'sk-kimi-legacy',
       ANTHROPIC_MODEL: 'kimi-k2.7-code',
-      ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES: 'thinking,required_thinking',
+      ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES:
+        'thinking,required_thinking,effort,xhigh_effort,max_effort',
     })
 
     await writeJson(path.join(tmpDir, 'cc-haha', 'providers.json'), {
@@ -393,11 +504,75 @@ describe('providerRuntimeEnv', () => {
     expect(zhipuEnv).toMatchObject({
       ANTHROPIC_MODEL: 'glm-5.2[1m]',
       ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.7',
-      CLAUDE_CODE_AUTO_COMPACT_WINDOW: '1000000',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES:
+        'thinking,effort,xhigh_effort,max_effort',
+      ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES:
+        'thinking,effort,xhigh_effort,max_effort',
     })
+    // No provider-wide auto-compact window: it is model-agnostic and pinned
+    // small-context models at 1M so auto-compact never fired (#1162).
+    expect(zhipuEnv!.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBeUndefined()
     expect(JSON.parse(zhipuEnv!.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS)).toMatchObject({
       'glm-5.2[1m]': 1000000,
       'glm-4.7': 200000,
+    })
+  })
+
+  // getManagedEnvKeys() is the erase list used to strip stale provider env out of
+  // cc-haha/settings.json. It is built by unioning every preset's defaultEnv keys, so
+  // deleting a preset outright would drop keys only that preset declares — they would
+  // then never be cleaned and would leak into every provider activated afterwards.
+  test('keeps the settings.json erase list covering retired presets env keys', () => {
+    const keys = getManagedEnvKeys()
+
+    // Declared only by the retired 胜算云 preset; a stale 50-minute API_TIMEOUT_MS
+    // leaking into other providers is exactly what this guards.
+    expect(keys).toContain('API_TIMEOUT_MS')
+    expect(keys).toContain('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC')
+  })
+
+  // Retiring a preset must not touch providers already saved against it. defaultEnv is
+  // never persisted per provider — it is resolved from the preset on every run, so
+  // deleting the entry would silently drop it. Older records may also lack
+  // authStrategy / modelContextWindows and fall back to the preset for those too.
+  test('keeps resolving preset runtime env for providers saved against a retired preset', async () => {
+    await writeJson(path.join(tmpDir, 'cc-haha', 'providers.json'), {
+      activeId: 'provider-shengsuanyun',
+      providers: [
+        {
+          id: 'provider-shengsuanyun',
+          presetId: 'shengsuanyun',
+          name: '胜算云',
+          apiKey: 'sk-shengsuanyun',
+          baseUrl: 'https://router.shengsuanyun.com/api',
+          apiFormat: 'anthropic',
+          models: {
+            main: 'anthropic/claude-sonnet-4.6',
+            haiku: 'anthropic/claude-haiku-4.5:thinking',
+            sonnet: 'anthropic/claude-sonnet-4.6',
+            opus: 'anthropic/claude-opus-4.7',
+          },
+        },
+      ],
+    })
+
+    const env = readActiveProviderManagedEnv(tmpDir)
+
+    expect(env).toMatchObject({
+      ANTHROPIC_BASE_URL: 'https://router.shengsuanyun.com/api',
+      ANTHROPIC_MODEL: 'anthropic/claude-sonnet-4.6',
+      // preset defaultEnv survives the retirement
+      API_TIMEOUT_MS: '3000000',
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+      ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES:
+        'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
+    })
+    // preset authStrategy (auth_token) survives: bearer token, blanked api key
+    expect(env?.ANTHROPIC_AUTH_TOKEN).toBe('sk-shengsuanyun')
+    expect(env?.ANTHROPIC_API_KEY).toBe('')
+    expect(JSON.parse(env!.CLAUDE_CODE_MODEL_CONTEXT_WINDOWS)).toMatchObject({
+      'anthropic/claude-sonnet-4.6': 1000000,
+      'anthropic/claude-opus-4.7': 1000000,
     })
   })
 })

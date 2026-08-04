@@ -5,6 +5,7 @@ import { useSettingsStore } from '../stores/settingsStore'
 import { useKeyboardShortcuts } from './useKeyboardShortcuts'
 import { useChatStore, type PerSessionState } from '../stores/chatStore'
 import { useTabStore } from '../stores/tabStore'
+import { useUIStore } from '../stores/uiStore'
 
 function ShortcutHost() {
   useKeyboardShortcuts()
@@ -208,6 +209,181 @@ describe('useKeyboardShortcuts generation stop', () => {
       cancelable: true,
     })
     document.dispatchEvent(event)
+
+    expect(event.defaultPrevented).toBe(false)
+    expect(stopGeneration).not.toHaveBeenCalled()
+  })
+})
+
+describe('useKeyboardShortcuts navigation', () => {
+  const initialTabState = useTabStore.getInitialState()
+  const initialUIState = useUIStore.getInitialState()
+
+  function makeTabs(count: number) {
+    return Array.from({ length: count }, (_, i) => ({
+      sessionId: `s${i + 1}`,
+      title: `Session ${i + 1}`,
+      type: 'session' as const,
+      status: 'idle' as const,
+    }))
+  }
+
+  function dispatch(init: KeyboardEventInit) {
+    const event = new KeyboardEvent('keydown', { bubbles: true, cancelable: true, ...init })
+    document.dispatchEvent(event)
+    return event
+  }
+
+  afterEach(() => {
+    cleanup()
+    useTabStore.setState(initialTabState, true)
+    useUIStore.setState(initialUIState, true)
+  })
+
+  it('jumps to the Nth session and treats 9 as the last one', () => {
+    useTabStore.setState({ tabs: makeTabs(4), activeTabId: 's1' })
+    render(<ShortcutHost />)
+
+    dispatch({ code: 'Digit3', key: '3', metaKey: true })
+    expect(useTabStore.getState().activeTabId).toBe('s3')
+
+    dispatch({ code: 'Digit9', key: '9', metaKey: true })
+    expect(useTabStore.getState().activeTabId).toBe('s4')
+  })
+
+  it('ignores a session index that has no open tab', () => {
+    useTabStore.setState({ tabs: makeTabs(2), activeTabId: 's1' })
+    render(<ShortcutHost />)
+
+    const event = dispatch({ code: 'Digit5', key: '5', metaKey: true })
+
+    expect(event.defaultPrevented).toBe(false)
+    expect(useTabStore.getState().activeTabId).toBe('s1')
+  })
+
+  it('cycles sessions with Cmd+Shift+bracket and wraps at both ends', () => {
+    useTabStore.setState({ tabs: makeTabs(3), activeTabId: 's1' })
+    render(<ShortcutHost />)
+
+    dispatch({ code: 'BracketLeft', key: '{', metaKey: true, shiftKey: true })
+    expect(useTabStore.getState().activeTabId).toBe('s3')
+
+    dispatch({ code: 'BracketRight', key: '}', metaKey: true, shiftKey: true })
+    expect(useTabStore.getState().activeTabId).toBe('s1')
+  })
+
+  it('toggles the sidebar and opens settings', () => {
+    const sidebarBefore = useUIStore.getState().sidebarOpen
+    render(<ShortcutHost />)
+
+    dispatch({ code: 'KeyB', key: 'b', metaKey: true })
+    expect(useUIStore.getState().sidebarOpen).toBe(!sidebarBefore)
+
+    dispatch({ code: 'Comma', key: ',', metaKey: true })
+    const settingsTab = useTabStore.getState().tabs.find((t) => t.type === 'settings')
+    expect(settingsTab).toBeDefined()
+    expect(useTabStore.getState().activeTabId).toBe(settingsTab!.sessionId)
+  })
+
+  it('closes the active session tab and does nothing without one', () => {
+    useTabStore.setState({ tabs: makeTabs(2), activeTabId: 's2' })
+    render(<ShortcutHost />)
+
+    dispatch({ code: 'KeyW', key: 'w', metaKey: true })
+    expect(useTabStore.getState().tabs.map((t) => t.sessionId)).not.toContain('s2')
+
+    useTabStore.setState({ tabs: [], activeTabId: null })
+    const event = dispatch({ code: 'KeyW', key: 'w', metaKey: true })
+    expect(event.defaultPrevented).toBe(false)
+  })
+})
+
+describe('useKeyboardShortcuts escape interrupt', () => {
+  const sessionId = 'session-under-escape'
+  const initialChatState = useChatStore.getInitialState()
+  const initialTabState = useTabStore.getInitialState()
+  const initialUIState = useUIStore.getInitialState()
+  let stopGeneration: ReturnType<typeof vi.fn>
+
+  function dispatchEscape(init: KeyboardEventInit = {}) {
+    const event = new KeyboardEvent('keydown', {
+      key: 'Escape',
+      bubbles: true,
+      cancelable: true,
+      ...init,
+    })
+    document.dispatchEvent(event)
+    return event
+  }
+
+  beforeEach(() => {
+    stopGeneration = vi.fn()
+    useTabStore.setState({
+      activeTabId: sessionId,
+      tabs: [{ sessionId, title: 'Session', type: 'session', status: 'running' }],
+    })
+  })
+
+  afterEach(() => {
+    cleanup()
+    useChatStore.setState(initialChatState, true)
+    useTabStore.setState(initialTabState, true)
+    useUIStore.setState(initialUIState, true)
+  })
+
+  it('interrupts a streaming session when no modal is open', () => {
+    useChatStore.setState({
+      stopGeneration,
+      sessions: { [sessionId]: makeIdleSession({ chatState: 'streaming' }) },
+    })
+    render(<ShortcutHost />)
+
+    const event = dispatchEscape()
+
+    expect(event.defaultPrevented).toBe(true)
+    expect(stopGeneration).toHaveBeenCalledWith(sessionId)
+  })
+
+  it('only closes the modal and leaves generation running', () => {
+    useChatStore.setState({
+      stopGeneration,
+      sessions: { [sessionId]: makeIdleSession({ chatState: 'streaming' }) },
+    })
+    useUIStore.setState({ activeModal: 'globalSearch' })
+    render(<ShortcutHost />)
+
+    dispatchEscape()
+
+    expect(useUIStore.getState().activeModal).toBeNull()
+    expect(stopGeneration).not.toHaveBeenCalled()
+  })
+
+  it('does not interrupt when an inner surface already handled escape', () => {
+    useChatStore.setState({
+      stopGeneration,
+      sessions: { [sessionId]: makeIdleSession({ chatState: 'streaming' }) },
+    })
+    render(<ShortcutHost />)
+
+    const preventer = (event: KeyboardEvent) => event.preventDefault()
+    document.addEventListener('keydown', preventer, true)
+    try {
+      dispatchEscape()
+    } finally {
+      document.removeEventListener('keydown', preventer, true)
+    }
+
+    expect(stopGeneration).not.toHaveBeenCalled()
+  })
+
+  it('does nothing when the session is idle with no background work', () => {
+    useChatStore.setState({
+      stopGeneration,
+      sessions: { [sessionId]: makeIdleSession() },
+    })
+    render(<ShortcutHost />)
+
+    const event = dispatchEscape()
 
     expect(event.defaultPrevented).toBe(false)
     expect(stopGeneration).not.toHaveBeenCalled()

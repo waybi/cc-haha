@@ -675,7 +675,7 @@ export class ProviderService {
       })
 
       const latencyMs = Date.now() - start
-      const resBody = await response.json().catch(() => null) as Record<string, unknown> | null
+      const resBody = await readTestResponseBody(response, format)
 
       if (!response.ok) {
         let error = `HTTP ${response.status}`
@@ -747,7 +747,11 @@ export class ProviderService {
       }
 
       // Transform response back to Anthropic format
-      const responseBody = await response.json()
+      const responseBody = await readTestResponseBody(response, format)
+      if (!responseBody) {
+        return { success: false, latencyMs: Date.now() - start, modelUsed: modelId,
+          error: 'Empty response — not a valid API endpoint' }
+      }
       const anthropicRes = format === 'openai_chat'
         ? openaiChatToAnthropic(responseBody, modelId)
         : openaiResponsesToAnthropic(responseBody, modelId)
@@ -790,10 +794,12 @@ function buildDirectTestRequest(
     }
   }
   if (format === 'openai_responses') {
+    // max_output_tokens is omitted for the same reason the proxy transform omits
+    // it: some Responses-compatible gateways reject the parameter outright.
     return {
       url: `${base}/v1/responses`,
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-      body: { model: modelId, max_output_tokens: 16, input: [{ type: 'message', role: 'user', content: prompt }] },
+      body: { model: modelId, stream: false, store: false, input: [{ type: 'message', role: 'user', content: prompt }] },
     }
   }
   // anthropic
@@ -820,6 +826,84 @@ function buildAnthropicAuthHeaders(apiKey: string, authStrategy: ProviderAuthStr
     case 'dual_dummy':
       return { 'x-api-key': 'dummy', Authorization: 'Bearer dummy' }
   }
+}
+
+/**
+ * Read a connectivity-test response body.
+ *
+ * Some OpenAI-compatible gateways always answer with an SSE stream, even when
+ * the request asked for `stream: false`. Parsing those with `response.json()`
+ * yields null and the endpoint looks dead, so collect the stream through the
+ * same transform the proxy uses and validate the collected result instead.
+ */
+async function readTestResponseBody(
+  response: Response,
+  format: ApiFormat,
+): Promise<Record<string, unknown> | null> {
+  const isEventStream = (response.headers.get('content-type') || '')
+    .toLowerCase()
+    .includes('text/event-stream')
+
+  if (!isEventStream || format === 'anthropic') {
+    return await response.json().catch(() => null) as Record<string, unknown> | null
+  }
+
+  const text = await response.text().catch(() => '')
+  if (!text) return null
+
+  const collected = collectSseTerminalPayload(text)
+  if (collected) return collected
+
+  try {
+    return JSON.parse(text) as Record<string, unknown>
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Pull the meaningful payload out of an SSE transcript: the terminal
+ * `response.completed`/`[DONE]`-style frame when present, otherwise the first
+ * frame carrying an error so the real upstream message reaches the user.
+ */
+function collectSseTerminalPayload(text: string): Record<string, unknown> | null {
+  let lastCompleted: Record<string, unknown> | null = null
+  let firstError: Record<string, unknown> | null = null
+  let lastChunk: Record<string, unknown> | null = null
+
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed.startsWith('data:')) continue
+    const payload = trimmed.slice(5).trim()
+    if (!payload || payload === '[DONE]') continue
+
+    let data: Record<string, unknown>
+    try {
+      data = JSON.parse(payload) as Record<string, unknown>
+    } catch {
+      continue
+    }
+
+    const inner = data.response
+    const innerRecord = inner && typeof inner === 'object' && !Array.isArray(inner)
+      ? inner as Record<string, unknown>
+      : null
+
+    if (!firstError) {
+      if (innerRecord?.error && typeof innerRecord.error === 'object') {
+        firstError = { error: innerRecord.error }
+      } else if (data.error && typeof data.error === 'object') {
+        firstError = { error: data.error }
+      }
+    }
+
+    if (innerRecord && Array.isArray(innerRecord.output)) {
+      lastCompleted = innerRecord
+    }
+    lastChunk = data
+  }
+
+  return firstError ?? lastCompleted ?? lastChunk
 }
 
 function validateResponseBody(

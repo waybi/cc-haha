@@ -2082,6 +2082,80 @@ describe('ProviderService', () => {
       }
     })
 
+    test('accepts SSE-only gateways that ignore stream:false during Responses tests', async () => {
+      const originalFetch = globalThis.fetch
+      const calls: Array<{ url: string; body: Record<string, unknown> }> = []
+      const sse = [
+        'event: response.created',
+        'data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress","output":[]}}',
+        '',
+        'event: response.output_text.delta',
+        'data: {"type":"response.output_text.delta","delta":"ok"}',
+        '',
+        'event: response.completed',
+        'data: {"type":"response.completed","response":{"id":"resp_1","object":"response","created_at":0,"model":"gateway-model","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}}',
+        '',
+      ].join('\n')
+      globalThis.fetch = mock(async (url: string | URL | Request, init?: RequestInit) => {
+        calls.push({
+          url: String(url),
+          body: JSON.parse(String(init?.body)) as Record<string, unknown>,
+        })
+        return new Response(sse, {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        })
+      }) as typeof fetch
+
+      try {
+        const svc = new ProviderService()
+        const result = await svc.testProviderConfig({
+          baseUrl: 'http://127.0.0.1:61444',
+          apiKey: 'gateway-key',
+          modelId: 'gateway-model',
+          authStrategy: 'api_key',
+          apiFormat: 'openai_responses',
+        })
+
+        expect(result.connectivity.success).toBe(true)
+        expect(result.connectivity.error).toBeUndefined()
+        expect(result.proxy?.success).toBe(true)
+        expect(result.connectivity.modelUsed).toBe('gateway-model')
+        expect(calls[0].body.max_output_tokens).toBeUndefined()
+      } finally {
+        globalThis.fetch = originalFetch
+      }
+    })
+
+    test('surfaces the upstream error message from an SSE-only failure frame', async () => {
+      const originalFetch = globalThis.fetch
+      const sse = [
+        'event: response.failed',
+        'data: {"type":"response.failed","response":{"error":{"type":"invalid_request_error","message":"Unsupported parameter: max_output_tokens"}}}',
+        '',
+      ].join('\n')
+      globalThis.fetch = mock(async () => new Response(sse, {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' },
+      })) as typeof fetch
+
+      try {
+        const svc = new ProviderService()
+        const result = await svc.testProviderConfig({
+          baseUrl: 'http://127.0.0.1:61444',
+          apiKey: 'gateway-key',
+          modelId: 'gateway-model',
+          authStrategy: 'api_key',
+          apiFormat: 'openai_responses',
+        })
+
+        expect(result.connectivity.success).toBe(false)
+        expect(result.connectivity.error).toBe('Unsupported parameter: max_output_tokens')
+      } finally {
+        globalThis.fetch = originalFetch
+      }
+    })
+
     test('bypasses manual proxy options when testing loopback provider endpoints', async () => {
       await fs.writeFile(
         path.join(tmpDir, 'settings.json'),

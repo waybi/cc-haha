@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useCallback, useEffect, useRef } from 'react'
 import { useSessionStore } from '../stores/sessionStore'
 import { useChatStore } from '../stores/chatStore'
 import { useTabStore } from '../stores/tabStore'
@@ -9,10 +9,11 @@ import {
 } from '../lib/appZoom'
 import { useSettingsStore } from '../stores/settingsStore'
 import { hasRunningSubagentTasks } from '../lib/backgroundTasks'
+import { useTranslation } from '../i18n'
 
 export function useKeyboardShortcuts() {
-  const setActiveSession = useSessionStore((s) => s.setActiveSession)
-  const setActiveView = useUIStore((s) => s.setActiveView)
+  const t = useTranslation()
+  const addToast = useUIStore((s) => s.addToast)
   const openModal = useUIStore((s) => s.openModal)
   const closeModal = useUIStore((s) => s.closeModal)
   const activeModal = useUIStore((s) => s.activeModal)
@@ -38,6 +39,28 @@ export function useKeyboardShortcuts() {
   const appZoomLevelRef = useRef(uiZoom)
   appZoomLevelRef.current = uiZoom
 
+  // Mirrors the sidebar's "New session" action: a session only exists once it
+  // has a tab and a live connection, so setting an active id is not enough.
+  const openNewSession = useCallback(async () => {
+    const tabStore = useTabStore.getState()
+    const sessionStore = useSessionStore.getState()
+    const currentSession = tabStore.activeTabId
+      ? sessionStore.sessions.find((session) => session.id === tabStore.activeTabId)
+      : null
+    try {
+      const sessionId = await sessionStore.createSession(
+        currentSession?.workDir || currentSession?.projectRoot || undefined,
+      )
+      tabStore.openTab(sessionId, t('sidebar.newSession'))
+      useChatStore.getState().connectToSession(sessionId)
+    } catch (error) {
+      addToast({
+        type: 'error',
+        message: error instanceof Error ? error.message : t('sidebar.sessionListFailed'),
+      })
+    }
+  }, [addToast, t])
+
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       const zoomAction = getAppZoomKeyboardAction(e)
@@ -54,8 +77,7 @@ export function useKeyboardShortcuts() {
       // Cmd+N — New session
       if (meta && e.key === 'n') {
         e.preventDefault()
-        setActiveSession(null)
-        setActiveView('code')
+        void openNewSession()
       }
 
       // Cmd+B — Toggle sidebar
@@ -70,17 +92,25 @@ export function useKeyboardShortcuts() {
         openModal('globalSearch')
       }
 
-      // Ctrl+F — Open find-in-page bar
+      // Cmd+F — Open find-in-page bar
       if (meta && e.key === 'f') {
         e.preventDefault()
         openModal('findInPage')
       }
 
-      // Escape — Close modal or clear state
+      // Escape — Close the modal, or stop generation when nothing is layered on top.
+      // `defaultPrevented` means a closer handler (the composer's slash/file
+      // menus) already consumed the key, so Escape stays a "dismiss" there.
       if (e.key === 'Escape') {
         if (activeModalRef.current) {
           closeModal()
+          return
         }
+        if (!e.defaultPrevented && canStopActiveSessionRef.current && activeTabIdRef.current) {
+          e.preventDefault()
+          stopGeneration(activeTabIdRef.current)
+        }
+        return
       }
 
       // Cmd+. — Stop generation
@@ -94,5 +124,5 @@ export function useKeyboardShortcuts() {
 
     document.addEventListener('keydown', handler)
     return () => document.removeEventListener('keydown', handler)
-  }, [closeModal, openModal, setActiveSession, setActiveView, setUiZoom, stopGeneration, toggleSidebar])
+  }, [closeModal, openModal, openNewSession, setUiZoom, stopGeneration, toggleSidebar])
 }

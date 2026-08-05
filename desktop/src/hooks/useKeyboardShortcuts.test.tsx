@@ -5,6 +5,8 @@ import { useSettingsStore } from '../stores/settingsStore'
 import { useKeyboardShortcuts } from './useKeyboardShortcuts'
 import { useChatStore, type PerSessionState } from '../stores/chatStore'
 import { useTabStore } from '../stores/tabStore'
+import { useUIStore } from '../stores/uiStore'
+import { useSessionStore } from '../stores/sessionStore'
 
 function ShortcutHost() {
   useKeyboardShortcuts()
@@ -128,6 +130,44 @@ describe('useKeyboardShortcuts app zoom', () => {
   })
 })
 
+describe('useKeyboardShortcuts new session', () => {
+  const sessionId = 'current-session'
+  const initialChatState = useChatStore.getInitialState()
+  const initialTabState = useTabStore.getInitialState()
+  const initialSessionState = useSessionStore.getInitialState()
+
+  afterEach(() => {
+    cleanup()
+    useChatStore.setState(initialChatState, true)
+    useTabStore.setState(initialTabState, true)
+    useSessionStore.setState(initialSessionState, true)
+  })
+
+  it('opens and connects a tab for the session Cmd+N creates', async () => {
+    const createSession = vi.fn().mockResolvedValue('created-session')
+    const connectToSession = vi.fn()
+    useSessionStore.setState({
+      createSession,
+      sessions: [{ id: sessionId, workDir: '/repo' } as never],
+    })
+    useChatStore.setState({ connectToSession })
+    useTabStore.setState({
+      activeTabId: sessionId,
+      tabs: [{ sessionId, title: 'Session', type: 'session', status: 'idle' }],
+    })
+    render(<ShortcutHost />)
+
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'n', metaKey: true, bubbles: true, cancelable: true }))
+
+    await waitFor(() => {
+      expect(connectToSession).toHaveBeenCalledWith('created-session')
+    })
+    expect(createSession).toHaveBeenCalledWith('/repo')
+    expect(useTabStore.getState().activeTabId).toBe('created-session')
+    expect(useTabStore.getState().tabs.some((tab) => tab.sessionId === 'created-session')).toBe(true)
+  })
+})
+
 describe('useKeyboardShortcuts generation stop', () => {
   const sessionId = 'session-with-background-work'
   const initialChatState = useChatStore.getInitialState()
@@ -146,6 +186,7 @@ describe('useKeyboardShortcuts generation stop', () => {
     cleanup()
     useChatStore.setState(initialChatState, true)
     useTabStore.setState(initialTabState, true)
+    useUIStore.setState({ activeModal: null })
   })
 
   it.each([
@@ -180,6 +221,47 @@ describe('useKeyboardShortcuts generation stop', () => {
 
     expect(event.defaultPrevented).toBe(true)
     expect(stopGeneration).toHaveBeenCalledWith(sessionId)
+  })
+
+  it('uses Escape to stop a generating session', () => {
+    useChatStore.setState({
+      stopGeneration,
+      sessions: { [sessionId]: makeIdleSession({ chatState: 'streaming' }) },
+    })
+    render(<ShortcutHost />)
+
+    const event = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })
+    document.dispatchEvent(event)
+
+    expect(stopGeneration).toHaveBeenCalledWith(sessionId)
+  })
+
+  it('leaves Escape to the composer menus that already consumed it', () => {
+    useChatStore.setState({
+      stopGeneration,
+      sessions: { [sessionId]: makeIdleSession({ chatState: 'streaming' }) },
+    })
+    render(<ShortcutHost />)
+
+    const event = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })
+    event.preventDefault()
+    document.dispatchEvent(event)
+
+    expect(stopGeneration).not.toHaveBeenCalled()
+  })
+
+  it('closes an open modal with Escape instead of stopping generation', () => {
+    useChatStore.setState({
+      stopGeneration,
+      sessions: { [sessionId]: makeIdleSession({ chatState: 'streaming' }) },
+    })
+    useUIStore.setState({ activeModal: 'globalSearch' })
+    render(<ShortcutHost />)
+
+    fireEvent.keyDown(document, { key: 'Escape' })
+
+    expect(stopGeneration).not.toHaveBeenCalled()
+    expect(useUIStore.getState().activeModal).toBeNull()
   })
 
   it.each(['local_bash', 'dream'])('does not stop an idle session for a running %s task', (taskType) => {

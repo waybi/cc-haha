@@ -4,6 +4,8 @@ import { get3PModelCapabilityOverride } from './modelSupportOverrides.js'
 const ENV_KEYS = [
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_MODEL',
+  'ANTHROPIC_MODEL_SUPPORTED_CAPABILITIES',
   'ANTHROPIC_DEFAULT_SONNET_MODEL',
   'ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES',
 ] as const
@@ -45,6 +47,18 @@ describe('third-party model capability overrides', () => {
       expect(get3PModelCapabilityOverride(runtimeModel, 'xhigh_effort')).toBe(true)
       expect(get3PModelCapabilityOverride(runtimeModel, 'max_effort')).toBe(true)
     }
+  })
+
+  test('honors capabilities pinned on the main model env var', () => {
+    process.env.ANTHROPIC_MODEL = 'claude-opus-5[1m]'
+    process.env.ANTHROPIC_MODEL_SUPPORTED_CAPABILITIES =
+      'thinking,effort,adaptive_thinking,xhigh_effort,max_effort'
+    process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = 'gpt-5.6-sol'
+    clearCapabilityCache()
+
+    expect(get3PModelCapabilityOverride('claude-opus-5', 'effort')).toBe(true)
+    expect(get3PModelCapabilityOverride('claude-opus-5', 'xhigh_effort')).toBe(true)
+    expect(get3PModelCapabilityOverride('claude-opus-5', 'max_effort')).toBe(true)
   })
 
   test('does not collapse distinct provider namespaces while removing 1M markers', () => {

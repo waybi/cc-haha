@@ -44,6 +44,7 @@ export const MANAGED_PROVIDER_ENV_KEYS = [
   'ENABLE_TOOL_SEARCH',
   'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS',
   'ANTHROPIC_MODEL',
+  'ANTHROPIC_MODEL_SUPPORTED_CAPABILITIES',
   'ANTHROPIC_DEFAULT_FABLE_MODEL',
   'ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION',
   'ANTHROPIC_DEFAULT_FABLE_MODEL_NAME',
@@ -337,6 +338,15 @@ function getProviderCapabilityEnv(
 ): Record<string, string> {
   const apiFormat = provider.apiFormat ?? 'anthropic'
   return {
+    // The main model is pinned via ANTHROPIC_MODEL, not one of the role slots,
+    // so without its own declaration it gets no third-party capability override
+    // and effort levels like `max` are clamped back to `high`.
+    ...(models.main
+      ? {
+          ANTHROPIC_MODEL_SUPPORTED_CAPABILITIES:
+            getClaudeCodeModelCapabilities(models.main, apiFormat),
+        }
+      : {}),
     ...(models.fable
       ? {
           ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES:

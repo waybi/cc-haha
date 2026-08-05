@@ -248,6 +248,59 @@ describe('providerRuntimeEnv', () => {
     })
   })
 
+  test('declares capabilities for a main model that no role slot points at', async () => {
+    await writeJson(path.join(tmpDir, 'cc-haha', 'providers.json'), {
+      activeId: 'provider-main-only',
+      providers: [
+        {
+          id: 'provider-main-only',
+          presetId: 'custom',
+          name: 'Main Only',
+          apiKey: 'sk-main',
+          authStrategy: 'auth_token',
+          baseUrl: 'https://provider.example.test/anthropic',
+          apiFormat: 'anthropic',
+          models: {
+            main: 'claude-opus-5',
+            haiku: 'gpt-5.4-mini',
+            sonnet: 'gpt-5.6-sol',
+            opus: 'claude-fable-5',
+          },
+        },
+      ],
+    })
+
+    const env = readActiveProviderManagedEnv(tmpDir)
+
+    expect(env).toMatchObject({
+      ANTHROPIC_MODEL: 'claude-opus-5',
+      ANTHROPIC_MODEL_SUPPORTED_CAPABILITIES:
+        'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
+    })
+
+    const runtimeKeys = [
+      'ANTHROPIC_BASE_URL',
+      'ANTHROPIC_MODEL',
+      'ANTHROPIC_MODEL_SUPPORTED_CAPABILITIES',
+    ] as const
+    const originalRuntimeEnv = Object.fromEntries(
+      runtimeKeys.map(key => [key, process.env[key]]),
+    )
+    try {
+      for (const key of runtimeKeys) process.env[key] = env![key]
+      clearCapabilityCache()
+
+      expect(get3PModelCapabilityOverride('claude-opus-5', 'max_effort')).toBe(true)
+    } finally {
+      for (const key of runtimeKeys) {
+        const value = originalRuntimeEnv[key]
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+      clearCapabilityCache()
+    }
+  })
+
   test('active provider env overrides stale proxy settings while preserving unrelated env', async () => {
     await writeJson(path.join(tmpDir, 'cc-haha', 'providers.json'), {
       activeId: 'provider-1',

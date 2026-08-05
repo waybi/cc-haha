@@ -11,6 +11,11 @@ export type ModelReasoningApiFormat = 'anthropic' | 'openai_chat' | 'openai_resp
 
 export const MODEL_REASONING_CAPABILITY_TIERS = [
   {
+    slot: 'main',
+    modelEnvVar: 'ANTHROPIC_MODEL',
+    capabilitiesEnvVar: 'ANTHROPIC_MODEL_SUPPORTED_CAPABILITIES',
+  },
+  {
     slot: 'fable',
     modelEnvVar: 'ANTHROPIC_DEFAULT_FABLE_MODEL',
     capabilitiesEnvVar: 'ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES',

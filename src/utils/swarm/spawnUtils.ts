@@ -117,6 +117,7 @@ const TEAMMATE_ENV_VARS = [
   'DISABLE_INTERLEAVED_THINKING',
   // Provider role mappings and their declared capabilities are needed when a
   // selected Agent uses a family alias in a separate tmux process.
+  'ANTHROPIC_MODEL_SUPPORTED_CAPABILITIES',
   'ANTHROPIC_DEFAULT_FABLE_MODEL',
   'ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES',
   'ANTHROPIC_DEFAULT_HAIKU_MODEL',

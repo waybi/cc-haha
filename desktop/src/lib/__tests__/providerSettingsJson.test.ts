@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import {
   API_KEY_JSON_PLACEHOLDER,
   maskSettingsJsonSecrets,
+  readUpstreamBaseUrlFromSettingsEnv,
   restoreSettingsJsonSecrets,
   stripProviderSettingsJsonEnv,
 } from '../providerSettingsJson'
@@ -80,5 +81,36 @@ describe('provider settings JSON helpers', () => {
     )
 
     expect(cleaned).toEqual({ USER_DEFINED: 'keep-me' })
+  })
+
+  it('keeps a real upstream base url from settings env', () => {
+    expect(
+      readUpstreamBaseUrlFromSettingsEnv(
+        { ANTHROPIC_BASE_URL: 'http://127.0.0.1:61444' },
+        'http://127.0.0.1:51091/proxy',
+      ),
+    ).toBe('http://127.0.0.1:61444')
+  })
+
+  it('refuses the local provider proxy url as an upstream base url', () => {
+    for (const value of [
+      'http://127.0.0.1:51091/proxy',
+      'http://127.0.0.1:51091/proxy/',
+      '  HTTP://127.0.0.1:51091/PROXY  ',
+    ]) {
+      expect(
+        readUpstreamBaseUrlFromSettingsEnv({ ANTHROPIC_BASE_URL: value }, 'http://127.0.0.1:51091/proxy'),
+      ).toBeNull()
+    }
+  })
+
+  it('returns null when settings env carries no usable base url', () => {
+    expect(readUpstreamBaseUrlFromSettingsEnv({}, 'http://127.0.0.1:51091/proxy')).toBeNull()
+    expect(
+      readUpstreamBaseUrlFromSettingsEnv({ ANTHROPIC_BASE_URL: '   ' }, 'http://127.0.0.1:51091/proxy'),
+    ).toBeNull()
+    expect(
+      readUpstreamBaseUrlFromSettingsEnv({ ANTHROPIC_BASE_URL: 42 }, 'http://127.0.0.1:51091/proxy'),
+    ).toBeNull()
   })
 })

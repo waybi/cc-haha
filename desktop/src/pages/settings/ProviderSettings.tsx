@@ -32,7 +32,7 @@ import { BUILT_IN_PROVIDER_IDS, CLAUDE_OFFICIAL_PROVIDER_ID, OPENAI_OFFICIAL_PRO
 import { GROK_OFFICIAL_PROVIDER_ID } from '../../constants/grokOfficialProvider'
 import { getBaseUrl } from '../../api/client'
 import { getDesktopHost } from '../../lib/desktopHost'
-import { API_KEY_JSON_PLACEHOLDER, maskSettingsJsonSecrets, restoreSettingsJsonSecrets, stripProviderSettingsJsonEnv } from '../../lib/providerSettingsJson'
+import { API_KEY_JSON_PLACEHOLDER, maskSettingsJsonSecrets, readUpstreamBaseUrlFromSettingsEnv, restoreSettingsJsonSecrets, stripProviderSettingsJsonEnv } from '../../lib/providerSettingsJson'
 import { SETTINGS_CHECKBOX_INPUT_CLASS, SettingsCheckboxMark } from '../settings/shared'
 
 /**
@@ -1957,7 +1957,7 @@ function ProviderFormModal({ open, onClose, mode, provider, presets }: ProviderF
                 // Auto-fill form fields from parsed JSON env
                 const env = parsed.env as Record<string, string> | undefined
                 if (env) {
-                  const baseUrl = env.ANTHROPIC_BASE_URL
+                  const baseUrl = readUpstreamBaseUrlFromSettingsEnv(env, providerProxyBaseUrl)
                   if (baseUrl) {
                     setBaseUrl(baseUrl)
                     // Auto-switch to matching preset or Custom

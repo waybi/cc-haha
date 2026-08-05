@@ -99,6 +99,25 @@ export function restoreSettingsJsonSecrets<T>(
   return settings
 }
 
+function normalizeBaseUrlForCompare(value: string): string {
+  return value.trim().replace(/\/+$/, '').toLowerCase()
+}
+
+export function readUpstreamBaseUrlFromSettingsEnv(
+  env: Record<string, unknown>,
+  proxyBaseUrl: string,
+): string | null {
+  const value = env.ANTHROPIC_BASE_URL
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (trimmed === '') return null
+  const normalizedProxy = normalizeBaseUrlForCompare(proxyBaseUrl)
+  if (normalizedProxy !== '' && normalizeBaseUrlForCompare(trimmed) === normalizedProxy) {
+    return null
+  }
+  return trimmed
+}
+
 export function stripProviderSettingsJsonEnv(
   env: Record<string, string>,
   extraManagedKeys: Iterable<string> = [],

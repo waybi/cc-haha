@@ -355,6 +355,7 @@ export type DesktopHost = {
     isMaximized(): Promise<boolean>
     onResized(handler: () => void): Promise<DesktopHostUnlisten>
     onNativeMenuNavigate(handler: (destination: string) => void): Promise<DesktopHostUnlisten>
+    onNativeMenuCloseTab(handler: () => void): Promise<DesktopHostUnlisten>
   }
   terminal: {
     spawn(options: TerminalSpawnOptions): Promise<TerminalSession>

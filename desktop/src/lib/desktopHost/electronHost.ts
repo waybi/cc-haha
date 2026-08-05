@@ -166,6 +166,7 @@ export function createElectronHost(bridge: ElectronHostBridge): DesktopHost {
       isMaximized: () => invoke(ELECTRON_IPC_CHANNELS.windowIsMaximized),
       onResized: handler => subscribe(ELECTRON_EVENT_CHANNELS.windowResized, handler),
       onNativeMenuNavigate: handler => subscribe(ELECTRON_EVENT_CHANNELS.nativeMenuNavigate, handler),
+      onNativeMenuCloseTab: handler => subscribe(ELECTRON_EVENT_CHANNELS.nativeMenuCloseTab, handler),
     },
     terminal: {
       spawn: options => invoke(ELECTRON_IPC_CHANNELS.terminalSpawn, options),

@@ -19,7 +19,7 @@ type RendererContextMenuParams = {
 
 type ApplicationMenuActions = {
   hide?: () => void
-  close?: () => void
+  closeTab?: () => void
   toggleFullScreen?: () => void
 }
 
@@ -84,7 +84,10 @@ export function buildApplicationMenuTemplate(
       submenu: [
         { role: 'minimize' },
         { role: 'zoom' },
-        { label: 'Close Window', accelerator: 'CmdOrCtrl+W', click: () => actions.close?.() },
+        // Closes the active tab, not the window: the window's own close is
+        // intercepted into a hide (see `windows.ts`), so Cmd+W used to make the
+        // whole app vanish instead of dismissing what the user was looking at.
+        { label: 'Close Tab', accelerator: 'CmdOrCtrl+W', click: () => actions.closeTab?.() },
       ],
     },
   ]
@@ -144,8 +147,8 @@ export async function installApplicationMenu(
       }
       hideWindowSafely(window, () => app.hide?.())
     },
-    close: () => {
-      getMainWindow()?.close()
+    closeTab: () => {
+      getMainWindow()?.webContents.send(ELECTRON_EVENT_CHANNELS.nativeMenuCloseTab)
     },
     toggleFullScreen: () => {
       const window = getMainWindow()

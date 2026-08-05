@@ -185,6 +185,21 @@ export function AppShell() {
     return () => { unlisten?.() }
   }, [])
 
+  // Cmd+W arrives as a menu event rather than a key press, because a menu
+  // accelerator wins over the renderer's own keydown handling.
+  useEffect(() => {
+    const host = getDesktopHost()
+    if (!host.isDesktop) return
+    let unlisten: (() => void) | undefined
+    host.window.onNativeMenuCloseTab(() => {
+      const { activeTabId: openTabId, closeTab } = useTabStore.getState()
+      if (openTabId) closeTab(openTabId)
+    })
+      .then((fn) => { unlisten = fn })
+      .catch(() => {})
+    return () => { unlisten?.() }
+  }, [])
+
   useEffect(() => {
     const host = getDesktopHost()
     if (!host.isDesktop || !host.pets) return

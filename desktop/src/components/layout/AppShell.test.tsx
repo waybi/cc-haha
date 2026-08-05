@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   setActiveTab: vi.fn(),
   openTab: vi.fn(),
   openTraceTab: vi.fn(),
+  closeTab: vi.fn(),
   getDesktopUiPreferences: vi.fn(),
   updatePetPreferences: vi.fn(),
   tabState: {
@@ -62,6 +63,7 @@ vi.mock('../../stores/tabStore', () => {
     tabs: mocks.tabState.tabs,
     openTab: mocks.openTab,
     openTraceTab: mocks.openTraceTab,
+    closeTab: mocks.closeTab,
     setActiveTab: mocks.setActiveTab,
   })
   useTabStore.setState = (next: { activeTabId?: string | null }) => {
@@ -398,6 +400,7 @@ describe('AppShell boot flow', () => {
       isDesktop: true,
       window: {
         onNativeMenuNavigate,
+        onNativeMenuCloseTab: vi.fn().mockResolvedValue(vi.fn()),
       },
     } as any
 
@@ -412,6 +415,60 @@ describe('AppShell boot flow', () => {
 
     expect(useUIStore.getState().pendingSettingsTab).toBe('about')
     expect(mocks.openTab).toHaveBeenCalledWith('__settings__', 'Settings', 'settings')
+  })
+
+  it('closes the active tab when the native menu asks for it', async () => {
+    let requestCloseTab: (() => void) | undefined
+    const onNativeMenuCloseTab = vi.fn((handler: () => void) => {
+      requestCloseTab = handler
+      return Promise.resolve(vi.fn())
+    })
+    mocks.tabState.activeTabId = 'session-to-close'
+    window.desktopHost = {
+      isDesktop: true,
+      window: {
+        onNativeMenuNavigate: vi.fn().mockResolvedValue(vi.fn()),
+        onNativeMenuCloseTab,
+      },
+    } as any
+
+    render(<AppShell />)
+
+    await screen.findByText('sidebar loaded')
+    await waitFor(() => expect(onNativeMenuCloseTab).toHaveBeenCalledTimes(1))
+
+    act(() => {
+      requestCloseTab?.()
+    })
+
+    expect(mocks.closeTab).toHaveBeenCalledWith('session-to-close')
+  })
+
+  it('ignores a native close-tab request when no tab is open', async () => {
+    let requestCloseTab: (() => void) | undefined
+    const onNativeMenuCloseTab = vi.fn((handler: () => void) => {
+      requestCloseTab = handler
+      return Promise.resolve(vi.fn())
+    })
+    mocks.tabState.activeTabId = null
+    window.desktopHost = {
+      isDesktop: true,
+      window: {
+        onNativeMenuNavigate: vi.fn().mockResolvedValue(vi.fn()),
+        onNativeMenuCloseTab,
+      },
+    } as any
+
+    render(<AppShell />)
+
+    await screen.findByText('sidebar loaded')
+    await waitFor(() => expect(onNativeMenuCloseTab).toHaveBeenCalledTimes(1))
+
+    act(() => {
+      requestCloseTab?.()
+    })
+
+    expect(mocks.closeTab).not.toHaveBeenCalled()
   })
 
   it('restores an enabled pet window and routes pet session navigation', async () => {
@@ -445,6 +502,7 @@ describe('AppShell boot flow', () => {
       },
       window: {
         onNativeMenuNavigate: vi.fn().mockResolvedValue(vi.fn()),
+        onNativeMenuCloseTab: vi.fn().mockResolvedValue(vi.fn()),
       },
     } as any
 

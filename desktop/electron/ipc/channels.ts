@@ -75,6 +75,7 @@ export const ELECTRON_EVENT_CHANNELS = {
   updateDownloadEvent: 'desktop:update:download-event',
   windowResized: 'desktop:window:resized',
   nativeMenuNavigate: 'desktop:window:native-menu-navigate',
+  nativeMenuCloseTab: 'desktop:window:native-menu-close-tab',
   terminalOutput: 'desktop:terminal:output',
   terminalExit: 'desktop:terminal:exit',
   previewEvent: 'desktop:preview:event',

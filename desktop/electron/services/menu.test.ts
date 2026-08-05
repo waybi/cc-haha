@@ -172,18 +172,20 @@ describe('Electron application menu service', () => {
     expect(hide).toHaveBeenCalledTimes(1)
   })
 
-  it('routes the Window close accelerator through the provided close action', () => {
-    const close = vi.fn()
-    const template = buildApplicationMenuTemplate('Claude Code Haha', vi.fn(), 'darwin', { close })
-    const closeItem = template
+  it('routes Cmd+W to closing a tab rather than the window', () => {
+    const closeTab = vi.fn()
+    const template = buildApplicationMenuTemplate('Claude Code Haha', vi.fn(), 'darwin', { closeTab })
+    const submenuItems = template
       .flatMap(item => (item.submenu as MenuItemConstructorOptions[] | undefined) ?? [])
-      .find(item => item.label === 'Close Window')
+    const closeItem = submenuItems.find(item => item.label === 'Close Tab')
 
     expect(closeItem).toBeDefined()
     expect(closeItem?.accelerator).toBe('CmdOrCtrl+W')
+    // The window's own close is intercepted into a hide, so it must not be bound.
+    expect(submenuItems.some(item => item.label === 'Close Window')).toBe(false)
     closeItem?.click?.({} as never, {} as never, {} as never)
 
-    expect(close).toHaveBeenCalledTimes(1)
+    expect(closeTab).toHaveBeenCalledTimes(1)
   })
 
   it('routes the View fullscreen accelerator through the provided fullscreen action', () => {

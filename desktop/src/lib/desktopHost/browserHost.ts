@@ -254,6 +254,9 @@ export const browserHost: DesktopHost = {
     async onNativeMenuNavigate() {
       return noopUnlisten
     },
+    async onNativeMenuCloseTab() {
+      return noopUnlisten
+    },
   },
   terminal: {
     async spawn() {

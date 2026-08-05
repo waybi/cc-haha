@@ -80,6 +80,16 @@ export function ReasoningEffortPopover({
     }
   }, [anchorRef, open])
 
+  // Move focus onto the slider once it is placed. Opening with a click used to
+  // leave focus on the anchor, so the arrow keys did nothing and Escape missed
+  // the slider's handler below — which, since that handler is what closes the
+  // popover, meant Escape fell through to the app and stopped generation.
+  const isPositioned = position !== null
+  useLayoutEffect(() => {
+    if (!open || !isPositioned) return
+    sliderRef.current?.focus()
+  }, [open, isPositioned])
+
   // Escape is deliberately left to the slider's own key handler below, which
   // also returns focus to the anchor; letting the hook handle it too would fire
   // `onClose` twice for one key press.

@@ -151,4 +151,20 @@ describe('ReasoningEffortPopover', () => {
 
     expect(onClose).toHaveBeenCalledTimes(2)
   })
+
+  // Opening by click left focus on the anchor, so the arrow keys went nowhere
+  // and Escape bypassed the slider handler that closes the popover — the app's
+  // global Escape then read it as "interrupt the session" instead.
+  it('moves focus onto the slider so its own key handling receives Escape', () => {
+    const { onClose } = renderPopover()
+    const slider = screen.getByRole('slider', { name: '推理强度' })
+
+    expect(document.activeElement).toBe(slider)
+
+    const escape = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })
+    document.activeElement!.dispatchEvent(escape)
+
+    expect(onClose).toHaveBeenCalledTimes(1)
+    expect(escape.defaultPrevented).toBe(true)
+  })
 })

@@ -407,7 +407,7 @@ describe('WebSocket API retry events', () => {
 })
 
 describe('WebSocket background task events', () => {
-  it('forwards task start and progress as structured desktop notifications', () => {
+  it('forwards task start and progress without reviving an idle foreground turn', () => {
     const started = {
       type: 'system',
       subtype: 'task_started',
@@ -424,11 +424,6 @@ describe('WebSocket background task events', () => {
         subtype: 'task_started',
         message: 'Verify the todo app',
         data: started,
-      },
-      {
-        type: 'status',
-        state: 'tool_executing',
-        verb: 'Verify the todo app',
       },
     ])
 
@@ -453,11 +448,6 @@ describe('WebSocket background task events', () => {
         subtype: 'task_progress',
         message: 'Running Playwright checks',
         data: progress,
-      },
-      {
-        type: 'status',
-        state: 'tool_executing',
-        verb: 'Running Playwright checks',
       },
     ])
   })

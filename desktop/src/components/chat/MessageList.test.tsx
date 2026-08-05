@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, createEvent, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import {
   MessageList,
   buildRenderModel,
@@ -96,6 +96,39 @@ async function waitForSelectionMenuUpdate() {
   })
 }
 
+function fireSelectionPointerEvent(
+  target: Element | Document,
+  type: 'down' | 'up',
+  {
+    button,
+    clientX,
+    clientY,
+    pointerId,
+    pointerType,
+    ctrlKey = false,
+  }: {
+    button: number
+    clientX: number
+    clientY: number
+    pointerId: number
+    pointerType: string
+    ctrlKey?: boolean
+  },
+) {
+  const event = type === 'down'
+    ? createEvent.pointerDown(target)
+    : createEvent.pointerUp(target)
+  Object.defineProperties(event, {
+    button: { value: button },
+    clientX: { value: clientX },
+    clientY: { value: clientY },
+    pointerId: { value: pointerId },
+    pointerType: { value: pointerType },
+    ctrlKey: { value: ctrlKey },
+  })
+  fireEvent(target, event)
+}
+
 function prepareMessageTextSelection(
   element: Element,
   text: string,
@@ -149,14 +182,14 @@ async function selectMessageText(
   prepareMessageTextSelection(element, text, rect)
 
   await act(async () => {
-    fireEvent.pointerDown(element, {
+    fireSelectionPointerEvent(element, 'down', {
       button: 0,
       clientX: rect.left ?? 160,
       clientY: rect.top ?? 80,
       pointerId: 1,
       pointerType: 'mouse',
     })
-    fireEvent.pointerUp(element, {
+    fireSelectionPointerEvent(element, 'up', {
       button: 0,
       clientX: rect.right ?? 280,
       clientY: rect.bottom ?? 98,
@@ -198,6 +231,24 @@ async function selectAcrossMessageText(
       y: rect.y ?? rect.top ?? 80,
       toJSON: () => ({}),
     }),
+    getClientRects: () => [
+      {
+        left: rect.left ?? 160,
+        top: rect.top ?? 80,
+        right: (rect.left ?? 160) + 200,
+        bottom: (rect.top ?? 80) + 18,
+        width: 200,
+        height: 18,
+      },
+      {
+        left: rect.left ?? 160,
+        top: (rect.bottom ?? 150) - 18,
+        right: rect.right ?? 520,
+        bottom: rect.bottom ?? 150,
+        width: (rect.right ?? 520) - (rect.left ?? 160),
+        height: 18,
+      },
+    ],
   })
 
   const selectableRoot = startElement.closest('[data-message-shell]')?.parentElement?.parentElement
@@ -219,14 +270,14 @@ async function selectAcrossMessageText(
   window.getSelection()?.addRange(range)
 
   await act(async () => {
-    fireEvent.pointerDown(startElement, {
+    fireSelectionPointerEvent(startElement, 'down', {
       button: 0,
       clientX: rect.left ?? 160,
       clientY: rect.top ?? 80,
       pointerId: 1,
       pointerType: 'mouse',
     })
-    fireEvent.pointerUp(endElement, {
+    fireSelectionPointerEvent(endElement, 'up', {
       button: 0,
       clientX: rect.right ?? 520,
       clientY: rect.bottom ?? 150,
@@ -2770,6 +2821,98 @@ describe('MessageList nested tool calls', () => {
     expect(window.getSelection()?.toString()).toBe('')
   })
 
+  it('cancels a pending Add to chat update when the native context menu opens', async () => {
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [{
+            id: 'assistant-1',
+            type: 'assistant_text',
+            content: 'Right-click should copy this selected reply.',
+            timestamp: 1,
+          }],
+        }),
+      },
+    })
+
+    render(<MessageList />)
+
+    const assistantText = screen.getByText(/Right-click should copy/)
+    prepareMessageTextSelection(assistantText, 'copy this selected reply')
+
+    await act(async () => {
+      fireSelectionPointerEvent(assistantText, 'down', {
+        button: 0,
+        clientX: 180,
+        clientY: 88,
+        pointerId: 1,
+        pointerType: 'mouse',
+      })
+      fireSelectionPointerEvent(assistantText, 'up', {
+        button: 0,
+        clientX: 260,
+        clientY: 104,
+        pointerId: 1,
+        pointerType: 'mouse',
+      })
+      fireSelectionPointerEvent(assistantText, 'down', {
+        button: 2,
+        clientX: 240,
+        clientY: 96,
+        pointerId: 2,
+        pointerType: 'mouse',
+      })
+      fireSelectionPointerEvent(assistantText, 'up', {
+        button: 2,
+        clientX: 240,
+        clientY: 96,
+        pointerId: 2,
+        pointerType: 'mouse',
+      })
+      fireEvent.mouseUp(assistantText, { button: 2, clientX: 240, clientY: 96 })
+      fireEvent.contextMenu(assistantText, { clientX: 240, clientY: 96 })
+    })
+    await waitForSelectionMenuUpdate()
+
+    expect(screen.queryByRole('button', { name: 'Add to chat' })).toBeNull()
+    expect(window.getSelection()?.toString()).toBe('copy this selected reply')
+  })
+
+  it('dismisses Add to chat on right-click without clearing the selected text', async () => {
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [{
+            id: 'assistant-1',
+            type: 'assistant_text',
+            content: 'Selected text must remain copyable after opening its context menu.',
+            timestamp: 1,
+          }],
+        }),
+      },
+    })
+
+    render(<MessageList />)
+
+    const assistantText = screen.getByText(/Selected text must remain copyable/)
+    await selectMessageText(assistantText, 'remain copyable')
+    expect(screen.getByRole('button', { name: 'Add to chat' })).toBeTruthy()
+
+    await act(async () => {
+      fireSelectionPointerEvent(assistantText, 'down', {
+        button: 2,
+        clientX: 260,
+        clientY: 104,
+        pointerId: 2,
+        pointerType: 'mouse',
+      })
+      fireEvent.contextMenu(assistantText, { clientX: 260, clientY: 104 })
+    })
+
+    expect(screen.queryByRole('button', { name: 'Add to chat' })).toBeNull()
+    expect(window.getSelection()?.toString()).toBe('remain copyable')
+  })
+
   it('shows the selected-message action when text selection ends outside the message', async () => {
     useChatStore.setState({
       sessions: {
@@ -2790,7 +2933,7 @@ describe('MessageList nested tool calls', () => {
     prepareMessageTextSelection(assistantText, 'selection gestures')
 
     await act(async () => {
-      fireEvent.pointerDown(assistantText, {
+      fireSelectionPointerEvent(assistantText, 'down', {
         button: 0,
         clientX: 172,
         clientY: 88,
@@ -2803,7 +2946,8 @@ describe('MessageList nested tool calls', () => {
         pointerId: 1,
         pointerType: 'mouse',
       })
-      fireEvent.pointerUp(document.body, {
+      fireSelectionPointerEvent(document, 'up', {
+        button: 0,
         clientX: 640,
         clientY: 120,
         pointerId: 1,
@@ -2883,7 +3027,7 @@ describe('MessageList nested tool calls', () => {
     const floatingAddButton = screen.getByRole('button', { name: 'Add to chat' })
 
     expect(floatingAddButton.style.left).toBe('530px')
-    expect(floatingAddButton.style.top).toBe('98px')
+    expect(floatingAddButton.style.top).toBe('129px')
 
     fireEvent.click(floatingAddButton)
 
@@ -2961,6 +3105,20 @@ describe('MessageList nested tool calls', () => {
     window.getSelection()?.addRange(range)
 
     await act(async () => {
+      fireSelectionPointerEvent(firstParagraph, 'down', {
+        button: 0,
+        clientX: 150,
+        clientY: 76,
+        pointerId: 1,
+        pointerType: 'mouse',
+      })
+      fireSelectionPointerEvent(secondParagraph, 'up', {
+        button: 0,
+        clientX: 500,
+        clientY: 140,
+        pointerId: 1,
+        pointerType: 'mouse',
+      })
       document.dispatchEvent(new Event('selectionchange'))
     })
     await waitForSelectionMenuUpdate()
@@ -5206,6 +5364,74 @@ describe('MessageList nested tool calls', () => {
     await waitFor(() => {
       expect(getWorkspaceDiff).toHaveBeenCalledWith(ACTIVE_TAB, 'src/live.ts')
     })
+  })
+
+  it('reloads live turn checkpoints when the completed transcript mutation is committed', async () => {
+    const getTurnCheckpoints = vi.spyOn(sessionsApi, 'getTurnCheckpoints')
+      .mockResolvedValueOnce({ checkpoints: [] })
+      .mockResolvedValue({
+        checkpoints: [
+          {
+            target: {
+              targetUserMessageId: 'transcript-user-1',
+              userMessageIndex: 0,
+              userMessageCount: 1,
+            },
+            code: {
+              available: true,
+              filesChanged: ['/private/tmp/generated/src/App.jsx'],
+              insertions: 12,
+              deletions: 3,
+            },
+            workDir: '/private/tmp',
+          },
+        ],
+      })
+
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          chatState: 'idle',
+          historyMutationEpoch: 1,
+          messages: [
+            {
+              id: 'local-user-1',
+              type: 'user_text',
+              content: '在 /tmp 下创建项目',
+              timestamp: 1,
+            },
+            {
+              id: 'assistant-1',
+              type: 'assistant_text',
+              content: '完成。',
+              timestamp: 2,
+            },
+          ],
+        }),
+      },
+    })
+
+    render(<MessageList />)
+
+    await waitFor(() => {
+      expect(getTurnCheckpoints).toHaveBeenCalledTimes(1)
+    })
+    expect(screen.queryByText('App.jsx')).toBeNull()
+
+    act(() => {
+      useChatStore.setState((state) => ({
+        sessions: {
+          ...state.sessions,
+          [ACTIVE_TAB]: {
+            ...state.sessions[ACTIVE_TAB]!,
+            historyMutationEpoch: 2,
+          },
+        },
+      }))
+    })
+
+    expect(await screen.findByText('App.jsx')).toBeTruthy()
+    expect(getTurnCheckpoints).toHaveBeenCalledTimes(2)
   })
 
   it('rewinds a live turn with the authoritative checkpoint id when the local UI id differs', async () => {

@@ -17,6 +17,7 @@ import {
 import { hasRunningBackgroundTasks, hasRunningSubagentTasks } from '../lib/backgroundTasks'
 import { AGENT_LIFECYCLE_TYPES } from '../types/team'
 import type { ComposerAttachment } from '../lib/composerAttachments'
+import type { ComposerMention } from '../lib/composerMentions'
 import type { MessageEntry } from '../types/session'
 import type { PermissionMode } from '../types/settings'
 import type { RuntimeSelection } from '../types/runtime'
@@ -52,6 +53,14 @@ type CompactSummaryMessage = Extract<UIMessage, { type: 'compact_summary' }>
 export type ComposerDraftState = {
   input: string
   attachments: ComposerAttachment[]
+  /** Inline @-mention pills in the draft, in document order. */
+  mentions?: ComposerMention[]
+}
+
+export type RepositoryLaunchDraftState = {
+  workDir: string
+  branch: string | null
+  useWorktree: boolean
 }
 
 export type QueuedUserMessage = {
@@ -157,6 +166,7 @@ export type PerSessionState = {
   } | null
   composerInsertion?: ComposerReferenceInsertion | null
   composerDraft?: ComposerDraftState | null
+  repositoryLaunchDraft?: RepositoryLaunchDraftState | null
   queuedUserMessages?: QueuedUserMessage[]
 }
 
@@ -198,6 +208,7 @@ const DEFAULT_SESSION_STATE: PerSessionState = {
   composerPrefill: null,
   composerInsertion: null,
   composerDraft: null,
+  repositoryLaunchDraft: null,
   queuedUserMessages: [],
 }
 
@@ -336,6 +347,8 @@ type ChatStore = {
   clearComposerInsertion: (sessionId: string, nonce?: number) => void
   setComposerDraft: (sessionId: string, draft: ComposerDraftState) => void
   clearComposerDraft: (sessionId: string) => void
+  setRepositoryLaunchDraft: (sessionId: string, draft: RepositoryLaunchDraftState) => void
+  clearRepositoryLaunchDraft: (sessionId: string) => void
   queueUserMessage: (
     sessionId: string,
     message: Omit<QueuedUserMessage, 'id' | 'createdAt'>,
@@ -463,6 +476,16 @@ function buildPartialToolInputPreview(
   previousInput: unknown,
 ): Record<string, unknown> {
   const previous = isRecord(previousInput) ? previousInput : {}
+
+  try {
+    const complete = JSON.parse(partialInput) as unknown
+    if (isRecord(complete)) {
+      return { ...previous, ...complete }
+    }
+  } catch {
+    // Keep exposing useful scalar fields while the JSON object is incomplete.
+  }
+
   const preview: Record<string, unknown> = { ...previous }
   for (const field of ['file_path', 'filePath', 'path', 'command', 'pattern', 'url', 'query', 'description']) {
     const value = extractPartialJsonStringField(partialInput, field)
@@ -616,22 +639,21 @@ function appendAssistantTextMessage(
   ) {
     return messages
   }
-  // 上面那道只在尾部仍是那条 hydrated 消息时才够得着。整轮重放时，正文到达前
-  // 尾部早被 thinking / tool_result 顶掉了，于是重复的回复照样追加进来。
-  // 这里比的是"逐字相同"而不是子串：整段重发的正文会与某条 hydrated 回复完全一致，
-  // 而正常流式送来的是碎片（碎片几乎必然是某条历史回复的子串，用子串判定会误伤）。
-  if (
-    !transcriptMessageId &&
-    messages.some(
-      (message) =>
-        message.type === 'assistant_text' &&
-        message.transcriptMessageId &&
-        message.content.trim() === trimmedContent,
-    )
-  ) {
-    return messages
-  }
-
+  // 这里曾经还有一道守卫：扫描整个 messages，只要某条 hydrated 回复与来文逐字相同
+  // 就丢弃。它必须去掉 —— 内容相等原理上区分不了「重放」和「模型真的又答了一遍同样
+  // 的话」。一轮里出现两次「好的」、两次「完成了」、两次同样的一行命令输出毫不稀奇，
+  // 而 mergeRestoredTranscriptMessageIds 会按逐字相同把 transcript id 回填到 live
+  // 消息上，于是第一条就成了第二条的毒药。用户眼看着流式输出完的回复会在
+  // message_complete 时凭空消失，且没有任何路径能找回来。
+  //
+  // d39e82b62 试过把扫描限定在当前轮次，被 3a630db11 回退：同轮重复照样丢，而且
+  // 尾部只要有一条 user_text 就让守卫彻底失效。换任何扫描边界都不成立。
+  //
+  // 真正挡住重放的是服务端按 uuid 去重（conversationService.isReplayedSdkMessage，
+  // 与这道守卫同一个提交 de52656bb 加入）。那里的容量是 2000 条 uuid，而 de52656bb
+  // 记录的最坏情况是 858 条消息重放 31 次 —— 858 < 2000，整个重放窗口都在集合里，
+  // 逐条按身份挡掉。上面那道尾部子串守卫保留：它只在尾部仍是那条 hydrated 消息时
+  // 才生效，够不到一轮之内被工具调用隔开的重复。
   const canMergeIntoLast =
     last?.type === 'assistant_text' &&
     (
@@ -1337,6 +1359,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           messages: existing?.messages ?? [],
           activeGoal: existing?.activeGoal ?? null,
           composerDraft: existing?.composerDraft ?? null,
+          repositoryLaunchDraft: existing?.repositoryLaunchDraft ?? null,
           queuedUserMessages: existing?.queuedUserMessages ?? [],
           backgroundAgentTasks: existing?.backgroundAgentTasks ?? {},
           agentTaskNotifications: existing?.agentTaskNotifications ?? {},
@@ -2002,6 +2025,29 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     }))
   },
 
+  setRepositoryLaunchDraft: (sessionId, draft) => {
+    set((state) => {
+      const session = state.sessions[sessionId] ?? createDefaultSessionState()
+      return {
+        sessions: {
+          ...state.sessions,
+          [sessionId]: {
+            ...session,
+            repositoryLaunchDraft: draft,
+          },
+        },
+      }
+    })
+  },
+
+  clearRepositoryLaunchDraft: (sessionId) => {
+    set((state) => ({
+      sessions: updateSessionIn(state.sessions, sessionId, () => ({
+        repositoryLaunchDraft: null,
+      })),
+    }))
+  },
+
   queueUserMessage: (sessionId, message) => {
     const id = `queued-user-${Date.now()}-${Math.random().toString(36).slice(2)}`
     set((state) => {
@@ -2587,7 +2633,10 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           const last = lastIndex >= 0 ? base[lastIndex] : undefined
           if (last && last.type === 'thinking') {
             const updated = [...base]
-            updated[lastIndex] = { ...last, content: last.content + msg.text }
+            updated[lastIndex] = {
+              ...last,
+              content: joinThinkingContent(last.content, msg.text, msg.complete === true),
+            }
             return {
               messages: updated,
               chatState: 'thinking',
@@ -2682,10 +2731,12 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           return {
             messages,
             ...(stoppedTask ? { backgroundAgentTasks } : {}),
-            chatState: hasPendingPermissionRequests(s)
-              ? 'permission_pending'
-              : 'thinking',
-            activeThinkingId: null,
+            chatState: parentToolUseId
+              ? s.chatState
+              : hasPendingPermissionRequests(s)
+                ? 'permission_pending'
+                : 'thinking',
+            activeThinkingId: parentToolUseId ? s.activeThinkingId : null,
           }
         })
         if (consumePendingTaskToolUseId(sessionId, msg.toolUseId)) {
@@ -4113,6 +4164,51 @@ function pushAssistantHistoryText(
   })
 }
 
+/**
+ * Joins a thinking block onto the one before it.
+ *
+ * Two granularities arrive under the same `thinking` message: stream fragments, which
+ * must be concatenated raw to rebuild one thought, and finished blocks, which are
+ * separate thoughts and need a break between them. Gluing the second kind produced
+ * "plan the fix carefullythen run tests" — and the test that shipped with it copied
+ * that string into its expectation, so the run-together words became the pinned
+ * behaviour rather than the bug they were.
+ *
+ * Merging adjacent blocks into one bubble is deliberate (see the history-mapping
+ * test); only the missing separator was not.
+ */
+export function joinThinkingContent(previous: string, next: string, nextIsWholeBlock: boolean): string {
+  if (!nextIsWholeBlock) return previous + next
+  if (!previous) return next
+  return `${previous}\n\n${next}`
+}
+
+function pushAssistantHistoryThinking(
+  messages: UIMessage[],
+  id: string,
+  content: string,
+  timestamp: number,
+): void {
+  // 与流式路径（case 'thinking'）保持同等防护：纯空白块不产生空壳气泡。
+  if (!content.trim()) return
+
+  const last = messages[messages.length - 1]
+  if (last?.type === 'thinking') {
+    // 流式落盘的快照会让同一段思考在 jsonl 里以"整块重发"或"前缀增长"的
+    // 形态重复出现，逐字相同直接丢弃，前缀包含则用更全的新块替换旧块。
+    // 合并时保留首个块的确定性 id，保证轮询重映射时 React key 稳定。
+    if (last.content === content) return
+    if (content.startsWith(last.content)) {
+      last.content = content
+      return
+    }
+    last.content = joinThinkingContent(last.content, content, true)
+    return
+  }
+
+  messages.push({ id, type: 'thinking', content, timestamp })
+}
+
 type HistoryMappingOptions = {
   includeTeammateMessages?: boolean
 }
@@ -4340,6 +4436,16 @@ function replayAttachmentsMatchCurrent(
   )
 }
 
+// The server-side replay normalizes whitespace that the optimistic bubble
+// keeps verbatim: `readXmlTag` trims <command-args> and
+// formatCommandDisplayText re-joins name + args with a single space, so
+// `/ego-browser␣␣https://…` replays as `/ego-browser https://…`. HTML
+// collapses the extra space anyway, so a literal comparison would append a
+// visually identical duplicate bubble. Compare with whitespace runs collapsed.
+function collapseWhitespaceRuns(text: string): string {
+  return text.replace(/\s+/g, ' ').trim()
+}
+
 function replayMatchesCurrentUserMessage(
   message: Extract<UIMessage, { type: 'user_text' }>,
   replayDisplay: RestoredUserDisplay,
@@ -4347,6 +4453,11 @@ function replayMatchesCurrentUserMessage(
 ): boolean {
   const currentModelContent = (message.modelContent ?? message.content).trim()
   if (currentModelContent === replayModelContent) return true
+  if (
+    collapseWhitespaceRuns(currentModelContent) === collapseWhitespaceRuns(replayModelContent)
+  ) {
+    return true
+  }
 
   const currentAttachments = message.attachments ?? []
   if (
@@ -4360,7 +4471,11 @@ function replayMatchesCurrentUserMessage(
   }
 
   const currentDisplay = extractRestoredUserDisplay(currentModelContent)
-  if (currentDisplay.content.trim() !== replayDisplay.content.trim()) return false
+  if (
+    collapseWhitespaceRuns(currentDisplay.content) !== collapseWhitespaceRuns(replayDisplay.content)
+  ) {
+    return false
+  }
 
   return replayAttachmentsMatchCurrent(
     replayDisplay.attachments ?? [],
@@ -4711,7 +4826,7 @@ export function mapHistoryMessagesToUiMessages(
     }
     if ((msg.type === 'assistant' || msg.type === 'tool_use') && Array.isArray(msg.content)) {
       for (const [blockIndex, block] of (msg.content as AssistantHistoryBlock[]).entries()) {
-        if (block.type === 'thinking' && block.thinking) uiMessages.push({ id: `${msg.id}-block-${blockIndex}`, type: 'thinking', content: block.thinking, timestamp })
+        if (block.type === 'thinking' && block.thinking) pushAssistantHistoryThinking(uiMessages, `${msg.id}-block-${blockIndex}`, block.thinking, timestamp)
         else if (block.type === 'text' && block.text) {
           pushAssistantHistoryText(uiMessages, block.text, timestamp, msg.model, msg.id || undefined)
         }

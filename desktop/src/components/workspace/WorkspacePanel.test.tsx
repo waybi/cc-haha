@@ -2579,13 +2579,18 @@ describe('WorkspacePanel', () => {
     const otherComposerShell = document.createElement('div')
     otherComposerShell.dataset.testid = 'chat-input-shell'
     otherComposerShell.dataset.sessionId = 'another-session'
-    otherComposerShell.append(document.createElement('textarea'))
+    const otherComposer = document.createElement('div')
+    otherComposer.setAttribute('data-composer-editor', 'true')
+    otherComposer.tabIndex = -1
+    otherComposerShell.append(otherComposer)
     document.body.append(otherComposerShell)
 
     const composerShell = document.createElement('div')
     composerShell.dataset.testid = 'chat-input-shell'
     composerShell.dataset.sessionId = 'session-diff-comment'
-    const composer = document.createElement('textarea')
+    const composer = document.createElement('div')
+    composer.setAttribute('data-composer-editor', 'true')
+    composer.tabIndex = -1
     composerShell.append(composer)
     document.body.append(composerShell)
 

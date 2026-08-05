@@ -107,6 +107,7 @@ export type SessionRewindResponse = {
     insertions: number
     deletions: number
   }
+  restoreAvailable?: boolean
 }
 
 export type RecentProject = {
@@ -299,6 +300,7 @@ export type SessionTurnCheckpoint = {
   conversation?: SessionRewindResponse['conversation']
   code: SessionRewindResponse['code']
   workDir?: string
+  restoreAvailable?: boolean
 }
 
 export type SessionTurnCheckpointsResponse = {

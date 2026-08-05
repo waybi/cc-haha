@@ -120,6 +120,106 @@ describe('translateCliMessage usage mapping', () => {
   })
 })
 
+describe('WebSocket handler session title lifecycle', () => {
+  afterEach(() => {
+    __resetWebSocketHandlerStateForTests()
+    mock.restore()
+  })
+
+  it('does not regenerate a title when a resumed session already has transcript messages', async () => {
+    const sessionId = `title-resumed-${crypto.randomUUID()}`
+    const ws = makeClientSocket(sessionId)
+    spyOn(conversationService, 'hasSession').mockReturnValue(true)
+    spyOn(conversationService, 'getPendingPermissionRequests').mockReturnValue([])
+    spyOn(conversationService, 'onOutput').mockImplementation(() => {})
+    spyOn(conversationService, 'removeOutputCallback').mockImplementation(() => {})
+    spyOn(conversationService, 'sendMessage').mockResolvedValue(true)
+    spyOn(sessionService, 'getCustomTitle').mockResolvedValue(null)
+    spyOn(sessionService, 'getSessionLaunchInfo').mockResolvedValue({
+      filePath: '/tmp/resumed-session.jsonl',
+      projectDir: '/tmp',
+      workDir: '/tmp',
+      transcriptMessageCount: 4,
+      customTitle: null,
+    })
+    const appendAiTitle = spyOn(sessionService, 'appendAiTitle').mockResolvedValue(undefined)
+
+    handleWebSocket.open(ws)
+    ws.sent.length = 0
+    handleWebSocket.message(ws, JSON.stringify({
+      type: 'user_message',
+      content: 'Continue the existing investigation',
+    }))
+    await flushMicrotasks(30)
+
+    expect(appendAiTitle).not.toHaveBeenCalled()
+    expect(ws.sent.map((payload) => JSON.parse(payload))).not.toContainEqual(
+      expect.objectContaining({ type: 'session_title_updated' }),
+    )
+  })
+
+  it('ignores /compact for titles without disabling the next real first-message title', async () => {
+    const sessionId = `title-compact-${crypto.randomUUID()}`
+    const ws = makeClientSocket(sessionId)
+    const outputCallbacks = new Set<(cliMsg: any) => void>()
+    spyOn(conversationService, 'hasSession').mockReturnValue(true)
+    spyOn(conversationService, 'getPendingPermissionRequests').mockReturnValue([])
+    spyOn(conversationService, 'onOutput').mockImplementation((_sessionId, callback) => {
+      outputCallbacks.add(callback)
+    })
+    spyOn(conversationService, 'removeOutputCallback').mockImplementation((_sessionId, callback) => {
+      outputCallbacks.delete(callback)
+    })
+    spyOn(conversationService, 'sendMessage').mockResolvedValue(true)
+    spyOn(sessionService, 'getCustomTitle').mockResolvedValue(null)
+    spyOn(sessionService, 'getSessionLaunchInfo').mockResolvedValue({
+      filePath: '/tmp/fresh-session.jsonl',
+      projectDir: '/tmp',
+      workDir: '/tmp',
+      transcriptMessageCount: 0,
+      customTitle: null,
+    })
+    const appendAiTitle = spyOn(sessionService, 'appendAiTitle').mockResolvedValue(undefined)
+
+    handleWebSocket.open(ws)
+    ws.sent.length = 0
+    handleWebSocket.message(ws, JSON.stringify({
+      type: 'user_message',
+      content: '/compact',
+    }))
+    await flushMicrotasks(30)
+
+    expect(appendAiTitle).not.toHaveBeenCalled()
+    expect(ws.sent.map((payload) => JSON.parse(payload))).not.toContainEqual(
+      expect.objectContaining({ type: 'session_title_updated' }),
+    )
+
+    for (const callback of [...outputCallbacks]) {
+      callback({
+        type: 'result',
+        subtype: 'success',
+        result: '',
+        usage: { input_tokens: 0, output_tokens: 0 },
+      })
+    }
+    await flushMicrotasks()
+
+    handleWebSocket.message(ws, JSON.stringify({
+      type: 'user_message',
+      content: 'Design the renderer cache',
+    }))
+    await flushMicrotasks(30)
+
+    expect(appendAiTitle).toHaveBeenCalledTimes(1)
+    expect(appendAiTitle).toHaveBeenCalledWith(sessionId, 'Design the renderer cache')
+    expect(ws.sent.map((payload) => JSON.parse(payload))).toContainEqual({
+      type: 'session_title_updated',
+      sessionId,
+      title: 'Design the renderer cache',
+    })
+  })
+})
+
 describe('WebSocket handler session isolation', () => {
   afterEach(() => {
     __resetWebSocketHandlerStateForTests()
@@ -692,6 +792,79 @@ describe('WebSocket handler session isolation', () => {
     expireForceKill?.()
 
     expect(stopSession).not.toHaveBeenCalled()
+  })
+
+  it('does not turn background task lifecycle into foreground activity after the user turn ends', () => {
+    const sessionId = `background-task-foreground-state-${crypto.randomUUID()}`
+    const ws = makeClientSocket(sessionId)
+    const outputCallbacks: Array<(cliMsg: any) => void> = []
+    spyOn(conversationService, 'hasSession').mockReturnValue(true)
+    spyOn(conversationService, 'onOutput').mockImplementation((_sid, callback) => {
+      outputCallbacks.push(callback)
+    })
+    spyOn(conversationService, 'removeOutputCallback').mockImplementation(() => {})
+
+    handleWebSocket.open(ws)
+    ws.sent.length = 0
+
+    outputCallbacks[0]?.({
+      type: 'system',
+      subtype: 'task_started',
+      task_id: 'agent-task-1',
+      tool_use_id: 'agent-tool-1',
+      description: 'Verify the todo app',
+      task_type: 'local_agent',
+    })
+    outputCallbacks[0]?.({
+      type: 'system',
+      subtype: 'task_progress',
+      task_id: 'agent-task-1',
+      tool_use_id: 'agent-tool-1',
+      summary: 'Running Playwright checks',
+      task_type: 'local_agent',
+    })
+
+    const idleMessages = ws.sent.map((payload) => JSON.parse(payload))
+    expect(idleMessages).toContainEqual(expect.objectContaining({
+      type: 'system_notification',
+      subtype: 'task_started',
+    }))
+    expect(idleMessages).toContainEqual(expect.objectContaining({
+      type: 'system_notification',
+      subtype: 'task_progress',
+    }))
+    expect(idleMessages).not.toContainEqual(expect.objectContaining({
+      type: 'status',
+      state: 'tool_executing',
+    }))
+
+    handleWebSocket.message(ws, JSON.stringify({ type: 'sync_state' }))
+    expect(ws.sent.map((payload) => JSON.parse(payload))).toContainEqual({
+      type: 'session_state',
+      turnState: 'idle',
+    })
+
+    __markActiveTurnForTests(sessionId)
+    ws.sent.length = 0
+    outputCallbacks[0]?.({
+      type: 'system',
+      subtype: 'task_progress',
+      task_id: 'agent-task-1',
+      tool_use_id: 'agent-tool-1',
+      summary: 'Foreground turn is waiting for the task',
+      task_type: 'local_agent',
+    })
+
+    expect(ws.sent.map((payload) => JSON.parse(payload))).toContainEqual({
+      type: 'status',
+      state: 'tool_executing',
+      verb: 'Foreground turn is waiting for the task',
+    })
+    handleWebSocket.message(ws, JSON.stringify({ type: 'sync_state' }))
+    expect(ws.sent.map((payload) => JSON.parse(payload))).toContainEqual({
+      type: 'session_state',
+      turnState: 'running',
+    })
   })
 
   it('stops every active Agent task when generation is stopped', async () => {

@@ -49,6 +49,8 @@ export function Modal({
     if (!open) return
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
+        // Consume it so the app-level handler does not also stop generation.
+        event.preventDefault()
         onClose()
         return
       }

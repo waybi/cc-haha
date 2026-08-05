@@ -37,7 +37,10 @@ export function MobileBottomSheet({
   useEffect(() => {
     if (!open) return
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose()
+      if (event.key !== 'Escape') return
+      // Consume it so the app-level handler does not also stop generation.
+      event.preventDefault()
+      onClose()
     }
     document.addEventListener('keydown', handleKeyDown)
     return () => document.removeEventListener('keydown', handleKeyDown)

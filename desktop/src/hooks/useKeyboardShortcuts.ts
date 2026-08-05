@@ -122,7 +122,11 @@ export function useKeyboardShortcuts() {
       }
     }
 
-    document.addEventListener('keydown', handler)
-    return () => document.removeEventListener('keydown', handler)
+    // On `window`, not `document`: overlays register their own Escape handlers
+    // on `document` only once opened, so they always sort after this hook's
+    // listener there and the `defaultPrevented` check below would never see
+    // their dismissal. `window` is the last bubble target, so it does.
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
   }, [closeModal, openModal, openNewSession, setUiZoom, stopGeneration, toggleSidebar])
 }

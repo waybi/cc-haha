@@ -77,8 +77,11 @@ export function useDismissable({
 
     const handleKey = (nativeEvent: KeyboardEvent) => {
       if (nativeEvent.key !== 'Escape') return
+      // Always mark the key as consumed: the app-level Escape handler falls back
+      // to interrupting the running session, and dismissing an overlay must not
+      // also stop generation.
+      nativeEvent.preventDefault()
       if (stopEscapePropagation) {
-        nativeEvent.preventDefault()
         nativeEvent.stopPropagation()
       }
       onDismiss('escape')

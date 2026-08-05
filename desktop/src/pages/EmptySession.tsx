@@ -135,7 +135,6 @@ export function EmptySession() {
   const createSession = useSessionStore((state) => state.createSession)
   const sendMessage = useChatStore((state) => state.sendMessage)
   const connectToSession = useChatStore((state) => state.connectToSession)
-  const setActiveView = useUIStore((state) => state.setActiveView)
   const addToast = useUIStore((state) => state.addToast)
   const currentModel = useSettingsStore((state) => state.currentModel)
   const activeProviderName = useSettingsStore((state) => state.activeProviderName)
@@ -366,7 +365,6 @@ export function EmptySession() {
       if (explicitDraftSelection) {
         runtimeStore.clearSelection(DRAFT_RUNTIME_SELECTION_KEY)
       }
-      setActiveView('code')
       useTabStore.getState().openTab(sessionId, 'New Session')
       connectToSession(sessionId)
       const attachmentPayload: AttachmentRef[] = attachments.map((attachment) => ({

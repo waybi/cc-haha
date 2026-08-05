@@ -248,8 +248,6 @@ export type SettingsTab =
   | 'diagnostics'
   | 'about'
 
-type ActiveView = 'code' | 'scheduled' | 'terminal' | 'history' | 'settings'
-
 type UIStore = {
   /** The theme currently on `<html>` — resolved, not necessarily the manual pick. */
   theme: ThemeMode
@@ -262,7 +260,6 @@ type UIStore = {
   sidebarOpen: boolean
   /** Expanded-state sidebar width in px, user-resizable within the clamp range. */
   sidebarWidth: number
-  activeView: ActiveView
   activeSettingsTab: SettingsTab
   pendingSettingsTab: SettingsTab | null
   pendingMemoryPath: string | null
@@ -275,7 +272,6 @@ type UIStore = {
   toggleSidebar: () => void
   setSidebarOpen: (open: boolean) => void
   setSidebarWidth: (width: number) => void
-  setActiveView: (view: ActiveView) => void
   setActiveSettingsTab: (tab: SettingsTab) => void
   setPendingSettingsTab: (tab: SettingsTab | null) => void
   setPendingMemoryPath: (path: string | null) => void
@@ -294,7 +290,6 @@ export const useUIStore = create<UIStore>((set) => ({
   darkTheme: readStoredDarkTheme(),
   sidebarOpen: true,
   sidebarWidth: getStoredSidebarWidth(),
-  activeView: 'code',
   activeSettingsTab: getStoredSettingsTab(),
   pendingSettingsTab: null,
   pendingMemoryPath: null,
@@ -364,7 +359,6 @@ export const useUIStore = create<UIStore>((set) => ({
     persist(SIDEBAR_WIDTH_STORAGE_KEY, String(clamped))
     set({ sidebarWidth: clamped })
   },
-  setActiveView: (view) => set({ activeView: view }),
   setActiveSettingsTab: (tab) => {
     try { localStorage.setItem(ACTIVE_SETTINGS_TAB_STORAGE_KEY, tab) } catch { /* noop */ }
     set({ activeSettingsTab: tab })

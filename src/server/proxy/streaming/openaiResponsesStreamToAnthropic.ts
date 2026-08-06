@@ -498,7 +498,11 @@ function processEvent(
     case 'response.failed':
     case 'response.cancelled':
     case 'error': {
-      if (!options.openAICodexOAuth) break
+      // Forwarded for every provider, not just Codex: an upstream that says why
+      // it failed is the only place that reason exists. Swallowing it left the
+      // empty-stream guard to answer with a generic line, turning a diagnosable
+      // failure into "upstream sent nothing". Both error types readStreamError
+      // produces are retryable, so this changes the wording, not the outcome.
       state.terminalSeen = true
       const streamError = readStreamError(event, data)
       controller.enqueue(encoder.encode(formatSse('error', {

@@ -738,17 +738,34 @@ describe('openaiResponsesStreamToAnthropic', () => {
     }])
   })
 
-  test('reports an upstream whose only event is one the translator drops', async () => {
-    // The gateway did say it failed; the non-Codex path drops response.failed,
-    // which is how an explicit upstream failure became a silent empty 200.
+  test('forwards the reason an upstream gives when it fails, without OAuth', async () => {
+    // The gateway did say why it failed. Dropping that for every non-Codex
+    // provider left the empty-stream guard to answer with a generic line, so
+    // a diagnosable failure ("quota exhausted") read as "upstream sent nothing".
     const events = await collectSse(openaiResponsesStreamToAnthropic(makeStream([
-      'event: response.failed\ndata: {"type":"response.failed","response":{"id":"r","status":"failed"}}\n\n',
+      'event: response.created\ndata: {"type":"response.created","response":{"id":"r","model":"gpt-5.6-sol","status":"in_progress"}}\n\n',
+      'event: response.failed\ndata: {"type":"response.failed","response":{"id":"r","status":"failed","error":{"code":"quota_exhausted","message":"Workspace quota exhausted"}}}\n\n',
     ]), 'gpt-5.6-sol'))
 
-    expect(events).toHaveLength(1)
-    expect(events[0]?.event).toBe('error')
-    expect((events[0]?.data.error as Record<string, unknown>).type).toBe('api_error')
-    expect((events[0]?.data.error as Record<string, unknown>).message).toContain('response.failed')
+    const error = events.find((event) => event.event === 'error')
+    expect(error?.data).toEqual({
+      type: 'error',
+      error: { type: 'api_error', message: 'Workspace quota exhausted' },
+    })
+  })
+
+  test('marks a rate-limited upstream failure as overloaded, without OAuth', async () => {
+    // overloaded_error and api_error are both retryable, so this changes the
+    // wording rather than the outcome — but it is the wording that says whether
+    // to wait or to go look at the account.
+    const events = await collectSse(openaiResponsesStreamToAnthropic(makeStream([
+      'event: error\ndata: {"type":"error","error":{"code":"rate_limit_exceeded","message":"Too many requests"}}\n\n',
+    ]), 'gpt-5.6-sol'))
+
+    expect(events).toEqual([{
+      event: 'error',
+      data: { type: 'error', error: { type: 'overloaded_error', message: 'Too many requests' } },
+    }])
   })
 })
 

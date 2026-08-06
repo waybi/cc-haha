@@ -20,7 +20,7 @@
     "check:chat-contract": "bun run scripts/pr/run-chat-contract-tests.ts",
     "check:agent-flow": "bun run scripts/quality-gate/agent-flow/index.ts",
     "check:desktop-ui-smoke": "bun run scripts/quality-gate/desktop-smoke/deterministic-cli.ts",
-    "check:desktop": "cd desktop && bun run lint && bun run test -- --run && bun run build",
+    "check:desktop": "cd desktop && bun run lint && bun run check:preview-agent && bun run test -- --run && bun run build",
     "desktop:install": "cd desktop && bun run install:local",
     "check:electron": "cd desktop && bun run check:electron",
     "check:adapters": "cd adapters && bun test",

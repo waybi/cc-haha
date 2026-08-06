@@ -19,6 +19,7 @@ import { sessionsApi, type SessionGitInfo } from '../../api/sessions'
 import { agentsApi } from '../../api/agents'
 import { PermissionModeSelector } from '../controls/PermissionModeSelector'
 import { ModelSelector, type ModelSelectorHandle } from '../controls/ModelSelector'
+import { useRegisterComposerModelSelector } from '../../lib/composerModelSelector'
 import type { AttachmentRef } from '../../types/chat'
 import { AttachmentGallery } from './AttachmentGallery'
 import { ComposerDropOverlay } from './ComposerDropOverlay'
@@ -151,6 +152,7 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
   const panelRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const modelSelectorRef = useRef<ModelSelectorHandle>(null)
+  useRegisterComposerModelSelector(modelSelectorRef)
   const plusMenuRef = useRef<HTMLDivElement>(null)
   const slashMenuRef = useRef<HTMLDivElement>(null)
   const fileSearchRef = useRef<FileSearchMenuHandle>(null)

@@ -40,6 +40,26 @@ export type WorkbenchTabOrigin = {
   sourceElementId?: string
 }
 
+export function isSessionTabId(tabId: string | null): tabId is string {
+  if (!tabId) return false
+  return tabId !== SETTINGS_TAB_ID &&
+    tabId !== SCHEDULED_TAB_ID &&
+    tabId !== MARKET_TAB_ID &&
+    tabId !== TRACE_LIST_TAB_ID &&
+    !tabId.startsWith(TERMINAL_TAB_PREFIX) &&
+    !tabId.startsWith(TRACE_TAB_PREFIX) &&
+    !tabId.startsWith(WORKBENCH_TAB_PREFIX) &&
+    !tabId.startsWith(SUBAGENT_TAB_PREFIX)
+}
+
+export function isSessionTab(tab: Tab | null | undefined) {
+  if (!tab) return false
+  const tabType = (tab as Partial<Tab>).type
+  if (tabType === 'session') return true
+  if (tabType) return false
+  return isSessionTabId(tab.sessionId)
+}
+
 type TabPersistence = {
   openTabs: Array<{ sessionId: string; title: string; type?: TabType; traceSessionId?: string }>
   activeTabId: string | null

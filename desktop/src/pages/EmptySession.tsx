@@ -19,6 +19,7 @@ import { SETTINGS_TAB_ID, useTabStore } from '../stores/tabStore'
 import { RepositoryLaunchControls } from '@/components/chat/RepositoryLaunchControls'
 import { PermissionModeSelector } from '../components/controls/PermissionModeSelector'
 import { ModelSelector, type ModelSelectorHandle } from '../components/controls/ModelSelector'
+import { useRegisterComposerModelSelector } from '../lib/composerModelSelector'
 import { AttachmentGallery } from '../components/chat/AttachmentGallery'
 import { ComposerDropOverlay } from '../components/chat/ComposerDropOverlay'
 import { ContextUsageIndicator } from '../components/chat/ContextUsageIndicator'
@@ -127,6 +128,7 @@ export function EmptySession() {
   const panelRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const modelSelectorRef = useRef<ModelSelectorHandle>(null)
+  useRegisterComposerModelSelector(modelSelectorRef)
   const plusMenuRef = useRef<HTMLDivElement>(null)
   const slashMenuRef = useRef<HTMLDivElement>(null)
   const fileSearchRef = useRef<FileSearchMenuHandle>(null)

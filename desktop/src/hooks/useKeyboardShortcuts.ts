@@ -1,14 +1,17 @@
 import { useCallback, useEffect, useRef } from 'react'
 import { useSessionStore } from '../stores/sessionStore'
 import { useChatStore } from '../stores/chatStore'
-import { useTabStore } from '../stores/tabStore'
+import { isSessionTabId, useTabStore } from '../stores/tabStore'
+import { useTerminalPanelStore } from '../stores/terminalPanelStore'
 import { useUIStore } from '../stores/uiStore'
+import { useWorkspacePanelStore } from '../stores/workspacePanelStore'
 import {
   getAppZoomKeyboardAction,
   nextAppZoomLevel,
 } from '../lib/appZoom'
 import { useSettingsStore } from '../stores/settingsStore'
 import { hasRunningSubagentTasks } from '../lib/backgroundTasks'
+import { getComposerModelSelector } from '../lib/composerModelSelector'
 import { useTranslation } from '../i18n'
 
 export function useKeyboardShortcuts() {
@@ -84,6 +87,52 @@ export function useKeyboardShortcuts() {
       if (meta && e.key === 'b') {
         e.preventDefault()
         toggleSidebar()
+      }
+
+      // Ctrl+` — Toggle the terminal, mirroring the tab bar's terminal button.
+      // Ctrl and not Cmd even on macOS: Cmd+` is the system's window cycler.
+      if (e.ctrlKey && !e.metaKey && !e.altKey && (e.key === '`' || e.code === 'Backquote')) {
+        e.preventDefault()
+        const activeTabId = activeTabIdRef.current
+        if (isSessionTabId(activeTabId)) {
+          useTerminalPanelStore.getState().togglePanel(activeTabId)
+        } else {
+          useTabStore.getState().openTerminalTab()
+        }
+        return
+      }
+
+      // Cmd+Shift+E — Toggle the workspace file panel, mirroring the tab bar's
+      // folder button. Only session tabs have one, same as the button itself.
+      if (meta && e.shiftKey && e.key.toLowerCase() === 'e') {
+        e.preventDefault()
+        const activeTabId = activeTabIdRef.current
+        if (isSessionTabId(activeTabId)) {
+          const workspace = useWorkspacePanelStore.getState()
+          if (workspace.isPanelOpen(activeTabId) && workspace.getMode(activeTabId) === 'workspace') {
+            workspace.closePanel(activeTabId)
+          } else {
+            workspace.setMode(activeTabId, 'workspace')
+            workspace.openPanel(activeTabId)
+          }
+        }
+        return
+      }
+
+      // Cmd+Shift+M — Open the composer's model picker
+      if (meta && e.shiftKey && e.key.toLowerCase() === 'm') {
+        e.preventDefault()
+        getComposerModelSelector()?.open()
+        return
+      }
+
+      // Cmd+Shift+R — Open the reasoning effort slider. Silently does nothing
+      // when the selected model has no effort levels, same as the button that
+      // opens it: it is not rendered at all in that case.
+      if (meta && e.shiftKey && e.key.toLowerCase() === 'r') {
+        e.preventDefault()
+        getComposerModelSelector()?.openEffort()
+        return
       }
 
       // Cmd+K — Open global session search

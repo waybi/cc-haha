@@ -1,11 +1,16 @@
+import { useRef } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import { APP_ZOOM_STORAGE_KEY } from '../lib/appZoom'
+import { useRegisterComposerModelSelector } from '../lib/composerModelSelector'
+import type { ModelSelectorHandle } from '../components/controls/ModelSelector'
 import { useSettingsStore } from '../stores/settingsStore'
 import { useKeyboardShortcuts } from './useKeyboardShortcuts'
 import { useChatStore, type PerSessionState } from '../stores/chatStore'
-import { useTabStore } from '../stores/tabStore'
+import { SETTINGS_TAB_ID, useTabStore } from '../stores/tabStore'
+import { useTerminalPanelStore } from '../stores/terminalPanelStore'
 import { useUIStore } from '../stores/uiStore'
+import { useWorkspacePanelStore } from '../stores/workspacePanelStore'
 import { useSessionStore } from '../stores/sessionStore'
 
 function ShortcutHost() {
@@ -165,6 +170,175 @@ describe('useKeyboardShortcuts new session', () => {
     expect(createSession).toHaveBeenCalledWith('/repo')
     expect(useTabStore.getState().activeTabId).toBe('created-session')
     expect(useTabStore.getState().tabs.some((tab) => tab.sessionId === 'created-session')).toBe(true)
+  })
+})
+
+describe('useKeyboardShortcuts terminal toggle', () => {
+  const initialTabState = useTabStore.getInitialState()
+  const initialTerminalPanelState = useTerminalPanelStore.getInitialState()
+
+  afterEach(() => {
+    cleanup()
+    useTabStore.setState(initialTabState, true)
+    useTerminalPanelStore.setState(initialTerminalPanelState, true)
+  })
+
+  it('toggles the docked terminal panel of the active session tab', () => {
+    const sessionId = 'session-1'
+    useTabStore.setState({
+      activeTabId: sessionId,
+      tabs: [{ sessionId, title: 'Session', type: 'session', status: 'idle' }],
+    })
+    render(<ShortcutHost />)
+
+    fireEvent.keyDown(document, { key: '`', code: 'Backquote', ctrlKey: true })
+    expect(useTerminalPanelStore.getState().isPanelOpen(sessionId)).toBe(true)
+
+    fireEvent.keyDown(document, { key: '`', code: 'Backquote', ctrlKey: true })
+    expect(useTerminalPanelStore.getState().isPanelOpen(sessionId)).toBe(false)
+    expect(useTabStore.getState().tabs).toHaveLength(1)
+  })
+
+  it('opens a terminal tab when the active tab is not a session', () => {
+    useTabStore.setState({
+      activeTabId: SETTINGS_TAB_ID,
+      tabs: [{ sessionId: SETTINGS_TAB_ID, title: 'Settings', type: 'settings', status: 'idle' }],
+    })
+    render(<ShortcutHost />)
+
+    fireEvent.keyDown(document, { key: '`', code: 'Backquote', ctrlKey: true })
+
+    const tabs = useTabStore.getState().tabs
+    expect(tabs.some((tab) => tab.type === 'terminal')).toBe(true)
+    expect(useTabStore.getState().activeTabId).not.toBe(SETTINGS_TAB_ID)
+  })
+
+  it('leaves Cmd+` to the macOS window cycler', () => {
+    const sessionId = 'session-1'
+    useTabStore.setState({
+      activeTabId: sessionId,
+      tabs: [{ sessionId, title: 'Session', type: 'session', status: 'idle' }],
+    })
+    render(<ShortcutHost />)
+
+    fireEvent.keyDown(document, { key: '`', code: 'Backquote', metaKey: true })
+
+    expect(useTerminalPanelStore.getState().isPanelOpen(sessionId)).toBe(false)
+  })
+})
+
+describe('useKeyboardShortcuts workspace panel toggle', () => {
+  const sessionId = 'session-1'
+  const initialTabState = useTabStore.getInitialState()
+  const initialWorkspaceState = useWorkspacePanelStore.getInitialState()
+
+  beforeEach(() => {
+    useTabStore.setState({
+      activeTabId: sessionId,
+      tabs: [{ sessionId, title: 'Session', type: 'session', status: 'idle' }],
+    })
+  })
+
+  afterEach(() => {
+    cleanup()
+    useTabStore.setState(initialTabState, true)
+    useWorkspacePanelStore.setState(initialWorkspaceState, true)
+  })
+
+  it('toggles the workspace panel of the active session tab', () => {
+    render(<ShortcutHost />)
+
+    fireEvent.keyDown(document, { key: 'E', metaKey: true, shiftKey: true })
+    expect(useWorkspacePanelStore.getState().isPanelOpen(sessionId)).toBe(true)
+    expect(useWorkspacePanelStore.getState().getMode(sessionId)).toBe('workspace')
+
+    fireEvent.keyDown(document, { key: 'E', metaKey: true, shiftKey: true })
+    expect(useWorkspacePanelStore.getState().isPanelOpen(sessionId)).toBe(false)
+  })
+
+  it('switches an open panel from another mode into workspace instead of closing it', () => {
+    useWorkspacePanelStore.getState().setMode(sessionId, 'browser')
+    useWorkspacePanelStore.getState().openPanel(sessionId)
+    render(<ShortcutHost />)
+
+    fireEvent.keyDown(document, { key: 'E', metaKey: true, shiftKey: true })
+
+    expect(useWorkspacePanelStore.getState().isPanelOpen(sessionId)).toBe(true)
+    expect(useWorkspacePanelStore.getState().getMode(sessionId)).toBe('workspace')
+  })
+
+  it('does nothing on tabs that have no workspace panel', () => {
+    useTabStore.setState({
+      activeTabId: SETTINGS_TAB_ID,
+      tabs: [{ sessionId: SETTINGS_TAB_ID, title: 'Settings', type: 'settings', status: 'idle' }],
+    })
+    render(<ShortcutHost />)
+
+    fireEvent.keyDown(document, { key: 'E', metaKey: true, shiftKey: true })
+
+    expect(useWorkspacePanelStore.getState().isPanelOpen(SETTINGS_TAB_ID)).toBe(false)
+  })
+
+  it('leaves plain Cmd+E alone', () => {
+    render(<ShortcutHost />)
+
+    fireEvent.keyDown(document, { key: 'e', metaKey: true })
+
+    expect(useWorkspacePanelStore.getState().isPanelOpen(sessionId)).toBe(false)
+  })
+})
+
+describe('useKeyboardShortcuts model selector', () => {
+  function SelectorHost({ handle }: { handle: ModelSelectorHandle }) {
+    const ref = useRef<ModelSelectorHandle | null>(handle)
+    ref.current = handle
+    useRegisterComposerModelSelector(ref)
+    useKeyboardShortcuts()
+    return null
+  }
+
+  afterEach(() => {
+    cleanup()
+  })
+
+  it('opens the model picker with Cmd+Shift+M', () => {
+    const handle = { open: vi.fn(), openEffort: vi.fn(() => true) }
+    render(<SelectorHost handle={handle} />)
+
+    fireEvent.keyDown(document, { key: 'M', metaKey: true, shiftKey: true })
+
+    expect(handle.open).toHaveBeenCalledTimes(1)
+    expect(handle.openEffort).not.toHaveBeenCalled()
+  })
+
+  it('opens the reasoning effort slider with Cmd+Shift+R', () => {
+    const handle = { open: vi.fn(), openEffort: vi.fn(() => true) }
+    render(<SelectorHost handle={handle} />)
+
+    fireEvent.keyDown(document, { key: 'R', metaKey: true, shiftKey: true })
+
+    expect(handle.openEffort).toHaveBeenCalledTimes(1)
+    expect(handle.open).not.toHaveBeenCalled()
+  })
+
+  it('does nothing when no composer is mounted', () => {
+    render(<ShortcutHost />)
+
+    expect(() => {
+      fireEvent.keyDown(document, { key: 'M', metaKey: true, shiftKey: true })
+      fireEvent.keyDown(document, { key: 'R', metaKey: true, shiftKey: true })
+    }).not.toThrow()
+  })
+
+  it('stops reaching a composer that has unmounted', () => {
+    const handle = { open: vi.fn(), openEffort: vi.fn(() => true) }
+    const { unmount } = render(<SelectorHost handle={handle} />)
+    unmount()
+    render(<ShortcutHost />)
+
+    fireEvent.keyDown(document, { key: 'M', metaKey: true, shiftKey: true })
+
+    expect(handle.open).not.toHaveBeenCalled()
   })
 })
 

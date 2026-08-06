@@ -15,7 +15,8 @@ vi.mock('../../lib/desktopRuntime', async (importOriginal) => {
   return { ...actual, isDesktopRuntime: () => runtimeMocks.isDesktopRuntime }
 })
 
-import { ModelSelector } from './ModelSelector'
+import { createRef } from 'react'
+import { ModelSelector, type ModelSelectorHandle } from './ModelSelector'
 import { useChatStore } from '../../stores/chatStore'
 import { useHahaOAuthStore } from '../../stores/hahaOAuthStore'
 import { useHahaOpenAIOAuthStore } from '../../stores/hahaOpenAIOAuthStore'
@@ -727,6 +728,67 @@ describe('ModelSelector', () => {
       modelId: 'claude-sonnet-5',
       effortLevel: 'xhigh',
     })
+  })
+
+  it('opens the effort slider through the imperative handle', async () => {
+    useSettingsStore.setState({
+      locale: 'en',
+      availableModels: [],
+      currentModel: null,
+      activeProviderName: 'Sub2API-ChatGPT',
+      effortLevel: 'high',
+    })
+    useProviderStore.setState({
+      providers: [{
+        id: 'sub2api-provider',
+        presetId: 'custom',
+        name: 'Sub2API-ChatGPT',
+        apiKey: '***',
+        baseUrl: 'https://api.example.com/v1',
+        apiFormat: 'openai_responses',
+        models: {
+          main: 'gpt-5.6-sol',
+          haiku: 'gpt-5.6-luna',
+          sonnet: 'gpt-5.6-terra',
+          opus: 'gpt-5.6-sol',
+        },
+      }],
+      activeId: 'sub2api-provider',
+      hasLoadedProviders: true,
+      isLoading: false,
+    })
+    useSessionRuntimeStore.getState().setSelection('session-effort-handle', {
+      providerId: 'sub2api-provider',
+      modelId: 'gpt-5.6-sol',
+      effortLevel: 'high',
+    })
+    const handleRef = createRef<ModelSelectorHandle>()
+
+    render(<ModelSelector ref={handleRef} runtimeKey="session-effort-handle" />)
+
+    expect(screen.queryByTestId('reasoning-effort-popover')).not.toBeInTheDocument()
+    await act(async () => {
+      expect(handleRef.current?.openEffort()).toBe(true)
+    })
+
+    expect(screen.getByTestId('reasoning-effort-popover')).toBeInTheDocument()
+    expect(screen.getByRole('slider', { name: 'Effort' })).toBeInTheDocument()
+  })
+
+  it('reports no effort control when the selector is not runtime scoped', async () => {
+    useSettingsStore.setState({
+      locale: 'en',
+      availableModels: MODELS,
+      currentModel: MODELS[0],
+    })
+    const handleRef = createRef<ModelSelectorHandle>()
+
+    render(<ModelSelector ref={handleRef} value="alpha" onChange={vi.fn()} />)
+
+    await act(async () => {
+      expect(handleRef.current?.openEffort()).toBe(false)
+    })
+    expect(screen.queryByTestId('reasoning-effort-popover')).not.toBeInTheDocument()
   })
 
   it('keeps effort selectable for OpenAI Responses models from compatible providers', async () => {

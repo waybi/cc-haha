@@ -60,6 +60,10 @@ type Props = {
 
 export type ModelSelectorHandle = {
   open: () => void
+  // Returns false when this selector has no effort control to open — the model
+  // may not support reasoning, or the selector may not be runtime-scoped. The
+  // caller uses that to tell "nothing happened" from "opened".
+  openEffort: () => boolean
 }
 
 type DropdownPosition = {
@@ -541,9 +545,20 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
     providerChoices.length,
   ])
 
+  const canOpenEffort = !disabled &&
+    canEditRuntimeEffort &&
+    Boolean(selectedRuntimeEffort) &&
+    runtimeEffortOptions.length > 0
+
   useImperativeHandle(selectorRef, () => ({
     open: openSelector,
-  }), [openSelector])
+    openEffort: () => {
+      if (!canOpenEffort) return false
+      setOpen(false)
+      setEffortOpen(true)
+      return true
+    },
+  }), [canOpenEffort, openSelector])
 
   const handleRuntimeSelect = (selection: RuntimeSelection) => {
     const apiFormat = providers.find((provider) => provider.id === selection.providerId)?.apiFormat

@@ -223,6 +223,34 @@ export function openaiResponsesStreamToAnthropic(
             return
           }
 
+          // The upstream answered 200 and then closed without yielding a single
+          // Anthropic event — it either sent nothing at all, or only events this
+          // translator drops. Closing cleanly hands the client a zero-byte 200
+          // that is indistinguishable from a legitimately empty answer, so the
+          // turn dies on "Stream ended without receiving any events" and neither
+          // retry classifier matches (not an APIError, no transport code).
+          //
+          // This has to be said inside the SSE body, not via controller.error():
+          // the 200 headers are already committed by the time this body runs, so
+          // erroring the stream still reaches an HTTP client as a clean empty
+          // 200. The Codex path above can error because it is consumed in-process
+          // by openaiResponsesStreamToAnthropicResponse, never over the wire.
+          // An api_error payload is what isRetryableStreamError keys on, so the
+          // turn is re-sent while it is still side-effect free.
+          //
+          // Either flag means something usable went out: messageStarted opens a
+          // real message, terminalSeen means a terminal outcome (completed,
+          // failed, incomplete) was already forwarded.
+          if (!state.messageStarted && !state.terminalSeen) {
+            controller.enqueue(encoder.encode(formatSse('error', {
+              type: 'error',
+              error: {
+                type: 'api_error',
+                message: `Upstream closed the response stream without sending any event (last event: ${state.lastUpstreamEvent ?? 'none'})`,
+              },
+            })))
+          }
+
           controller.close()
         } catch (error) {
           if (!cancelled) controller.error(error)

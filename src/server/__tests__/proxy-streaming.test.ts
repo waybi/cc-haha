@@ -714,6 +714,42 @@ describe('openaiResponsesStreamToAnthropic', () => {
       },
     }])
   })
+
+  test('reports an upstream that closes without emitting a single event', async () => {
+    // A gateway that accepts the request, answers 200, then closes the SSE body
+    // without sending anything used to translate into a clean zero-byte 200.
+    // The client cannot tell that apart from a legitimately empty answer, so the
+    // turn dies on "Stream ended without receiving any events" and neither retry
+    // classifier matches. An api_error payload is what isRetryableStreamError
+    // keys on, so the turn is re-sent instead.
+    const events = await collectSse(
+      openaiResponsesStreamToAnthropic(makeStream([]), 'gpt-5.6-sol'),
+    )
+
+    expect(events).toEqual([{
+      event: 'error',
+      data: {
+        type: 'error',
+        error: {
+          type: 'api_error',
+          message: 'Upstream closed the response stream without sending any event (last event: none)',
+        },
+      },
+    }])
+  })
+
+  test('reports an upstream whose only event is one the translator drops', async () => {
+    // The gateway did say it failed; the non-Codex path drops response.failed,
+    // which is how an explicit upstream failure became a silent empty 200.
+    const events = await collectSse(openaiResponsesStreamToAnthropic(makeStream([
+      'event: response.failed\ndata: {"type":"response.failed","response":{"id":"r","status":"failed"}}\n\n',
+    ]), 'gpt-5.6-sol'))
+
+    expect(events).toHaveLength(1)
+    expect(events[0]?.event).toBe('error')
+    expect((events[0]?.data.error as Record<string, unknown>).type).toBe('api_error')
+    expect((events[0]?.data.error as Record<string, unknown>).message).toContain('response.failed')
+  })
 })
 
 describe('openaiResponsesStreamToAnthropicResponse', () => {

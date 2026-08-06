@@ -49,3 +49,7 @@ export function isFirstPartyAnthropicBaseUrl(): boolean {
 export function hasAnthropicCompatibleThirdPartyConfig(): boolean {
   return getAPIProvider() !== 'firstParty' || !isFirstPartyAnthropicBaseUrl()
 }
+
+export function shouldTrustBuiltInClaudeModelCapabilities(): boolean {
+  return getAPIProvider() !== 'firstParty' || isFirstPartyAnthropicBaseUrl()
+}

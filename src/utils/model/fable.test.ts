@@ -10,17 +10,21 @@ import {
   CLAUDE_FABLE_5_CONFIG,
   CLAUDE_OPUS_4_6_CONFIG,
   CLAUDE_OPUS_4_8_CONFIG,
+  CLAUDE_OPUS_5_CONFIG,
   CLAUDE_SONNET_5_CONFIG,
 } from './configs.js'
 import {
   firstPartyNameToCanonical,
+  getBestModel,
   getDefaultFableModel,
+  getDefaultOpusModel,
   getMarketingNameForModel,
   getPublicModelDisplayName,
   parseUserSpecifiedModel,
   renderDefaultModelSetting,
 } from './model.js'
 import { getModelStrings } from './modelStrings.js'
+import { getModelOptions } from './modelOptions.js'
 import { get3PModelCapabilityOverride } from './modelSupportOverrides.js'
 
 const ENV_KEYS = [
@@ -64,6 +68,13 @@ describe('Fable model configuration', () => {
       foundry: 'claude-opus-4-8',
       azureOpenAI: 'claude-opus-4-8',
     })
+    expect(CLAUDE_OPUS_5_CONFIG).toEqual({
+      firstParty: 'claude-opus-5',
+      bedrock: 'anthropic.claude-opus-5',
+      vertex: 'claude-opus-5',
+      foundry: 'claude-opus-5',
+      azureOpenAI: 'claude-opus-5',
+    })
     expect(CLAUDE_SONNET_5_CONFIG).toEqual({
       firstParty: 'claude-sonnet-5',
       bedrock: 'anthropic.claude-sonnet-5',
@@ -82,6 +93,10 @@ describe('Fable model configuration', () => {
   test('resolves the alias without changing unrelated model defaults', () => {
     expect(getDefaultFableModel()).toBe(getModelStrings().fable5)
     expect(parseUserSpecifiedModel('fable')).toBe(getModelStrings().fable5)
+    expect(getDefaultOpusModel()).toBe(getModelStrings().opus50)
+    expect(getBestModel()).toBe(getModelStrings().opus50)
+    expect(parseUserSpecifiedModel('opus')).toBe(getModelStrings().opus50)
+    expect(parseUserSpecifiedModel('best')).toBe(getModelStrings().opus50)
 
     process.env.ANTHROPIC_DEFAULT_FABLE_MODEL = 'provider-owned-fable'
 
@@ -90,6 +105,14 @@ describe('Fable model configuration', () => {
     expect(parseUserSpecifiedModel('fable[1m]')).toBe(
       'provider-owned-fable[1m]',
     )
+  })
+
+  test('offers Opus 5 instead of Fable in the first-party CLI picker', () => {
+    const options = getModelOptions()
+    expect(options.some(option => option.description.includes('Opus 5'))).toBe(true)
+    expect(
+      options.some(option => option.description.includes('Fable 5')),
+    ).toBe(false)
   })
 
   test('normalizes and renders the public model name', () => {
@@ -115,35 +138,39 @@ describe('Fable model configuration', () => {
       'Sonnet 5 (1M context)',
     )
     expect(getMarketingNameForModel('claude-opus-4-8')).toBe('Opus 4.8')
+    expect(getPublicModelDisplayName(getModelStrings().opus50)).toBe('Opus 5')
+    expect(getMarketingNameForModel('claude-opus-5')).toBe('Opus 5')
     expect(getMarketingNameForModel('claude-sonnet-5')).toBe('Sonnet 5')
     expect(renderDefaultModelSetting('opusplan')).toBe(
-      'Opus 4.8 in plan mode, else Sonnet 5',
+      'Opus 5 in plan mode, else Sonnet 5',
     )
   })
 
   test('publishes current model IDs and knowledge cutoffs in environment context', async () => {
     expect(SKILL_MODEL_VARS).toMatchObject({
-      OPUS_ID: 'claude-opus-4-8',
-      OPUS_NAME: 'Claude Opus 4.8',
+      OPUS_ID: 'claude-opus-5',
+      OPUS_NAME: 'Claude Opus 5',
       SONNET_ID: 'claude-sonnet-5',
       SONNET_NAME: 'Claude Sonnet 5',
     })
 
-    for (const model of ['claude-fable-5', 'claude-opus-4-8', 'claude-sonnet-5']) {
-      const info = await computeSimpleEnvInfo(model)
-      expect(info).toContain('Assistant knowledge cutoff is January 2026.')
-      expect(info).toContain("Fable 5: 'claude-fable-5'")
-      expect(info).toContain("Opus 4.8: 'claude-opus-4-8'")
-      expect(info).toContain("Sonnet 5: 'claude-sonnet-5'")
-      expect(info).toContain('same Claude Opus 4.8 model')
-    }
+    const opusInfo = await computeSimpleEnvInfo('claude-opus-5')
+    expect(opusInfo).toContain('Assistant knowledge cutoff is May 2026.')
+    expect(opusInfo).toContain("Opus 5: 'claude-opus-5'")
+    expect(opusInfo).toContain("Sonnet 5: 'claude-sonnet-5'")
+    expect(opusInfo).not.toContain("Fable 5: 'claude-fable-5'")
+    expect(opusInfo).toContain('same Claude Opus 5 model')
+
+    const sonnetInfo = await computeSimpleEnvInfo('claude-sonnet-5')
+    expect(sonnetInfo).toContain('Assistant knowledge cutoff is January 2026.')
   })
 
   test('sanitizes new model trailers and keeps teammate fallbacks provider-safe', () => {
     expect(sanitizeModelName('claude-fable-5-experimental')).toBe('claude-fable-5')
     expect(sanitizeModelName('claude-opus-4-8-experimental')).toBe('claude-opus-4-8')
+    expect(sanitizeModelName('claude-opus-5-experimental')).toBe('claude-opus-5')
     expect(sanitizeModelName('claude-sonnet-5-experimental')).toBe('claude-sonnet-5')
-    expect(getHardcodedTeammateModelFallback()).toBe('claude-opus-4-8')
+    expect(getHardcodedTeammateModelFallback()).toBe('claude-opus-5')
 
     process.env.CLAUDE_CODE_USE_BEDROCK = '1'
     expect(getHardcodedTeammateModelFallback()).toBe(

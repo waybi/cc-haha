@@ -54,6 +54,7 @@ export function modelSupportsEffort(model: string): boolean {
   }
   // Supported by a subset of Claude 4 models
   if (shouldTrustBuiltInClaudeCapabilityList() && (
+    m.includes('opus-5') ||
     m.includes('opus-4-6') ||
     m.includes('opus-4-7') ||
     m.includes('opus-4-8') ||
@@ -96,6 +97,7 @@ export function modelSupportsXHighEffort(model: string): boolean {
   }
   const m = model.toLowerCase()
   return shouldTrustBuiltInClaudeCapabilityList() && (
+    m.includes('opus-5') ||
     m.includes('opus-4-7') ||
     m.includes('opus-4-8') ||
     m.includes('sonnet-5') ||
@@ -116,6 +118,7 @@ export function modelSupportsMaxEffort(model: string): boolean {
   }
   const m = model.toLowerCase()
   if (shouldTrustBuiltInClaudeCapabilityList() && (
+    m.includes('opus-5') ||
     m.includes('opus-4-6') ||
     m.includes('opus-4-7') ||
     m.includes('opus-4-8') ||

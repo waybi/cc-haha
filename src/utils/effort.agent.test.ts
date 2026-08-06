@@ -91,6 +91,7 @@ describe('agent effort values', () => {
 
   test('matches the Claude effort capability table', () => {
     const effortModels = [
+      'claude-opus-5',
       'claude-opus-4-5',
       'claude-opus-4-6',
       'claude-opus-4-7',
@@ -102,6 +103,7 @@ describe('agent effort values', () => {
       'claude-mythos-preview',
     ]
     const xhighModels = [
+      'claude-opus-5',
       'claude-opus-4-7',
       'claude-opus-4-8',
       'claude-sonnet-5',
@@ -109,6 +111,7 @@ describe('agent effort values', () => {
       'claude-mythos-5',
     ]
     const maxModels = [
+      'claude-opus-5',
       'claude-opus-4-6',
       'claude-opus-4-7',
       'claude-opus-4-8',

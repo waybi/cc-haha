@@ -85,6 +85,7 @@ import {
   stripToolReferenceBlocksFromUserMessage,
 } from "../../utils/messages.js";
 import {
+  getCanonicalName,
   getDefaultOpusModel,
   getDefaultSonnetModel,
   getSmallFastModel,
@@ -1577,9 +1578,23 @@ async function* queryModel(
     }
   }
 
-  const effort = resolveAppliedEffort(options.model, options.effortValue, {
+  const requestedEffort = resolveAppliedEffort(options.model, options.effortValue, {
     effortValueOverridesEnv: options.effortValueOverridesEnv,
   });
+  const isAdaptiveOnlyOpus5 =
+    getCanonicalName(options.model) === 'claude-opus-5' &&
+    modelSupportsAdaptiveThinking(options.model)
+  const isThinkingDisabledForRequest =
+    thinkingConfig.type === 'disabled' ||
+    isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_THINKING) ||
+    (isAdaptiveOnlyOpus5 &&
+      isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING))
+  const effort =
+    isAdaptiveOnlyOpus5 &&
+    isThinkingDisabledForRequest &&
+    (requestedEffort === 'xhigh' || requestedEffort === 'max')
+      ? 'high'
+      : requestedEffort
 
   if (feature("PROMPT_CACHE_BREAK_DETECTION")) {
     // Exclude defer_loading tools from the hash -- the API strips them from the
@@ -1682,11 +1697,14 @@ async function* queryModel(
         : [];
     const extraBodyParams = getExtraBodyParams(bedrockBetas);
 
-    const hasThinking = resolveModelThinkingEnabled(
-      options.model,
-      thinkingConfig.type !== 'disabled' &&
-        !isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_THINKING),
-    )
+    const hasThinking =
+      isAdaptiveOnlyOpus5 && isThinkingDisabledForRequest
+        ? false
+        : resolveModelThinkingEnabled(
+            options.model,
+            thinkingConfig.type !== 'disabled' &&
+              !isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_THINKING),
+          )
     const modelCanThink = modelSupportsThinking(options.model)
     const sendsExplicitDisabledThinking =
       !hasThinking && (modelCanThink || shouldSendExplicitDisabledThinking())
@@ -3700,12 +3718,14 @@ export async function queryWithModel({
   systemPrompt = asSystemPrompt([]),
   userPrompt,
   outputFormat,
+  thinkingConfig = { type: 'disabled' },
   signal,
   options,
 }: {
   systemPrompt: SystemPrompt;
   userPrompt: string;
   outputFormat?: BetaJSONOutputFormat;
+  thinkingConfig?: ThinkingConfig;
   signal: AbortSignal;
   options: QueryWithModelOptions;
 }): Promise<AssistantMessage> {
@@ -3728,7 +3748,7 @@ export async function queryWithModel({
       const result = await queryModelWithoutStreaming({
         messages,
         systemPrompt,
-        thinkingConfig: { type: "disabled" },
+        thinkingConfig,
         tools: [],
         signal,
         options: {

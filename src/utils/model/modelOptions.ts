@@ -9,11 +9,11 @@ import {
 } from '../auth.js'
 import { getModelStrings } from './modelStrings.js'
 import {
-  COST_TIER_10_50,
   COST_TIER_3_15,
   COST_HAIKU_35,
   COST_HAIKU_45,
   formatModelPricing,
+  getOpus5CostTier,
 } from '../modelCost.js'
 import { getSettings_DEPRECATED } from '../settings/settings.js'
 import { checkOpus1mAccess, checkSonnet1mAccess } from './check1mAccess.js'
@@ -167,19 +167,6 @@ function getCustomFableOption(): ModelOption | undefined {
   }
 }
 
-function getFable5Option(): ModelOption | undefined {
-  if (shouldUseThirdPartyAnthropicOptions()) {
-    return undefined
-  }
-  return {
-    value: 'fable',
-    label: 'Fable',
-    description: `Fable 5 · Highest capability for long-running tasks · ${formatModelPricing(COST_TIER_10_50)}`,
-    descriptionForModel:
-      'Fable 5 - highest capability for hard, long-running tasks',
-  }
-}
-
 function getSonnet46Option(): ModelOption {
   const is3P = shouldUseThirdPartyAnthropicOptions()
   const modelName = is3P ? 'Sonnet 4.6' : 'Sonnet 5'
@@ -220,11 +207,15 @@ function getOpus41Option(): ModelOption {
 
 function getOpus46Option(fastMode = false): ModelOption {
   const is3P = shouldUseThirdPartyAnthropicOptions()
+  const modelName = is3P ? 'Opus 4.6' : 'Opus 5'
+  const pricingSuffix = is3P
+    ? getOpus46PricingSuffix(fastMode)
+    : ` · ${formatModelPricing(getOpus5CostTier(fastMode))}`
   return {
     value: is3P ? getModelStrings().opus46 : 'opus',
     label: 'Opus',
-    description: `${is3P ? 'Opus 4.6' : 'Opus 4.8'} · Most capable for complex work${getOpus46PricingSuffix(fastMode)}`,
-    descriptionForModel: `${is3P ? 'Opus 4.6' : 'Opus 4.8'} - most capable for complex work`,
+    description: `${modelName} · Most capable for complex work${pricingSuffix}`,
+    descriptionForModel: `${modelName} - most capable for complex work`,
   }
 }
 
@@ -242,11 +233,14 @@ export function getSonnet46_1MOption(): ModelOption {
 
 export function getOpus46_1MOption(fastMode = false): ModelOption {
   const is3P = shouldUseThirdPartyAnthropicOptions()
-  const modelName = is3P ? 'Opus 4.6' : 'Opus 4.8'
+  const modelName = is3P ? 'Opus 4.6' : 'Opus 5'
+  const pricingSuffix = is3P
+    ? getOpus46PricingSuffix(fastMode)
+    : ` · ${formatModelPricing(getOpus5CostTier(fastMode))}`
   return {
     value: is3P ? getModelStrings().opus46 + '[1m]' : 'opus[1m]',
     label: 'Opus (1M context)',
-    description: `${modelName} for long sessions${getOpus46PricingSuffix(fastMode)}`,
+    description: `${modelName} for long sessions${pricingSuffix}`,
     descriptionForModel:
       `${modelName} with 1M context window - for long sessions with large codebases`,
   }
@@ -302,7 +296,7 @@ function getMaxOpusOption(fastMode = false): ModelOption {
   return {
     value: 'opus',
     label: 'Opus',
-    description: `Opus 4.8 · Most capable for complex work${fastMode ? getOpus46PricingSuffix(true) : ''}`,
+    description: `Opus 5 · Most capable for complex work · ${formatModelPricing(getOpus5CostTier(fastMode))}`,
   }
 }
 
@@ -321,18 +315,22 @@ export function getMaxOpus46_1MOption(fastMode = false): ModelOption {
   return {
     value: 'opus[1m]',
     label: 'Opus (1M context)',
-    description: `Opus 4.8 with 1M context${billingInfo}${getOpus46PricingSuffix(fastMode)}`,
+    description: `Opus 5 with 1M context${billingInfo} · ${formatModelPricing(getOpus5CostTier(fastMode))}`,
   }
 }
 
 function getMergedOpus1MOption(fastMode = false): ModelOption {
   const is3P = shouldUseThirdPartyAnthropicOptions()
+  const modelName = is3P ? 'Opus 4.6' : 'Opus 5'
+  const pricingSuffix = is3P
+    ? ''
+    : ` · ${formatModelPricing(getOpus5CostTier(fastMode))}`
   return {
     value: is3P ? getModelStrings().opus46 + '[1m]' : 'opus[1m]',
     label: 'Opus (1M context)',
-    description: `${is3P ? 'Opus 4.6' : 'Opus 4.8'} with 1M context · Most capable for complex work${!is3P && fastMode ? getOpus46PricingSuffix(fastMode) : ''}`,
+    description: `${modelName} with 1M context · Most capable for complex work${pricingSuffix}`,
     descriptionForModel:
-      `${is3P ? 'Opus 4.6' : 'Opus 4.8'} with 1M context - most capable for complex work`,
+      `${modelName} with 1M context - most capable for complex work`,
   }
 }
 
@@ -422,10 +420,10 @@ function getModelOptionsBase(fastMode = false): ModelOption[] {
       description: m.description ?? `[ANT-ONLY] ${m.label} (${m.model})`,
     }))
 
-    const fableOption = getFable5Option()
+    const opusOption = getOpus46Option(fastMode)
     return [
       getDefaultOptionForUser(),
-      ...(fableOption ? [fableOption] : []),
+      opusOption,
       ...antModelOptions,
       getMergedOpus1MOption(fastMode),
       getSonnet46Option(),
@@ -442,7 +440,7 @@ function getModelOptionsBase(fastMode = false): ModelOption[] {
     if (isMaxSubscriber() || isTeamPremiumSubscriber()) {
       // Max and Team Premium users: Opus is default, show Sonnet as alternative
       const premiumOptions = [getDefaultOptionForUser(fastMode)]
-      pushUniqueOption(premiumOptions, getFable5Option())
+      pushUniqueOption(premiumOptions, getMaxOpusOption(fastMode))
       if (!isOpus1mMergeEnabled() && checkOpus1mAccess()) {
         premiumOptions.push(getMaxOpus46_1MOption(fastMode))
       }
@@ -458,7 +456,6 @@ function getModelOptionsBase(fastMode = false): ModelOption[] {
 
     // Pro/Team Standard/Enterprise users: Sonnet is default, show Opus as alternative
     const standardOptions = [getDefaultOptionForUser(fastMode)]
-    pushUniqueOption(standardOptions, getFable5Option())
     if (shouldOfferSonnet1mOption()) {
       standardOptions.push(getMaxSonnet46_1MOption())
     }
@@ -476,11 +473,11 @@ function getModelOptionsBase(fastMode = false): ModelOption[] {
     return standardOptions
   }
 
-  // PAYG 1P API: Default (Opus 4.8) + Fable + Sonnet + Haiku.
-  // Opus 4.8 and Sonnet 5 already have native 1M context windows.
+  // PAYG 1P API: Default + Opus 5 + Sonnet + Haiku.
+  // Opus 5 and Sonnet 5 already have native 1M context windows.
   if (!shouldUseThirdPartyAnthropicOptions()) {
     const payg1POptions = [getDefaultOptionForUser(fastMode)]
-    pushUniqueOption(payg1POptions, getFable5Option())
+    pushUniqueOption(payg1POptions, getOpus46Option(fastMode))
     payg1POptions.push(getSonnet46Option())
     if (shouldOfferSonnet1mOption()) {
       payg1POptions.push(getSonnet46_1MOption())

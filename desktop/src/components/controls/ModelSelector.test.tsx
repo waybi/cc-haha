@@ -93,10 +93,18 @@ describe('ModelSelector', () => {
 
     await clickByRole(/Opus 4\.7/i)
 
-    expect(screen.getByRole('button', { name: /Fable 5/ })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Opus 5/ })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Fable 5/ })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: /Opus 4\.6/ })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /Sonnet 5/ })).toBeInTheDocument()
     expect(screen.getAllByRole('button', { name: /Opus 4\.7/ }).length).toBeGreaterThan(0)
+
+    await clickByRole(/Opus 5/i)
+    expect(useSessionRuntimeStore.getState().selections['session-claude-legacy']).toEqual({
+      providerId: null,
+      modelId: 'claude-opus-5',
+      effortLevel: 'high',
+    })
   })
 
   it('does not query official OAuth status when mounted', () => {
@@ -726,6 +734,48 @@ describe('ModelSelector', () => {
       providerId: 'xuanshuapi-provider',
       modelId: 'claude-sonnet-5',
       effortLevel: 'xhigh',
+    })
+  })
+
+  it('keeps configured third-party Fable models selectable', async () => {
+    useSettingsStore.setState({
+      locale: 'en',
+      availableModels: [],
+      currentModel: MODELS[0],
+      activeProviderName: 'Provider A',
+      effortLevel: 'high',
+    })
+    useProviderStore.setState({
+      providers: [{
+        id: 'provider-a',
+        presetId: 'custom',
+        name: 'Provider A',
+        apiKey: '***',
+        baseUrl: 'https://api.example.com',
+        apiFormat: 'anthropic',
+        models: {
+          main: 'provider-main',
+          fable: 'provider-fable',
+          haiku: '',
+          sonnet: '',
+          opus: '',
+        },
+      }],
+      activeId: 'provider-a',
+      hasLoadedProviders: true,
+      isLoading: false,
+    })
+
+    render(<ModelSelector runtimeKey="session-provider-fable" />)
+
+    await clickByRole(/provider-main/i)
+    expect(screen.getByRole('button', { name: /provider-fable/i })).toBeInTheDocument()
+    await clickByRole(/provider-fable/i)
+
+    expect(useSessionRuntimeStore.getState().selections['session-provider-fable']).toEqual({
+      providerId: 'provider-a',
+      modelId: 'provider-fable',
+      effortLevel: 'high',
     })
   })
 

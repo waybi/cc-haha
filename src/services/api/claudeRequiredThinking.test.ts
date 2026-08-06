@@ -65,6 +65,8 @@ const ENV_KEYS = [
   'ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES',
   'CLAUDE_CODE_EFFORT_LEVEL',
   'CLAUDE_CODE_ALWAYS_ENABLE_EFFORT',
+  'CLAUDE_CODE_DISABLE_THINKING',
+  'CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING',
   'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS',
 ] as const
 
@@ -73,12 +75,21 @@ async function captureQueryRequest({
   pinnedModel,
   capabilities,
   effortValue,
+  thinkingConfig = { type: 'disabled' },
+  disableAdaptiveThinking = false,
+  modelFamily = 'sonnet',
   configureCapabilityOverrides = true,
 }: {
   model: string
   pinnedModel?: string
   capabilities?: string
-  effortValue?: 'low'
+  effortValue?: 'low' | 'xhigh' | 'max'
+  thinkingConfig?:
+    | { type: 'adaptive' }
+    | { type: 'enabled'; budgetTokens: number }
+    | { type: 'disabled' }
+  disableAdaptiveThinking?: boolean
+  modelFamily?: 'fable' | 'sonnet'
   configureCapabilityOverrides?: boolean
 }): Promise<{
   content: unknown
@@ -112,6 +123,12 @@ async function captureQueryRequest({
     delete process.env.CLAUDE_CODE_USE_FOUNDRY
     delete process.env.CLAUDE_CODE_EFFORT_LEVEL
     delete process.env.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT
+    delete process.env.CLAUDE_CODE_DISABLE_THINKING
+    if (disableAdaptiveThinking) {
+      process.env.CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING = '1'
+    } else {
+      delete process.env.CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING
+    }
     delete process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS
     process.env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${server.port}`
     delete process.env.ANTHROPIC_AUTH_TOKEN
@@ -126,15 +143,22 @@ async function captureQueryRequest({
     delete process.env.ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES
     delete process.env.ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES
     if (configureCapabilityOverrides && capabilities !== undefined) {
-      process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = pinnedModel ?? model
-      process.env.ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES =
-        capabilities
+      if (modelFamily === 'fable') {
+        process.env.ANTHROPIC_DEFAULT_FABLE_MODEL = pinnedModel ?? model
+        process.env.ANTHROPIC_DEFAULT_FABLE_MODEL_SUPPORTED_CAPABILITIES =
+          capabilities
+      } else {
+        process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = pinnedModel ?? model
+        process.env.ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES =
+          capabilities
+      }
     }
     clearCapabilityCache()
     enableConfigs()
 
     const result = await queryWithModel({
       userPrompt: 'Reply exactly OK',
+      thinkingConfig,
       signal: new AbortController().signal,
       options: {
         model,
@@ -186,6 +210,59 @@ test('keeps request effort when thinking is explicitly disabled', async () => {
   expect(requests[0]?.output_config).toEqual({ effort: 'low' })
 }, 10_000)
 
+for (const effortValue of ['xhigh', 'max'] as const) {
+  test(`downgrades Opus 5 ${effortValue} to high when thinking is disabled`, async () => {
+    const { requests } = await captureQueryRequest({
+      model: 'claude-opus-5',
+      capabilities: 'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
+      effortValue,
+    })
+
+    expect(requests).toHaveLength(1)
+    expect(requests[0]?.thinking).toEqual({ type: 'disabled' })
+    expect(requests[0]?.output_config).toEqual({ effort: 'high' })
+  }, 10_000)
+}
+
+test('keeps Opus 5 xhigh with adaptive thinking enabled', async () => {
+  const { requests } = await captureQueryRequest({
+    model: 'claude-opus-5',
+    capabilities: 'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
+    effortValue: 'xhigh',
+    thinkingConfig: { type: 'adaptive' },
+  })
+
+  expect(requests).toHaveLength(1)
+  expect(requests[0]?.thinking).toEqual({ type: 'adaptive' })
+  expect(requests[0]?.output_config).toEqual({ effort: 'xhigh' })
+}, 10_000)
+
+test('does not fall back to manual thinking when Opus 5 adaptive mode is disabled', async () => {
+  const { requests } = await captureQueryRequest({
+    model: 'claude-opus-5',
+    capabilities: 'thinking,effort,adaptive_thinking,xhigh_effort,max_effort',
+    effortValue: 'max',
+    thinkingConfig: { type: 'adaptive' },
+    disableAdaptiveThinking: true,
+  })
+
+  expect(requests).toHaveLength(1)
+  expect(requests[0]?.thinking).toEqual({ type: 'disabled' })
+  expect(requests[0]?.output_config).toEqual({ effort: 'high' })
+}, 10_000)
+
+test('does not force adaptive thinking for an unconfigured third-party Opus 5 alias', async () => {
+  const { requests } = await captureQueryRequest({
+    model: 'vendor/claude-opus-5-compatible',
+    capabilities: 'thinking,effort,xhigh_effort,max_effort',
+    effortValue: 'xhigh',
+  })
+
+  expect(requests).toHaveLength(1)
+  expect(requests[0]?.thinking).toEqual({ type: 'disabled' })
+  expect(requests[0]?.output_config).toEqual({ effort: 'xhigh' })
+}, 10_000)
+
 test('sends effort through the final request when a pinned model adds a 1M marker', async () => {
   const { requests, requestHeaders } = await captureQueryRequest({
     model: 'deepseek-v4-flash',
@@ -210,6 +287,17 @@ test('normalizes a disabled parent thinking mode to adaptive for Fable', async (
   expect(requests).toHaveLength(1)
   expect(requests[0]?.thinking).toEqual({ type: 'adaptive' })
   expect(requests[0]?.thinking).not.toEqual({ type: 'disabled' })
+}, 10_000)
+
+test('does not force adaptive thinking for a third-party Fable override', async () => {
+  const { requests } = await captureQueryRequest({
+    model: 'claude-fable-5',
+    capabilities: '',
+    modelFamily: 'fable',
+  })
+
+  expect(requests).toHaveLength(1)
+  expect(requests[0]?.thinking).not.toEqual({ type: 'adaptive' })
 }, 10_000)
 
 function clearCapabilityCache() {

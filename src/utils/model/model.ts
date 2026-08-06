@@ -52,7 +52,8 @@ export function isNonCustomOpusModel(model: ModelName): boolean {
     model === getModelStrings().opus41 ||
     model === getModelStrings().opus45 ||
     model === getModelStrings().opus46 ||
-    model === getModelStrings().opus48
+    model === getModelStrings().opus48 ||
+    model === getModelStrings().opus50
   )
 }
 
@@ -108,7 +109,13 @@ export function getMainLoopModel(): ModelName {
 }
 
 export function getBestModel(): ModelName {
-  return getDefaultFableModel()
+  if (
+    shouldUseThirdPartyAnthropicModelDefaults() &&
+    process.env.ANTHROPIC_DEFAULT_FABLE_MODEL
+  ) {
+    return getDefaultFableModel()
+  }
+  return getDefaultOpusModel()
 }
 
 function shouldUseThirdPartyAnthropicModelDefaults(): boolean {
@@ -142,7 +149,7 @@ export function getDefaultOpusModel(): ModelName {
   if (shouldUseThirdPartyAnthropicModelDefaults()) {
     return getModelStrings().opus46
   }
-  return getModelStrings().opus48
+  return getModelStrings().opus50
 }
 
 // @[MODEL LAUNCH]: Update the default Sonnet model (3P providers may lag so keep defaults unchanged).
@@ -263,12 +270,23 @@ export function getDefaultMainLoopModel(): ModelName {
  * 'us.anthropic.claude-opus-4-7-v1:0'). Does not touch settings, so safe at
  * module top-level (see MODEL_COSTS in modelCost.ts).
  */
+function isClaudeOpus5FirstPartyName(name: string): boolean {
+  const versionSuffix = '(?:-\\d{8})?(?:-v\\d+(?::\\d+)?)?(?:\\[1m\\]|:1m)?'
+  return new RegExp(`^claude-opus-5${versionSuffix}$`).test(name) ||
+    new RegExp(
+      `^(?:[a-z0-9-]+\\.)?anthropic\\.claude-opus-5${versionSuffix}$`,
+    ).test(name)
+}
+
 export function firstPartyNameToCanonical(name: ModelName): ModelShortName {
   name = name.toLowerCase()
   // Special cases for Claude 4+ models to differentiate versions
   // Order matters: check more specific versions first (4-5 before 4)
   if (name.includes('claude-fable-5')) {
     return 'claude-fable-5'
+  }
+  if (isClaudeOpus5FirstPartyName(name)) {
+    return 'claude-opus-5'
   }
   if (name.includes('claude-opus-4-8')) {
     return 'claude-opus-4-8'
@@ -355,9 +373,9 @@ export function getClaudeAiUserDefaultModelDescription(
   }
   if (isMaxSubscriber() || isTeamPremiumSubscriber()) {
     if (isOpus1mMergeEnabled()) {
-      return `Opus 4.8 with 1M context · Most capable for complex work${fastMode ? getOpus46PricingSuffix(true) : ''}`
+      return `Opus 5 with 1M context · Most capable for complex work${fastMode ? ' · $10/$50 per Mtok' : ''}`
     }
-    return `Opus 4.8 · Most capable for complex work${fastMode ? getOpus46PricingSuffix(true) : ''}`
+    return `Opus 5 · Most capable for complex work${fastMode ? ' · $10/$50 per Mtok' : ''}`
   }
   return 'Sonnet 5 · Best for everyday tasks'
 }
@@ -419,6 +437,10 @@ export function getPublicModelDisplayName(model: ModelName): string | null {
     return openAIModelName
   }
   switch (model) {
+    case 'claude-opus-5':
+      return 'Opus 5'
+    case 'claude-opus-5[1m]':
+      return 'Opus 5 (1M context)'
     case getModelStrings().fable5:
       return 'Fable 5'
     case getModelStrings().fable5 + '[1m]':
@@ -665,6 +687,9 @@ export function getMarketingNameForModel(modelId: string): string | undefined {
   const has1m = modelId.toLowerCase().includes('[1m]')
   const canonical = getCanonicalName(modelId)
 
+  if (canonical === 'claude-opus-5') {
+    return has1m ? 'Opus 5 (with 1M context)' : 'Opus 5'
+  }
   if (canonical.includes('claude-fable-5')) {
     return has1m ? 'Fable 5 (with 1M context)' : 'Fable 5'
   }

@@ -14,6 +14,7 @@ import {
   getBuiltInModelContextWindow,
   getConfiguredModelContextWindow,
 } from './model/modelContextWindows.js'
+import { shouldTrustBuiltInClaudeModelCapabilities } from './model/providers.js'
 
 // Default fallback when the model-specific capability is unknown.
 export const MODEL_CONTEXT_WINDOW_DEFAULT = 200_000
@@ -57,6 +58,8 @@ export function modelSupports1M(model: string): boolean {
   const canonical = getCanonicalName(model)
   return (
     canonical.includes('claude-fable-5') ||
+    (canonical === 'claude-opus-5' &&
+      shouldTrustBuiltInClaudeModelCapabilities()) ||
     canonical.includes('claude-sonnet-5') ||
     canonical.includes('claude-opus-4-8') ||
     canonical.includes('claude-opus-4-7') ||
@@ -109,7 +112,12 @@ export function getContextWindowForModel(
     return 1_000_000
   }
 
-  const builtInWindow = getBuiltInModelContextWindow(model)
+  const canonical = getCanonicalName(model)
+  const builtInWindow =
+    canonical === 'claude-opus-5' &&
+    !shouldTrustBuiltInClaudeModelCapabilities()
+      ? undefined
+      : getBuiltInModelContextWindow(model)
   if (builtInWindow !== undefined) {
     return capToDefaultIfExtendedContextDisabled(builtInWindow)
   }
@@ -255,6 +263,8 @@ export function getModelMaxOutputTokens(model: string): {
 
   if (
     m.includes('fable-5') ||
+    (m === 'claude-opus-5' &&
+      shouldTrustBuiltInClaudeModelCapabilities()) ||
     m.includes('opus-4-8') ||
     m.includes('opus-4-7') ||
     m.includes('opus-4-6') ||

@@ -118,10 +118,11 @@ function mergeOfficialModels(availableModels: ModelInfo[]): ModelInfo[] {
 
 function buildProviderModels(
   provider: SavedProvider,
-  labels: Record<'main' | 'haiku' | 'sonnet' | 'opus', string>,
+  labels: Record<'main' | 'fable' | 'haiku' | 'sonnet' | 'opus', string>,
 ): ModelInfo[] {
   const entries: Array<{ id: string; label: string }> = [
     { id: provider.models.main.trim(), label: labels.main },
+    { id: provider.models.fable?.trim() ?? '', label: labels.fable },
     { id: provider.models.haiku.trim(), label: labels.haiku },
     { id: provider.models.sonnet.trim(), label: labels.sonnet },
     { id: provider.models.opus.trim(), label: labels.opus },
@@ -185,7 +186,7 @@ function buildProviderChoices(
   officialName: string,
   openAIOfficialName: string,
   grokOfficialName: string,
-  labels: Record<'main' | 'haiku' | 'sonnet' | 'opus', string>,
+  labels: Record<'main' | 'fable' | 'haiku' | 'sonnet' | 'opus', string>,
   claudeOfficialLoggedIn: boolean,
   openAIOfficialLoggedIn: boolean,
   grokOfficialLoggedIn: boolean,
@@ -391,6 +392,7 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
   const roleLabels = useMemo(
     () => ({
       main: t('settings.providers.mainModel'),
+      fable: 'Fable',
       haiku: t('settings.providers.haikuModel'),
       sonnet: t('settings.providers.sonnetModel'),
       opus: t('settings.providers.opusModel'),
@@ -666,14 +668,17 @@ export const ModelSelector = forwardRef<ModelSelectorHandle, Props>(function Mod
                             ? normalizedProviderEffort
                             : undefined
                           const nextEffort = supportedEfforts === undefined
-                            ? explicitEffort ?? effortLevel
+                            ? explicitEffort ?? model.defaultReasoningEffort ?? effortLevel
                             : supportedEfforts.length
                               ? supportedProviderEffort
                                 ?? (explicitEffort && supportedEfforts.includes(explicitEffort)
-                                ? explicitEffort
-                                : supportedEfforts.includes(effortLevel)
-                                  ? effortLevel
-                                  : model.defaultReasoningEffort ?? supportedEfforts[0])
+                                  ? explicitEffort
+                                  : model.defaultReasoningEffort &&
+                                      supportedEfforts.includes(model.defaultReasoningEffort)
+                                    ? model.defaultReasoningEffort
+                                    : supportedEfforts.includes(effortLevel)
+                                      ? effortLevel
+                                      : supportedEfforts[0])
                               : undefined
                           handleRuntimeSelect({
                             providerId: choice.providerId,

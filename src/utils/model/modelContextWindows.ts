@@ -4,6 +4,7 @@ export const MODEL_CONTEXT_WINDOW_MAX = 10_000_000
 
 const DIRECT_MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   'claude-fable-5': 1_000_000,
+  'claude-opus-5': 1_000_000,
   'claude-opus-4-8': 1_000_000,
   'claude-opus-4-6': 1_000_000,
   'claude-sonnet-5': 1_000_000,

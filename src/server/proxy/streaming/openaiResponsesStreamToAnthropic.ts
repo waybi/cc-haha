@@ -30,6 +30,10 @@ type StreamState = {
   indexByKey: Map<string, number>
   reasoningIndexByOutputIndex: Map<number, number>
   toolIndexByItemId: Map<string, number>
+  /** Fallback lookup for providers that omit item_id on argument events. */
+  toolIndexByOutputIndex: Map<number, number>
+  /** Blocks emitted with content_block_start but not yet stopped. */
+  openBlocks: Set<number>
   model: string
   messageStarted: boolean
   messageStopped: boolean
@@ -39,6 +43,52 @@ type StreamState = {
 
 function formatSse(event: string, data: unknown): string {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+}
+
+function openBlock(
+  state: StreamState,
+  controller: ReadableStreamDefaultController,
+  encoder: TextEncoder,
+  index: number,
+  contentBlock: Record<string, unknown>,
+): void {
+  state.openBlocks.add(index)
+  controller.enqueue(encoder.encode(formatSse('content_block_start', {
+    type: 'content_block_start',
+    index,
+    content_block: contentBlock,
+  })))
+}
+
+function closeBlock(
+  state: StreamState,
+  controller: ReadableStreamDefaultController,
+  encoder: TextEncoder,
+  index: number,
+): void {
+  if (!state.openBlocks.delete(index)) return
+  controller.enqueue(encoder.encode(formatSse('content_block_stop', {
+    type: 'content_block_stop',
+    index,
+  })))
+}
+
+/**
+ * Resolve the Anthropic block index for a function-call argument event.
+ * Some providers (runai-bridge) omit item_id entirely, so fall back to
+ * output_index, which stays distinct per tool call.
+ */
+function resolveToolIndex(
+  data: Record<string, unknown>,
+  state: StreamState,
+): number | undefined {
+  const itemId = (data.item_id as string) || ''
+  const byItemId = itemId ? state.toolIndexByItemId.get(itemId) : undefined
+  if (byItemId !== undefined) return byItemId
+
+  const outputIndex = data.output_index
+  if (typeof outputIndex !== 'number') return undefined
+  return state.toolIndexByOutputIndex.get(outputIndex)
 }
 
 /**
@@ -62,6 +112,8 @@ export function openaiResponsesStreamToAnthropic(
     indexByKey: new Map(),
     reasoningIndexByOutputIndex: new Map(),
     toolIndexByItemId: new Map(),
+    toolIndexByOutputIndex: new Map(),
+    openBlocks: new Set(),
     model,
     messageStarted: false,
     messageStopped: false,
@@ -93,7 +145,7 @@ export function openaiResponsesStreamToAnthropic(
           }
           if (!options.openAICodexOAuth && !state.messageStopped) {
             state.terminalSeen = true
-            closeAllReasoningBlocks(state, controller, encoder)
+            closeAllOpenBlocks(state, controller, encoder)
             emitMessageStop(state, controller, encoder, model)
             return true
           }
@@ -253,17 +305,17 @@ function processEvent(
         const callId = (item.call_id as string) || (item.id as string) || ''
         const name = (item.name as string) || ''
         state.toolIndexByItemId.set((item.id as string) || callId, index)
+        const outputIndex = data.output_index
+        if (typeof outputIndex === 'number') {
+          state.toolIndexByOutputIndex.set(outputIndex, index)
+        }
 
-        controller.enqueue(encoder.encode(formatSse('content_block_start', {
-          type: 'content_block_start',
-          index,
-          content_block: {
-            type: 'tool_use',
-            id: callId,
-            name,
-            input: {},
-          },
-        })))
+        openBlock(state, controller, encoder, index, {
+          type: 'tool_use',
+          id: callId,
+          name,
+          input: {},
+        })
       } else if (item.type === 'reasoning' && !options.openAICodexOAuth) {
         ensureReasoningBlock(data, state, controller, encoder)
       }
@@ -285,15 +337,11 @@ function processEvent(
 
       if (!state.messageStarted) emitMessageStart(state, controller, encoder, state.model)
       const index = state.nextContentIndex++
-      controller.enqueue(encoder.encode(formatSse('content_block_start', {
-        type: 'content_block_start',
-        index,
-        content_block: { type: 'redacted_thinking', data: reasoningData },
-      })))
-      controller.enqueue(encoder.encode(formatSse('content_block_stop', {
-        type: 'content_block_stop',
-        index,
-      })))
+      openBlock(state, controller, encoder, index, {
+        type: 'redacted_thinking',
+        data: reasoningData,
+      })
+      closeBlock(state, controller, encoder, index)
       break
     }
 
@@ -308,11 +356,7 @@ function processEvent(
       const index = state.nextContentIndex++
       state.indexByKey.set(key, index)
 
-      controller.enqueue(encoder.encode(formatSse('content_block_start', {
-        type: 'content_block_start',
-        index,
-        content_block: { type: 'text', text: '' },
-      })))
+      openBlock(state, controller, encoder, index, { type: 'text', text: '' })
       break
     }
 
@@ -371,8 +415,7 @@ function processEvent(
     }
 
     case 'response.function_call_arguments.delta': {
-      const itemId = (data.item_id as string) || ''
-      const index = state.toolIndexByItemId.get(itemId)
+      const index = resolveToolIndex(data, state)
       if (index === undefined) break
 
       const delta = stringifyOpenAIToolArguments(data.delta)
@@ -392,22 +435,15 @@ function processEvent(
       const index = state.indexByKey.get(key)
       if (index === undefined) break
 
-      controller.enqueue(encoder.encode(formatSse('content_block_stop', {
-        type: 'content_block_stop',
-        index,
-      })))
+      closeBlock(state, controller, encoder, index)
       break
     }
 
     case 'response.function_call_arguments.done': {
-      const itemId = (data.item_id as string) || ''
-      const index = state.toolIndexByItemId.get(itemId)
+      const index = resolveToolIndex(data, state)
       if (index === undefined) break
 
-      controller.enqueue(encoder.encode(formatSse('content_block_stop', {
-        type: 'content_block_stop',
-        index,
-      })))
+      closeBlock(state, controller, encoder, index)
       break
     }
 
@@ -456,7 +492,7 @@ function processEvent(
         : status === 'incomplete' ? 'max_tokens' : 'end_turn'
 
       if (!state.messageStarted) emitMessageStart(state, controller, encoder, state.model)
-      closeAllReasoningBlocks(state, controller, encoder)
+      closeAllOpenBlocks(state, controller, encoder)
       controller.enqueue(encoder.encode(formatSse('message_delta', {
         type: 'message_delta',
         delta: { stop_reason: stopReason, stop_sequence: null },
@@ -486,11 +522,7 @@ function ensureReasoningBlock(
 
   const index = state.nextContentIndex++
   state.reasoningIndexByOutputIndex.set(outputIndex, index)
-  controller.enqueue(encoder.encode(formatSse('content_block_start', {
-    type: 'content_block_start',
-    index,
-    content_block: { type: 'thinking', thinking: '' },
-  })))
+  openBlock(state, controller, encoder, index, { type: 'thinking', thinking: '' })
   return index
 }
 
@@ -515,25 +547,25 @@ function closeReasoningBlock(
       delta: { type: 'signature_delta', signature },
     })))
   }
-  controller.enqueue(encoder.encode(formatSse('content_block_stop', {
-    type: 'content_block_stop',
-    index,
-  })))
+  closeBlock(state, controller, encoder, index)
   state.reasoningIndexByOutputIndex.delete(outputIndex)
 }
 
-function closeAllReasoningBlocks(
+/**
+ * Terminal safety net: emit content_block_stop for every block still open.
+ * Without this a provider that drops its own close events leaves the message
+ * with a dangling block, which downstream clients discard entirely — the
+ * assistant turn then renders as silence with no tool call to execute.
+ */
+function closeAllOpenBlocks(
   state: StreamState,
   controller: ReadableStreamDefaultController,
   encoder: TextEncoder,
 ): void {
-  for (const [outputIndex, index] of state.reasoningIndexByOutputIndex) {
-    controller.enqueue(encoder.encode(formatSse('content_block_stop', {
-      type: 'content_block_stop',
-      index,
-    })))
-    state.reasoningIndexByOutputIndex.delete(outputIndex)
+  for (const index of [...state.openBlocks].sort((a, b) => a - b)) {
+    closeBlock(state, controller, encoder, index)
   }
+  state.reasoningIndexByOutputIndex.clear()
 }
 
 function readStreamError(

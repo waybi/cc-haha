@@ -442,6 +442,87 @@ describe('openaiResponsesStreamToAnthropic', () => {
     expect((msgDelta.data.delta as Record<string, unknown>).stop_reason).toBe('tool_use')
   })
 
+  test('function call streaming when upstream omits item_id', async () => {
+    // runai-bridge shape: argument events carry only output_index, never item_id.
+    const sseChunks = [
+      'event: response.created\ndata: {"id":"r2b","model":"claude-opus-5","status":"in_progress"}\n\n',
+      'event: response.output_item.added\ndata: {"output_index":0,"item":{"type":"function_call","id":"item_0","call_id":"toolu_01","name":"Skill"}}\n\n',
+      'event: response.function_call_arguments.delta\ndata: {"output_index":0,"delta":"{\\"q\\":"}\n\n',
+      'event: response.function_call_arguments.delta\ndata: {"output_index":0,"delta":"\\"test\\"}"}\n\n',
+      'event: response.function_call_arguments.done\ndata: {"output_index":0,"arguments":"{\\"q\\":\\"test\\"}"}\n\n',
+      'event: response.completed\ndata: {"response":{"id":"r2b","model":"claude-opus-5","status":"completed"}}\n\n',
+    ]
+
+    const events = await collectSse(openaiResponsesStreamToAnthropic(makeStream(sseChunks), 'claude-opus-5'))
+
+    const jsonDeltas = events.filter(
+      (e) => e.event === 'content_block_delta' && (e.data.delta as Record<string, unknown>)?.type === 'input_json_delta',
+    )
+    expect(jsonDeltas.map((e) => (e.data.delta as Record<string, unknown>).partial_json).join('')).toBe('{"q":"test"}')
+    expect(events.some((e) => e.event === 'content_block_stop' && e.data.index === 0)).toBe(true)
+  })
+
+  test('parallel tool calls without item_id keep arguments on their own block', async () => {
+    // The message item also reports output_index 0, so tool lookup must not collide with it.
+    const sseChunks = [
+      'event: response.created\ndata: {"id":"r2c","model":"claude-opus-5","status":"in_progress"}\n\n',
+      'event: response.output_item.added\ndata: {"output_index":0,"item":{"type":"message","id":"msg_0","role":"assistant"}}\n\n',
+      'event: response.content_part.added\ndata: {"output_index":0,"content_index":0,"item_id":"msg_0","part":{"type":"output_text","text":""}}\n\n',
+      'event: response.output_text.delta\ndata: {"output_index":0,"content_index":0,"item_id":"msg_0","delta":"working"}\n\n',
+      'event: response.output_item.added\ndata: {"output_index":0,"item":{"type":"function_call","id":"item_0","call_id":"toolu_a","name":"get_time"}}\n\n',
+      'event: response.function_call_arguments.delta\ndata: {"output_index":0,"delta":"{\\"tz\\":\\"Asia/Shanghai\\"}"}\n\n',
+      'event: response.output_item.added\ndata: {"output_index":1,"item":{"type":"function_call","id":"item_1","call_id":"toolu_b","name":"get_time"}}\n\n',
+      'event: response.function_call_arguments.delta\ndata: {"output_index":1,"delta":"{\\"tz\\":\\"Europe/London\\"}"}\n\n',
+      'event: response.output_text.done\ndata: {"output_index":0,"content_index":0,"item_id":"msg_0","text":"working"}\n\n',
+      'event: response.function_call_arguments.done\ndata: {"output_index":0}\n\n',
+      'event: response.function_call_arguments.done\ndata: {"output_index":1}\n\n',
+      'event: response.completed\ndata: {"response":{"id":"r2c","model":"claude-opus-5","status":"completed"}}\n\n',
+    ]
+
+    const events = await collectSse(openaiResponsesStreamToAnthropic(makeStream(sseChunks), 'claude-opus-5'))
+
+    const toolStarts = events.filter(
+      (e) => e.event === 'content_block_start' && (e.data.content_block as Record<string, unknown>)?.type === 'tool_use',
+    )
+    expect(toolStarts).toHaveLength(2)
+
+    const argsFor = (index: number): string => events
+      .filter((e) => e.event === 'content_block_delta'
+        && e.data.index === index
+        && (e.data.delta as Record<string, unknown>)?.type === 'input_json_delta')
+      .map((e) => (e.data.delta as Record<string, unknown>).partial_json)
+      .join('')
+
+    expect(argsFor(toolStarts[0]!.data.index as number)).toBe('{"tz":"Asia/Shanghai"}')
+    expect(argsFor(toolStarts[1]!.data.index as number)).toBe('{"tz":"Europe/London"}')
+
+    // The text block must not absorb any tool arguments.
+    const textStart = events.find(
+      (e) => e.event === 'content_block_start' && (e.data.content_block as Record<string, unknown>)?.type === 'text',
+    )!
+    expect(argsFor(textStart.data.index as number)).toBe('')
+  })
+
+  test('closes dangling content blocks at response.completed', async () => {
+    // Upstream opens a tool block then goes straight to completion without any argument event.
+    const sseChunks = [
+      'event: response.created\ndata: {"id":"r2d","model":"claude-opus-5","status":"in_progress"}\n\n',
+      'event: response.output_item.added\ndata: {"output_index":0,"item":{"type":"function_call","id":"item_0","call_id":"toolu_z","name":"Bash"}}\n\n',
+      'event: response.completed\ndata: {"response":{"id":"r2d","model":"claude-opus-5","status":"completed"}}\n\n',
+    ]
+
+    const events = await collectSse(openaiResponsesStreamToAnthropic(makeStream(sseChunks), 'claude-opus-5'))
+
+    const opened = events.filter((e) => e.event === 'content_block_start').map((e) => e.data.index)
+    const closed = events.filter((e) => e.event === 'content_block_stop').map((e) => e.data.index)
+    expect(opened.length).toBeGreaterThan(0)
+    expect(closed.sort()).toEqual(opened.sort())
+
+    // Every stop must precede message_stop.
+    const lastStop = events.map((e) => e.event).lastIndexOf('content_block_stop')
+    expect(lastStop).toBeLessThan(events.map((e) => e.event).indexOf('message_stop'))
+  })
+
   test('maps cached tokens from response.completed usage', async () => {
     const sseChunks = [
       'event: response.created\ndata: {"id":"r3","model":"gpt-5.4","status":"in_progress"}\n\n',

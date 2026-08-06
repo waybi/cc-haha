@@ -95,6 +95,7 @@
     "electron:build": "bun run build:sidecars && bun run build && bun run build:electron",
     "electron:package": "bun run clean:electron-output && bun run electron:build && node ./node_modules/electron-builder/out/cli/cli.js --publish never",
     "electron:package:dir": "bun run clean:electron-output && bun run electron:build && node ./node_modules/electron-builder/out/cli/cli.js --dir --publish never",
+    "install:local": "bash ./scripts/install-local-macos.sh",
     "check:electron": "node ./node_modules/typescript/bin/tsc -p electron/tsconfig.json && bun test ./electron && bun run build:electron",
     "preview": "vite preview",
     "test": "vitest",

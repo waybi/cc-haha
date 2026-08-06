@@ -21,6 +21,7 @@
     "check:agent-flow": "bun run scripts/quality-gate/agent-flow/index.ts",
     "check:desktop-ui-smoke": "bun run scripts/quality-gate/desktop-smoke/deterministic-cli.ts",
     "check:desktop": "cd desktop && bun run lint && bun run test -- --run && bun run build",
+    "desktop:install": "cd desktop && bun run install:local",
     "check:electron": "cd desktop && bun run check:electron",
     "check:adapters": "cd adapters && bun test",
     "check:native": "cd desktop && bun run build:sidecars && bun run test:compiled-sidecar-smoke && bun run check:electron && CSC_IDENTITY_AUTO_DISCOVERY=false bun run electron:package:dir && cd .. && bun run test:package-smoke:current",

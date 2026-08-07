@@ -350,6 +350,23 @@ describe('resendEditedMessage', () => {
     expect(useChatStore.getState().sessions[TEST_SESSION_ID]!.editingLastMessage).toBeNull()
   })
 
+  it('surfaces the server reason so a refusal is actionable', async () => {
+    seedEditingSession()
+    // The server refuses for many distinct reasons; collapsing them into one
+    // opaque string leaves the user nothing to act on.
+    rewindMock.mockRejectedValueOnce(
+      new Error('One or more tracked files cannot be safely restored from this checkpoint.'),
+    )
+    const addToast = vi.spyOn(useUIStore.getState(), 'addToast')
+
+    await useChatStore.getState().resendEditedMessage(TEST_SESSION_ID, 'fixed prompt')
+
+    expect(addToast).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'error',
+      message: expect.stringContaining('cannot be safely restored'),
+    }))
+  })
+
   it('stops an in-flight turn before rewinding', async () => {
     seedEditingSession({ chatState: 'thinking' })
 

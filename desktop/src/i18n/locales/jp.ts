@@ -1836,6 +1836,7 @@ export const jp: Record<TranslationKey, string> = {
   'chat.rewindSuccessWithCode': '{count} 件のメッセージを巻き戻し、追跡対象のファイルを復元しました。',
   'chat.rewindSuccessConversationOnly': '{count} 件のメッセージを巻き戻しました。このターンには利用できるファイルチェックポイントがありませんでした。',
   'chat.editResendFailed': '元のメッセージを削除できなかったため保持されました。編集内容は新しいメッセージとして送信されました。',
+  'chat.editResendFailedWithReason': '元のメッセージを保持し、編集内容を新しいメッセージとして送信しました。{reason}',
   'chat.editingLastMessage': '直前のメッセージを編集中',
   'chat.editingLastMessageCancel': '編集をキャンセル',
   'chat.turnChangesTitle': '{count} 個のファイルが変更されました',

@@ -2063,15 +2063,22 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         userMessageIndex: editing.userMessageIndex,
         expectedContent: editing.expectedContent,
       })
-    } catch {
+    } catch (error) {
       // The transcript is untouched — executeSessionRewind rolls back any file
       // restore before it trims. Keep the original message and let the edit go
       // out as a new one rather than erasing a prompt whose file changes are
       // still on disk.
+      //
+      // Carry the server's own wording through: it refuses for many distinct
+      // reasons, most of them permanent for that message rather than worth
+      // retrying, so "it failed" alone leaves nothing to act on.
+      const reason = error instanceof Error ? error.message.trim() : ''
       get().exitEditLastMessage(sessionId)
       useUIStore.getState().addToast({
         type: 'error',
-        message: t('chat.editResendFailed'),
+        message: reason
+          ? t('chat.editResendFailedWithReason', { reason })
+          : t('chat.editResendFailed'),
       })
       get().sendMessage(sessionId, content, attachments, options)
       return

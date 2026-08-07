@@ -189,6 +189,7 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
     sendQueuedUserMessage,
     enterEditLastMessage,
     exitEditLastMessage,
+    resendEditedMessage,
   } = useChatStore()
   const activeTabId = useTabStore((s) => s.activeTabId)
   const sessionState = useChatStore((s) => activeTabId ? s.sessions[activeTabId] : undefined)
@@ -819,6 +820,13 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
       queueUserMessage(targetSessionId, {
         content: contentForModel,
         attachments: [...uploadAttachmentPayload, ...workspaceAttachmentPayload],
+        displayContent,
+        displayAttachments: visibleAttachmentPayload,
+      })
+    } else if (editingLastMessage && targetSessionId === activeTabId) {
+      // Trims the message being replaced before sending, so the edit lands as
+      // one message instead of a near-duplicate pair.
+      void resendEditedMessage(targetSessionId, contentForModel, [...uploadAttachmentPayload, ...workspaceAttachmentPayload], {
         displayContent,
         displayAttachments: visibleAttachmentPayload,
       })

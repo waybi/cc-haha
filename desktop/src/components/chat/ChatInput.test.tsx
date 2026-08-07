@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   getRecentProjects: vi.fn(),
   search: vi.fn(),
   browse: vi.fn(),
+  rewind: vi.fn(),
   wsSend: vi.fn(),
   dialogOpen: vi.fn(),
   webviewDragHandlers: [] as Array<(event: { payload: unknown }) => void>,
@@ -39,6 +40,7 @@ vi.mock('../../api/sessions', () => ({
     getSlashCommands: mocks.getSlashCommands,
     getRepositoryContext: mocks.getRepositoryContext,
     getRecentProjects: mocks.getRecentProjects,
+    rewind: mocks.rewind,
   },
 }))
 
@@ -2260,6 +2262,43 @@ describe('ChatInput file mentions', () => {
 
       expect(useChatStore.getState().sessions[sessionId]!.editingLastMessage).toBeFalsy()
       expect(getComposerText()).toBe('/')
+    })
+
+    it('replaces the original message instead of appending a duplicate', async () => {
+      useChatStore.setState({
+        sessions: {
+          ...useChatStore.getState().sessions,
+          [sessionId]: {
+            ...useChatStore.getState().sessions[sessionId]!,
+            messages: [{
+              id: 'u1', type: 'user_text', content: 'origianl typo',
+              transcriptMessageId: 'uuid-1', timestamp: 1,
+            }],
+          },
+        },
+      })
+      mocks.rewind.mockResolvedValue({ conversation: { messagesRemoved: 1 }, code: { available: false } })
+      mocks.getMessages.mockResolvedValue({ messages: [] })
+      render(<ChatInput compact />)
+
+      fireEvent.keyDown(getComposerElement(), { key: 'ArrowUp' })
+      await waitFor(() => expect(getComposerText()).toBe('origianl typo'))
+      setComposerText('original typo fixed', 19)
+      fireEvent.keyDown(getComposerElement(), { key: 'Enter' })
+
+      await waitFor(() => {
+        expect(mocks.rewind).toHaveBeenCalledWith(sessionId, expect.objectContaining({
+          targetUserMessageId: 'uuid-1',
+          expectedContent: 'origianl typo',
+        }))
+      })
+      await waitFor(() => {
+        expect(mocks.wsSend).toHaveBeenCalledWith(sessionId, expect.objectContaining({
+          type: 'user_message',
+          content: 'original typo fixed',
+        }))
+      })
+      expect(useChatStore.getState().sessions[sessionId]!.editingLastMessage).toBeNull()
     })
 
     it('exits edit mode on Escape and clears the composer', async () => {

@@ -182,12 +182,11 @@ export function Sidebar({ isMobile = false, onRequestClose }: SidebarProps) {
     () => applyProjectOrder(projectGroups, projectOrder, pinnedProjectKeys, projectOrganization, projectSortBy),
     [projectGroups, projectOrder, pinnedProjectKeys, projectOrganization, projectSortBy],
   )
-  const visibleProjectGroups = useMemo(() => {
-    if (hiddenProjectKeys.size === 0) return orderedProjectGroups
-    return orderedProjectGroups.filter((project) => (
-      !hiddenProjectKeys.has(project.key)
+  const visibleProjectGroups = useMemo(() => (
+    orderedProjectGroups.filter((project) => (
+      !hiddenProjectKeys.has(project.key) && !isAbandonedTempProject(project)
     ))
-  }, [hiddenProjectKeys, orderedProjectGroups])
+  ), [hiddenProjectKeys, orderedProjectGroups])
   const showInitialLoading = isLoading && sessions.length === 0
   const showRefreshLoading = showInitialLoading
   // Index building/ready/off are implementation details of how the list is
@@ -1883,6 +1882,26 @@ function getVisibleProjectSessions(
 
 function getSessionProjectKey(session: SessionListItem): string {
   return session.projectRoot || session.workDir || session.projectPath || 'unknown'
+}
+
+// Scripts that run Claude inside a `mktemp -d` workspace leave the session
+// records behind after deleting the directory, so those throwaway paths would
+// otherwise pile up in the sidebar forever. Hiding them requires both signals:
+// a missing workspace alone can just mean an unmounted volume, where dropping
+// the project would look like data loss.
+function isAbandonedTempProject(project: ProjectGroup): boolean {
+  return project.sessions.every((session) => (
+    getSessionWorkspaceState(session) === 'missing'
+    && isTempWorkspacePath(session.workDir || session.projectRoot || session.projectPath)
+  ))
+}
+
+function isTempWorkspacePath(path: string | null | undefined): boolean {
+  if (!path) return false
+  // `/private/…` is the resolved form macOS reports for `/tmp` and `$TMPDIR`.
+  const withoutPrivate = path.replace(/^\/private(?=\/)/, '')
+  return /^\/tmp\//.test(withoutPrivate)
+    || /^\/var\/folders\/.+\/T\//.test(withoutPrivate)
 }
 
 function compareSessionsByTimestamp(

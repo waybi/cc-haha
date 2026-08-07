@@ -569,6 +569,83 @@ describe('Sidebar', () => {
     expect(window.localStorage.getItem(PROJECT_SORT_STORAGE_KEY)).toBe('createdAt')
   })
 
+  it('hides projects whose temp working directory no longer exists', () => {
+    const now = new Date().toISOString()
+    const ghost = (id: string, workDir: string): SessionListItem => ({
+      ...makeSession(id, `Probe ${id}`, workDir, now),
+      workDirExists: false,
+      workspaceState: 'missing',
+    })
+    useSessionStore.setState({
+      sessions: [
+        makeSession('alpha-1', 'Alpha Session', '/workspace/alpha', now),
+        ghost('probe-1', '/tmp/tier-Q1-claude-opus-5-skill-vTFGxz'),
+        ghost('probe-2', '/private/tmp/tier-Q2-gemini-3-6-flash-noskill-mpVcAH'),
+        ghost('probe-3', '/var/folders/4r/9157j_6s19v6yd61x9f5t2zw0000gn/T/tier-Q3-noskill-abc123'),
+        ghost('probe-4', '/private/var/folders/4r/9157j_6s19v6yd61x9f5t2zw0000gn/T/tier-Q3-skill-def456'),
+      ],
+    })
+
+    render(<Sidebar />)
+
+    expect(projectGroupNames()).toEqual(['alpha'])
+  })
+
+  it('keeps a missing project whose path merely starts with a temp-like prefix', () => {
+    const now = new Date().toISOString()
+    useSessionStore.setState({
+      sessions: [
+        {
+          ...makeSession('beta-1', 'Beta Session', '/tmpfs-data/beta', now),
+          workDirExists: false,
+          workspaceState: 'missing',
+        },
+      ],
+    })
+
+    render(<Sidebar />)
+
+    expect(projectGroupNames()).toHaveLength(1)
+  })
+
+  it('keeps projects whose missing working directory is outside temp dirs', () => {
+    const now = new Date().toISOString()
+    useSessionStore.setState({
+      sessions: [
+        makeSession('alpha-1', 'Alpha Session', '/workspace/alpha', now),
+        {
+          ...makeSession('beta-1', 'Beta Session', '/Volumes/external/beta', now),
+          workDirExists: false,
+          workspaceState: 'missing',
+        },
+      ],
+    })
+
+    render(<Sidebar />)
+
+    expect(projectGroupNames()).toHaveLength(2)
+    expect(screen.getByTestId('sidebar-project-group-Volumes-external-beta')).toBeInTheDocument()
+  })
+
+  it('keeps a temp project that still has a live session', () => {
+    const now = new Date().toISOString()
+    const workDir = '/tmp/tier-Q1-claude-opus-5-skill-vTFGxz'
+    useSessionStore.setState({
+      sessions: [
+        {
+          ...makeSession('probe-dead', 'Dead probe', workDir, now),
+          workDirExists: false,
+          workspaceState: 'missing',
+        },
+        makeSession('probe-live', 'Live probe', workDir, now),
+      ],
+    })
+
+    render(<Sidebar />)
+
+    expect(projectGroupNames()).toHaveLength(1)
+  })
+
   it('hides archive-all from the project header menu', () => {
     const now = new Date().toISOString()
     useSessionStore.setState({

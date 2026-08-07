@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback, useMemo, useId } from 'react'
+import { X } from 'lucide-react'
 import { useDismissable } from '@/hooks/useDismissable'
 import { Button } from '@/components/ui/Button'
 import { IconButton } from '@/components/ui/IconButton'
@@ -1198,6 +1199,34 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
               onHighlight={setSlashSelectedIndex}
               showKeyboardHints={!isMobileComposer}
             />
+          )}
+
+          {editingLastMessage && activeTabId && (
+            // Without this the recalled prompt is indistinguishable from a
+            // fresh draft, and nothing warns that submitting rewrites history.
+            <div
+              data-testid="editing-last-message-indicator"
+              className={[
+                'flex min-w-0 items-center gap-2 rounded-[var(--radius-lg)] px-3.5 py-2',
+                'border border-dashed border-[var(--color-outline)]',
+                'text-[13.5px] text-[var(--color-text-secondary)]',
+                isHeroComposer ? '' : 'mb-2',
+              ].join(' ')}
+            >
+              <span className="min-w-0 flex-1 truncate">{t('chat.editingLastMessage')}</span>
+              <button
+                type="button"
+                aria-label={t('chat.editingLastMessageCancel')}
+                className="shrink-0 rounded-[var(--radius-sm)] p-0.5 text-[var(--color-text-tertiary)] hover:text-[var(--color-text-primary)]"
+                onClick={() => {
+                  exitEditLastMessage(activeTabId)
+                  setComposerInput('', [])
+                  setComposerAttachments([])
+                }}
+              >
+                <X className="h-3.5 w-3.5" strokeWidth={1.8} />
+              </button>
+            </div>
           )}
 
           {!isMemberSession && activeTabId && queuedUserMessages.length > 0 && (

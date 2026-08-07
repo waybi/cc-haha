@@ -1835,6 +1835,8 @@ export const zh: Record<TranslationKey, string> = {
   'chat.rewindSuccessWithCode': '已回滚 {count} 条消息，并恢复相关文件。',
   'chat.rewindSuccessConversationOnly': '已回滚 {count} 条消息。这一轮没有可用的文件检查点。',
   'chat.editResendFailed': '无法移除原消息，已保留。编辑后的内容已作为新消息发送。',
+  'chat.editingLastMessage': '正在编辑上一条消息',
+  'chat.editingLastMessageCancel': '取消编辑',
   'chat.turnChangesTitle': '{count} 个文件已更改',
   'chat.turnChangesLatestCardLabel': '轮次已更改文件',
   'chat.turnChangesHistoricalCardLabel': '轮次已更改文件',

@@ -2301,6 +2301,25 @@ describe('ChatInput file mentions', () => {
       expect(useChatStore.getState().sessions[sessionId]!.editingLastMessage).toBeNull()
     })
 
+    it('shows an editing indicator that cancels edit mode when dismissed', async () => {
+      seedLastUserMessage()
+      render(<ChatInput compact />)
+
+      fireEvent.keyDown(getComposerElement(), { key: 'ArrowUp' })
+
+      await waitFor(() => {
+        expect(screen.getByText('Editing your last message')).toBeInTheDocument()
+      })
+
+      fireEvent.click(screen.getByLabelText('Cancel editing'))
+
+      await waitFor(() => {
+        expect(screen.queryByText('Editing your last message')).not.toBeInTheDocument()
+        expect(useChatStore.getState().sessions[sessionId]!.editingLastMessage).toBeNull()
+        expect(getComposerText()).toBe('')
+      })
+    })
+
     it('exits edit mode on Escape and clears the composer', async () => {
       seedLastUserMessage()
       render(<ChatInput compact />)

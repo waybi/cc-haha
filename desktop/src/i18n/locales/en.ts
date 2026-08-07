@@ -1834,6 +1834,8 @@ Row 9, all 8 cells: continuing from straight down, turning left through lower-le
   'chat.rewindSuccessWithCode': 'Rewound {count} messages and restored tracked files.',
   'chat.rewindSuccessConversationOnly': 'Rewound {count} messages. No file checkpoint was available for this turn.',
   'chat.editResendFailed': 'Could not remove the original message, so it was kept. Your edited message was sent as a new one.',
+  'chat.editingLastMessage': 'Editing your last message',
+  'chat.editingLastMessageCancel': 'Cancel editing',
   'chat.turnChangesTitle': '{count} files changed',
   'chat.turnChangesLatestCardLabel': 'Turn changed files',
   'chat.turnChangesHistoricalCardLabel': 'Turn changed files',

@@ -301,13 +301,23 @@ describe('useKeyboardShortcuts model selector', () => {
     cleanup()
   })
 
-  it('opens the model picker with Cmd+Shift+M', () => {
+  it('opens the model picker with Cmd+Shift+A', () => {
+    const handle = { open: vi.fn(), openEffort: vi.fn(() => true) }
+    render(<SelectorHost handle={handle} />)
+
+    fireEvent.keyDown(document, { key: 'A', metaKey: true, shiftKey: true })
+
+    expect(handle.open).toHaveBeenCalledTimes(1)
+    expect(handle.openEffort).not.toHaveBeenCalled()
+  })
+
+  it('leaves the model picker closed on the retired Cmd+Shift+M', () => {
     const handle = { open: vi.fn(), openEffort: vi.fn(() => true) }
     render(<SelectorHost handle={handle} />)
 
     fireEvent.keyDown(document, { key: 'M', metaKey: true, shiftKey: true })
 
-    expect(handle.open).toHaveBeenCalledTimes(1)
+    expect(handle.open).not.toHaveBeenCalled()
     expect(handle.openEffort).not.toHaveBeenCalled()
   })
 
@@ -325,7 +335,7 @@ describe('useKeyboardShortcuts model selector', () => {
     render(<ShortcutHost />)
 
     expect(() => {
-      fireEvent.keyDown(document, { key: 'M', metaKey: true, shiftKey: true })
+      fireEvent.keyDown(document, { key: 'A', metaKey: true, shiftKey: true })
       fireEvent.keyDown(document, { key: 'R', metaKey: true, shiftKey: true })
     }).not.toThrow()
   })
@@ -336,7 +346,7 @@ describe('useKeyboardShortcuts model selector', () => {
     unmount()
     render(<ShortcutHost />)
 
-    fireEvent.keyDown(document, { key: 'M', metaKey: true, shiftKey: true })
+    fireEvent.keyDown(document, { key: 'A', metaKey: true, shiftKey: true })
 
     expect(handle.open).not.toHaveBeenCalled()
   })

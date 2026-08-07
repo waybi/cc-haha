@@ -119,8 +119,8 @@ export function useKeyboardShortcuts() {
         return
       }
 
-      // Cmd+Shift+M — Open the composer's model picker
-      if (meta && e.shiftKey && e.key.toLowerCase() === 'm') {
+      // Cmd+Shift+A — Open the composer's model picker
+      if (meta && e.shiftKey && e.key.toLowerCase() === 'a') {
         e.preventDefault()
         getComposerModelSelector()?.open()
         return

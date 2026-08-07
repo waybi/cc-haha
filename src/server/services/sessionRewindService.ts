@@ -371,6 +371,14 @@ async function readFileOrNull(filePath: string): Promise<string | null> {
   }
 }
 
+async function directoryExists(dirPath: string): Promise<boolean> {
+  try {
+    return (await lstat(dirPath)).isDirectory()
+  } catch {
+    return false
+  }
+}
+
 function countInsertedLines(content: string): number {
   return diffLines('', content).reduce((total, change) => (
     change.added ? total + (change.count || 0) : total
@@ -1265,6 +1273,16 @@ async function buildRestorePlan(
       throw ApiError.badRequest(`Checkpoint backup is missing: ${backupFileName}`)
     }
     if (restorableFileStatesMatch(originalState, targetState)) continue
+    // Recreating a file whose directory the user has since removed — a deleted
+    // worktree, say — would resurrect a tree they discarded. Tracked paths
+    // outlive the turns that touched them, so skip rather than rebuild.
+    if (
+      !originalState.exists &&
+      targetState.exists &&
+      !(await directoryExists(dirname(absolutePath)))
+    ) {
+      continue
+    }
     await assertRestoreTargetWritable(absolutePath, originalState, targetState)
     plan.push({ trackingPath, absolutePath, originalState, targetState })
   }

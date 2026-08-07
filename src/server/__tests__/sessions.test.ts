@@ -6104,6 +6104,55 @@ describe('Sessions API', () => {
       .toContain(userId)
   })
 
+  it('POST /api/sessions/:id/rewind should rewind an interrupted empty turn whose snapshot tracks a stale path', async () => {
+    // Pressing ESC leaves a user message with nothing after it. A path tracked
+    // by that turn's snapshot but never touched by the turn — typically a
+    // leftover from an earlier turn, in a directory that has since been
+    // removed — must not make the empty turn unrestorable.
+    const sessionId = '99999999-bbbb-cccc-dddd-000000000031'
+    const workDir = path.join(tmpDir, 'interrupted-stale-path-session')
+    const removedDir = path.join(tmpDir, 'interrupted-stale-path-removed')
+    const staleFile = path.join(removedDir, 'stale.sh')
+    const firstUserId = crypto.randomUUID()
+    const targetUserId = crypto.randomUUID()
+    const staleBackup = 'interrupted-stale@v1'
+
+    await fs.mkdir(workDir, { recursive: true })
+    // The tracked file's directory no longer exists — the worktree was deleted.
+    await writeFileHistoryBackup(sessionId, staleBackup, "echo 'stale'\n")
+
+    await writeSessionFile('-tmp-interrupted-stale-path-session', sessionId, [
+      makeSessionMetaEntry(workDir),
+      { ...makeUserEntry('first prompt', firstUserId), cwd: workDir, sessionId },
+      makeAssistantEntry('first reply', firstUserId),
+      // The interrupted turn's snapshot still carries the stale path.
+      makeFileHistorySnapshotEntry(targetUserId, {
+        [staleFile]: {
+          backupFileName: staleBackup,
+          version: 1,
+          backupTime: '2026-01-02T00:00:00.000Z',
+        },
+      }),
+      { ...makeUserEntry('interrupted prompt', targetUserId), cwd: workDir, sessionId },
+      // Nothing follows: ESC ended the turn before any tool ran.
+    ])
+
+    const rewindRes = await fetch(`${baseUrl}/api/sessions/${sessionId}/rewind`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetUserMessageId: targetUserId,
+        expectedContent: 'interrupted prompt',
+      }),
+    })
+    expect(rewindRes.status).toBe(200)
+
+    expect((await service.getSessionMessages(sessionId)).map((message) => message.id))
+      .not.toContain(targetUserId)
+    // The removed directory is not recreated on the user's behalf.
+    expect(await fs.access(removedDir).then(() => true, () => false)).toBe(false)
+  })
+
   it('GET /api/sessions/:id/turn-checkpoints should not treat a next-turn backup as a restorable target snapshot', async () => {
     const sessionId = '99999999-bbbb-cccc-dddd-000000000015'
     const workDir = path.join(tmpDir, 'historical-partial-snapshot-session')

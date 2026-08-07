@@ -4,6 +4,7 @@ import { useSessionRuntimeStore } from './sessionRuntimeStore'
 
 const {
   sendMock,
+  rewindMock,
   getMemberBySessionIdMock,
   sendMessageToMemberMock,
   handleTeamCreatedMock,
@@ -26,6 +27,7 @@ const {
   connectionStateHandlers,
 } = vi.hoisted(() => ({
   sendMock: vi.fn(),
+  rewindMock: vi.fn(async () => ({})),
   getMemberBySessionIdMock: vi.fn<(sessionId: string) => any>(() => null),
   sendMessageToMemberMock: vi.fn(async () => {}),
   handleTeamCreatedMock: vi.fn(),
@@ -85,6 +87,7 @@ vi.mock('../api/sessions', () => ({
   sessionsApi: {
     getMessages: vi.fn(async () => ({ messages: [] })),
     getSlashCommands: vi.fn(async () => ({ commands: [] })),
+    rewind: rewindMock,
   },
 }))
 
@@ -137,6 +140,7 @@ vi.mock('./cliTaskStore', () => ({
 
 import { sessionsApi } from '../api/sessions'
 import { useSettingsStore } from './settingsStore'
+import { useUIStore } from './uiStore'
 import {
   mapHistoryMessagesToUiMessages,
   reconstructAgentNotifications,
@@ -262,6 +266,89 @@ describe('exitEditLastMessage', () => {
     useChatStore.getState().exitEditLastMessage(TEST_SESSION_ID)
 
     expect(useChatStore.getState().sessions[TEST_SESSION_ID]!.editingLastMessage).toBeNull()
+  })
+})
+
+describe('resendEditedMessage', () => {
+  function seedEditingSession(overrides: Partial<PerSessionState> = {}) {
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          chatState: 'idle',
+          messages: [
+            {
+              id: 'u1', type: 'user_text', content: 'typo prompt',
+              transcriptMessageId: 'uuid-1', timestamp: 1,
+            },
+            { id: 'a1', type: 'assistant_text', content: 'partial', timestamp: 2 },
+          ],
+          ...overrides,
+        }),
+      },
+    })
+    useChatStore.getState().enterEditLastMessage(TEST_SESSION_ID)
+  }
+
+  it('rewinds the original message before sending the edited text', async () => {
+    seedEditingSession()
+
+    await useChatStore.getState().resendEditedMessage(TEST_SESSION_ID, 'fixed prompt')
+
+    expect(rewindMock).toHaveBeenCalledWith(TEST_SESSION_ID, {
+      targetUserMessageId: 'uuid-1',
+      userMessageIndex: 0,
+      expectedContent: 'typo prompt',
+    })
+    expect(sendMock).toHaveBeenCalledWith(TEST_SESSION_ID, expect.objectContaining({
+      type: 'user_message',
+      content: 'fixed prompt',
+    }))
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]!.editingLastMessage).toBeNull()
+  })
+
+  it('falls back to the user message index when the target is not hydrated', async () => {
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          chatState: 'idle',
+          messages: [{ id: 'u1', type: 'user_text', content: 'optimistic', timestamp: 1 }],
+        }),
+      },
+    })
+    useChatStore.getState().enterEditLastMessage(TEST_SESSION_ID)
+
+    await useChatStore.getState().resendEditedMessage(TEST_SESSION_ID, 'edited')
+
+    expect(rewindMock).toHaveBeenCalledWith(TEST_SESSION_ID, {
+      userMessageIndex: 0,
+      expectedContent: 'optimistic',
+    })
+  })
+
+  it('keeps the original message and still sends when the rewind fails', async () => {
+    seedEditingSession()
+    rewindMock.mockRejectedValueOnce(new Error('unrestorable file changes'))
+    const addToast = vi.spyOn(useUIStore.getState(), 'addToast')
+
+    await useChatStore.getState().resendEditedMessage(TEST_SESSION_ID, 'fixed prompt')
+
+    expect(sendMock).toHaveBeenCalledWith(TEST_SESSION_ID, expect.objectContaining({
+      type: 'user_message',
+      content: 'fixed prompt',
+    }))
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]!.messages.some(
+      (message) => message.type === 'user_text' && message.content === 'typo prompt',
+    )).toBe(true)
+    expect(addToast).toHaveBeenCalledWith(expect.objectContaining({ type: 'error' }))
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]!.editingLastMessage).toBeNull()
+  })
+
+  it('stops an in-flight turn before rewinding', async () => {
+    seedEditingSession({ chatState: 'thinking' })
+
+    await useChatStore.getState().resendEditedMessage(TEST_SESSION_ID, 'fixed prompt')
+
+    expect(sendMock).toHaveBeenCalledWith(TEST_SESSION_ID, { type: 'stop_generation' })
   })
 })
 

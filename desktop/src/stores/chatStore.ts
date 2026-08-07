@@ -6,6 +6,7 @@ import { useSessionStore } from './sessionStore'
 import { useCLITaskStore } from './cliTaskStore'
 import { useSessionRuntimeStore } from './sessionRuntimeStore'
 import { useTabStore } from './tabStore'
+import { useUIStore } from './uiStore'
 import { randomSpinnerVerb } from '../config/spinnerVerbs'
 import { notifyDesktop } from '../lib/desktopNotifications'
 import { deriveSessionTitle, isPlaceholderSessionTitle } from '../lib/sessionTitle'
@@ -351,6 +352,12 @@ type ChatStore = {
   clearComposerPrefill: (sessionId: string, nonce?: number) => void
   enterEditLastMessage: (sessionId: string) => boolean
   exitEditLastMessage: (sessionId: string) => void
+  resendEditedMessage: (
+    sessionId: string,
+    content: string,
+    attachments?: AttachmentRef[],
+    options?: { displayContent?: string; displayAttachments?: AttachmentRef[]; hideDisplayContent?: boolean },
+  ) => Promise<void>
   queueComposerInsertion: (
     sessionId: string,
     insertion: Omit<ComposerReferenceInsertion, 'nonce'>,
@@ -2034,6 +2041,45 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         editingLastMessage: null,
       })),
     }))
+  },
+
+  resendEditedMessage: async (sessionId, content, attachments, options) => {
+    const session = get().sessions[sessionId]
+    const editing = session?.editingLastMessage
+    if (!editing) {
+      get().sendMessage(sessionId, content, attachments, options)
+      return
+    }
+
+    if (session && session.chatState !== 'idle') {
+      get().stopGeneration(sessionId)
+    }
+
+    try {
+      await sessionsApi.rewind(sessionId, {
+        ...(editing.transcriptMessageId
+          ? { targetUserMessageId: editing.transcriptMessageId }
+          : {}),
+        userMessageIndex: editing.userMessageIndex,
+        expectedContent: editing.expectedContent,
+      })
+    } catch {
+      // The transcript is untouched — executeSessionRewind rolls back any file
+      // restore before it trims. Keep the original message and let the edit go
+      // out as a new one rather than erasing a prompt whose file changes are
+      // still on disk.
+      get().exitEditLastMessage(sessionId)
+      useUIStore.getState().addToast({
+        type: 'error',
+        message: t('chat.editResendFailed'),
+      })
+      get().sendMessage(sessionId, content, attachments, options)
+      return
+    }
+
+    await get().reloadHistory(sessionId)
+    get().exitEditLastMessage(sessionId)
+    get().sendMessage(sessionId, content, attachments, options)
   },
 
   queueComposerInsertion: (sessionId, insertion) => {

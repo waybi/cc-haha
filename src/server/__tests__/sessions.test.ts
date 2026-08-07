@@ -5049,6 +5049,54 @@ describe('Sessions API', () => {
     ])
   })
 
+  it('POST /api/sessions/:id/rewind should rewind an interrupted turn that changed no files', async () => {
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeee00000001'
+    const firstUserId = crypto.randomUUID()
+    const firstAssistantId = crypto.randomUUID()
+    const targetUserId = crypto.randomUUID()
+    const partialAssistantId = crypto.randomUUID()
+
+    await writeSessionFile('-tmp-api-rewind-interrupted', sessionId, [
+      makeSnapshotEntry(),
+      makeUserEntry('first prompt', firstUserId),
+      {
+        ...makeAssistantEntry('first reply', firstUserId),
+        uuid: firstAssistantId,
+      },
+      makeUserEntry('second prompt with typo', targetUserId),
+      {
+        ...makeAssistantEntry('partial answer before interrupt', targetUserId),
+        uuid: partialAssistantId,
+      },
+    ])
+
+    const executeRes = await fetch(`${baseUrl}/api/sessions/${sessionId}/rewind`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetUserMessageId: targetUserId,
+        userMessageIndex: 1,
+        expectedContent: 'second prompt with typo',
+      }),
+    })
+    expect(executeRes.status).toBe(200)
+
+    const executeBody = await executeRes.json() as {
+      conversation: { messagesRemoved: number; removedMessageIds: string[] }
+    }
+    expect(executeBody.conversation.messagesRemoved).toBe(2)
+    expect(executeBody.conversation.removedMessageIds).toEqual([
+      targetUserId,
+      partialAssistantId,
+    ])
+
+    const remainingMessages = await service.getSessionMessages(sessionId)
+    expect(remainingMessages.map((message) => message.id)).toEqual([
+      firstUserId,
+      firstAssistantId,
+    ])
+  })
+
   it('POST /api/sessions/:id/rewind should reject an index fallback when the selected prompt no longer matches', async () => {
     const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-000000000000'
     const firstUserId = crypto.randomUUID()

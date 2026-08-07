@@ -270,6 +270,13 @@ describe('exitEditLastMessage', () => {
 })
 
 describe('resendEditedMessage', () => {
+  // This file has no global mock reset, so call-order assertions below would
+  // otherwise read invocations left behind by earlier tests.
+  beforeEach(() => {
+    sendMock.mockClear()
+    rewindMock.mockClear()
+  })
+
   function seedEditingSession(overrides: Partial<PerSessionState> = {}) {
     useChatStore.setState({
       sessions: {
@@ -348,7 +355,14 @@ describe('resendEditedMessage', () => {
 
     await useChatStore.getState().resendEditedMessage(TEST_SESSION_ID, 'fixed prompt')
 
-    expect(sendMock).toHaveBeenCalledWith(TEST_SESSION_ID, { type: 'stop_generation' })
+    const stopCall = sendMock.mock.calls.findIndex(
+      ([, payload]) => payload?.type === 'stop_generation',
+    )
+    expect(stopCall).toBeGreaterThanOrEqual(0)
+    // Ordering is the point: rewinding a turn that is still streaming would
+    // race the runtime against the transcript trim.
+    expect(sendMock.mock.invocationCallOrder[stopCall]!)
+      .toBeLessThan(rewindMock.mock.invocationCallOrder[0]!)
   })
 })
 

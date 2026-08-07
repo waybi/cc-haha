@@ -907,6 +907,90 @@ describe('TabBar', () => {
     expect(scrollByMock).toHaveBeenCalledWith({ left: 300, behavior: 'smooth' })
   })
 
+  describe('driving the strip with the wheel', () => {
+    // The strip is `overflow-x-hidden` so no scrollbar can cross the titlebar,
+    // and the browser therefore routes no wheel delta to it — before this the
+    // chevrons were the only way to move the row at all. Writing `scrollLeft`
+    // by hand still works under `hidden`, which is what these cover.
+    async function renderStrip({ scrollWidth }: { scrollWidth: number }) {
+      const { TabBar } = await import('./TabBar')
+      const { useTabStore } = await import('../../stores/tabStore')
+      const { useChatStore } = await import('../../stores/chatStore')
+
+      useTabStore.setState({
+        tabs: [
+          { sessionId: 'tab-1', title: 'First Session', type: 'session', status: 'idle' },
+          { sessionId: 'tab-2', title: 'Second Session', type: 'session', status: 'idle' },
+          { sessionId: 'tab-3', title: 'Third Session', type: 'session', status: 'idle' },
+        ],
+        activeTabId: 'tab-1',
+      })
+      useChatStore.setState({
+        sessions: {},
+        disconnectSession: vi.fn(),
+      } as Partial<ReturnType<typeof useChatStore.getState>>)
+
+      await act(async () => {
+        render(<TabBar />)
+      })
+
+      const strip = screen.getByTestId('tab-bar-scroll-region')
+      let scrollLeft = 0
+      Object.defineProperty(strip, 'clientWidth', { configurable: true, get: () => 400 })
+      Object.defineProperty(strip, 'scrollWidth', { configurable: true, get: () => scrollWidth })
+      Object.defineProperty(strip, 'scrollLeft', {
+        configurable: true,
+        get: () => scrollLeft,
+        set: (value: number) => { scrollLeft = value },
+      })
+      Object.defineProperty(strip, 'scrollBy', { configurable: true, value: vi.fn() })
+
+      return strip
+    }
+
+    it('spends a vertical wheel delta sideways', async () => {
+      const strip = await renderStrip({ scrollWidth: 1200 })
+
+      const wheel = new WheelEvent('wheel', { deltaX: 0, deltaY: 120, bubbles: true, cancelable: true })
+      act(() => {
+        strip.dispatchEvent(wheel)
+      })
+
+      // A mouse wheel only ever reports deltaY, so spending it on the y axis
+      // would leave a plain mouse unable to reach the strip at all.
+      expect(strip.scrollLeft).toBe(120)
+      // The listener is native with `{ passive: false }` purely for this: React
+      // registers `wheel` passively at the root, where preventDefault is a
+      // silent no-op and the delta is *also* spent by the platform's own
+      // overscroll handling.
+      expect(wheel.defaultPrevented).toBe(true)
+    })
+
+    it('prefers the horizontal delta of a trackpad swipe', async () => {
+      const strip = await renderStrip({ scrollWidth: 1200 })
+
+      act(() => {
+        strip.dispatchEvent(new WheelEvent('wheel', { deltaX: -80, deltaY: 6, bubbles: true, cancelable: true }))
+      })
+
+      expect(strip.scrollLeft).toBe(-80)
+    })
+
+    it('leaves the event alone when the strip does not overflow', async () => {
+      const strip = await renderStrip({ scrollWidth: 320 })
+
+      const wheel = new WheelEvent('wheel', { deltaY: 120, bubbles: true, cancelable: true })
+      act(() => {
+        strip.dispatchEvent(wheel)
+      })
+
+      // Nothing to move, so the page keeps its own scroll rather than losing
+      // the gesture to a strip that cannot use it.
+      expect(strip.scrollLeft).toBe(0)
+      expect(wheel.defaultPrevented).toBe(false)
+    })
+  })
+
   it('scrolls the active tab into view when the active tab changes', async () => {
     const { TabBar } = await import('./TabBar')
     const { useTabStore } = await import('../../stores/tabStore')
@@ -1037,6 +1121,30 @@ describe('TabBar', () => {
       // view straight back and made the left end unreachable.
       fireStripResize()
 
+      expect(scrollIntoViewMock).not.toHaveBeenCalled()
+    })
+
+    it('leaves the strip alone once the user has driven it with the wheel', async () => {
+      const { activeTab, strip } = await renderOverflowingStrip()
+      stubRect(activeTab, 640, 896)
+      let scrollLeft = 108
+      Object.defineProperty(strip, 'scrollLeft', {
+        configurable: true,
+        get: () => scrollLeft,
+        set: (value: number) => { scrollLeft = value },
+      })
+
+      act(() => {
+        strip.dispatchEvent(new WheelEvent('wheel', { deltaY: 120, bubbles: true, cancelable: true }))
+      })
+      scrollIntoViewMock.mockClear()
+
+      // Same trap the chevrons fall into: retiring or reinstating a chevron as
+      // an end is reached resizes the strip mid-gesture, so realigning here
+      // would snap the view straight back and make the wheel useless.
+      fireStripResize()
+
+      expect(scrollLeft).toBe(228)
       expect(scrollIntoViewMock).not.toHaveBeenCalled()
     })
 

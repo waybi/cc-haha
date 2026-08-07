@@ -255,6 +255,41 @@ export function TabBar() {
     }
   }, [realignActiveTab, updateScrollState, tabs.length])
 
+  // Wheel → sideways. The strip is `overflow-x-hidden` so that no scrollbar
+  // can ever cross the titlebar, and the price of that is the browser refusing
+  // to route wheel deltas to it at all, which left the chevrons as the only way
+  // to move the row. Writing `scrollLeft` by hand is unaffected by `hidden`
+  // (unlike `clip`) — the same reason the chevrons' `scrollBy` works — so the
+  // wheel can drive the strip while it still shows no scrollbar.
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+
+    const handleWheel = (event: WheelEvent) => {
+      // Nothing to move. Leave the event alone rather than swallowing it, and
+      // in particular do not claim the position below.
+      if (el.scrollWidth <= el.clientWidth) return
+      // A mouse wheel reports only deltaY; a trackpad swipe is mostly deltaX.
+      // Take whichever axis the user actually pushed and spend it sideways.
+      const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY
+      if (delta === 0) return
+      // Same handover as the chevrons: the row's position is now the user's
+      // choice, so `realignActiveTab` must stop reclaiming it on resize.
+      userScrolledRef.current = true
+      // This is a native listener with `{ passive: false }` purely for this
+      // call — React registers `wheel` passively at the root, where
+      // `preventDefault` is a silent no-op and the delta goes on to be spent
+      // by the platform's own overscroll handling as well as by us.
+      event.preventDefault()
+      // Assigned, not `scrollBy({ behavior: 'smooth' })`: a smooth animation
+      // restarted by every tick of a wheel fights itself and lags the pointer.
+      el.scrollLeft += delta
+    }
+
+    el.addEventListener('wheel', handleWheel, { passive: false })
+    return () => el.removeEventListener('wheel', handleWheel)
+  }, [])
+
   useEffect(() => {
     if (!activeTabId) return
     const activeTabEl = tabRefs.current.get(activeTabId)
@@ -288,9 +323,7 @@ export function TabBar() {
     const el = scrollRef.current
     if (!el) return
     const step = el.clientWidth * SCROLL_STEP_RATIO
-    // The chevrons are the only way to drive the strip by hand — it is
-    // `overflow-x-hidden`, so wheel and trackpad do not reach it — which makes
-    // this the one place that has to hand the position over to the user.
+    // Hand the position over to the user, same as the wheel handler does.
     userScrolledRef.current = true
     el.scrollBy({ left: direction === 'left' ? -step : step, behavior: 'smooth' })
   }

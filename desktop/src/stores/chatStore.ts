@@ -6,6 +6,7 @@ import { useSessionStore } from './sessionStore'
 import { useCLITaskStore } from './cliTaskStore'
 import { useSessionRuntimeStore } from './sessionRuntimeStore'
 import { useTabStore } from './tabStore'
+import { useUIStore } from './uiStore'
 import { randomSpinnerVerb } from '../config/spinnerVerbs'
 import { notifyDesktop } from '../lib/desktopNotifications'
 import { deriveSessionTitle, isPlaceholderSessionTitle } from '../lib/sessionTitle'
@@ -86,6 +87,13 @@ export type ComposerReferenceInsertion = {
 
 export type ComposerPrefillMode = 'replace' | 'append'
 
+export type EditingLastMessageState = {
+  uiMessageId: string
+  expectedContent: string
+  transcriptMessageId?: string
+  userMessageIndex: number
+}
+
 export type PendingPermission = {
   requestId: string
   toolName: string
@@ -164,6 +172,7 @@ export type PerSessionState = {
     mode?: ComposerPrefillMode
     nonce: number
   } | null
+  editingLastMessage?: EditingLastMessageState | null
   composerInsertion?: ComposerReferenceInsertion | null
   composerDraft?: ComposerDraftState | null
   repositoryLaunchDraft?: RepositoryLaunchDraftState | null
@@ -206,6 +215,7 @@ const DEFAULT_SESSION_STATE: PerSessionState = {
   activeGoal: null,
   elapsedTimer: null,
   composerPrefill: null,
+  editingLastMessage: null,
   composerInsertion: null,
   composerDraft: null,
   repositoryLaunchDraft: null,
@@ -340,6 +350,14 @@ type ChatStore = {
     prefill: { text: string; attachments?: UIAttachment[]; mode?: ComposerPrefillMode },
   ) => void
   clearComposerPrefill: (sessionId: string, nonce?: number) => void
+  enterEditLastMessage: (sessionId: string) => boolean
+  exitEditLastMessage: (sessionId: string) => void
+  resendEditedMessage: (
+    sessionId: string,
+    content: string,
+    attachments?: AttachmentRef[],
+    options?: { displayContent?: string; displayAttachments?: AttachmentRef[]; hideDisplayContent?: boolean },
+  ) => Promise<void>
   queueComposerInsertion: (
     sessionId: string,
     insertion: Omit<ComposerReferenceInsertion, 'nonce'>,
@@ -1980,6 +1998,88 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         return { composerPrefill: null }
       }),
     }))
+  },
+
+  enterEditLastMessage: (sessionId) => {
+    const session = get().sessions[sessionId]
+    if (!session) return false
+
+    let userMessageIndex = -1
+    let targetIndex = -1
+    session.messages.forEach((message, index) => {
+      if (message.type === 'user_text' && !message.pending) {
+        userMessageIndex += 1
+        targetIndex = index
+      }
+    })
+    if (targetIndex < 0) return false
+
+    const target = session.messages[targetIndex]
+    if (!target || target.type !== 'user_text') return false
+
+    set((state) => ({
+      sessions: updateSessionIn(state.sessions, sessionId, () => ({
+        editingLastMessage: {
+          uiMessageId: target.id,
+          expectedContent: target.modelContent ?? target.content,
+          ...(target.transcriptMessageId ? { transcriptMessageId: target.transcriptMessageId } : {}),
+          userMessageIndex,
+        },
+      })),
+    }))
+
+    get().queueComposerPrefill(sessionId, {
+      text: target.content,
+      attachments: target.attachments,
+    })
+    return true
+  },
+
+  exitEditLastMessage: (sessionId) => {
+    set((state) => ({
+      sessions: updateSessionIn(state.sessions, sessionId, () => ({
+        editingLastMessage: null,
+      })),
+    }))
+  },
+
+  resendEditedMessage: async (sessionId, content, attachments, options) => {
+    const session = get().sessions[sessionId]
+    const editing = session?.editingLastMessage
+    if (!editing) {
+      get().sendMessage(sessionId, content, attachments, options)
+      return
+    }
+
+    if (session && session.chatState !== 'idle') {
+      get().stopGeneration(sessionId)
+    }
+
+    try {
+      await sessionsApi.rewind(sessionId, {
+        ...(editing.transcriptMessageId
+          ? { targetUserMessageId: editing.transcriptMessageId }
+          : {}),
+        userMessageIndex: editing.userMessageIndex,
+        expectedContent: editing.expectedContent,
+      })
+    } catch {
+      // The transcript is untouched — executeSessionRewind rolls back any file
+      // restore before it trims. Keep the original message and let the edit go
+      // out as a new one rather than erasing a prompt whose file changes are
+      // still on disk.
+      get().exitEditLastMessage(sessionId)
+      useUIStore.getState().addToast({
+        type: 'error',
+        message: t('chat.editResendFailed'),
+      })
+      get().sendMessage(sessionId, content, attachments, options)
+      return
+    }
+
+    await get().reloadHistory(sessionId)
+    get().exitEditLastMessage(sessionId)
+    get().sendMessage(sessionId, content, attachments, options)
   },
 
   queueComposerInsertion: (sessionId, insertion) => {

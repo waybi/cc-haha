@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback, useMemo, useId } from 'react'
+import { X } from 'lucide-react'
 import { useDismissable } from '@/hooks/useDismissable'
 import { Button } from '@/components/ui/Button'
 import { IconButton } from '@/components/ui/IconButton'
@@ -187,6 +188,9 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
     updateQueuedUserMessage,
     removeQueuedUserMessage,
     sendQueuedUserMessage,
+    enterEditLastMessage,
+    exitEditLastMessage,
+    resendEditedMessage,
   } = useChatStore()
   const activeTabId = useTabStore((s) => s.activeTabId)
   const sessionState = useChatStore((s) => activeTabId ? s.sessions[activeTabId] : undefined)
@@ -197,6 +201,7 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
   const chatState = sessionState?.chatState ?? 'idle'
   const slashCommands = sessionState?.slashCommands ?? []
   const composerPrefill = sessionState?.composerPrefill ?? null
+  const editingLastMessage = sessionState?.editingLastMessage ?? null
   const composerInsertion = sessionState?.composerInsertion ?? null
   const queuedUserMessages = sessionState?.queuedUserMessages ?? []
   const runtimeSelection = useSessionRuntimeStore((state) =>
@@ -819,6 +824,13 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
         displayContent,
         displayAttachments: visibleAttachmentPayload,
       })
+    } else if (editingLastMessage && targetSessionId === activeTabId) {
+      // Trims the message being replaced before sending, so the edit lands as
+      // one message instead of a near-duplicate pair.
+      void resendEditedMessage(targetSessionId, contentForModel, [...uploadAttachmentPayload, ...workspaceAttachmentPayload], {
+        displayContent,
+        displayAttachments: visibleAttachmentPayload,
+      })
     } else {
       sendMessage(targetSessionId, contentForModel, [...uploadAttachmentPayload, ...workspaceAttachmentPayload], {
         displayContent,
@@ -913,6 +925,31 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
         setSlashMenuOpen(false)
         return true
       }
+    }
+
+    // Recall the last prompt for editing. Only from a genuinely empty composer,
+    // so ArrowUp keeps its normal caret movement while a draft is being written.
+    if (
+      event.key === 'ArrowUp' &&
+      !isMemberSession &&
+      input === '' &&
+      composerAttachments.length === 0 &&
+      chatState === 'idle' &&
+      activeTabId
+    ) {
+      if (enterEditLastMessage(activeTabId)) {
+        event.preventDefault()
+        return true
+      }
+    }
+
+    // Returning true keeps the global Escape handler from also stopping generation.
+    if (event.key === 'Escape' && editingLastMessage && activeTabId) {
+      event.preventDefault()
+      exitEditLastMessage(activeTabId)
+      setComposerInput('', [])
+      setComposerAttachments([])
+      return true
     }
 
     if (shouldSubmitOnEnter(event, chatSendBehavior)) {
@@ -1162,6 +1199,34 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
               onHighlight={setSlashSelectedIndex}
               showKeyboardHints={!isMobileComposer}
             />
+          )}
+
+          {editingLastMessage && activeTabId && (
+            // Without this the recalled prompt is indistinguishable from a
+            // fresh draft, and nothing warns that submitting rewrites history.
+            <div
+              data-testid="editing-last-message-indicator"
+              className={[
+                'flex min-w-0 items-center gap-2 rounded-[var(--radius-lg)] px-3.5 py-2',
+                'border border-dashed border-[var(--color-outline)]',
+                'text-[13.5px] text-[var(--color-text-secondary)]',
+                isHeroComposer ? '' : 'mb-2',
+              ].join(' ')}
+            >
+              <span className="min-w-0 flex-1 truncate">{t('chat.editingLastMessage')}</span>
+              <button
+                type="button"
+                aria-label={t('chat.editingLastMessageCancel')}
+                className="shrink-0 rounded-[var(--radius-sm)] p-0.5 text-[var(--color-text-tertiary)] hover:text-[var(--color-text-primary)]"
+                onClick={() => {
+                  exitEditLastMessage(activeTabId)
+                  setComposerInput('', [])
+                  setComposerAttachments([])
+                }}
+              >
+                <X className="h-3.5 w-3.5" strokeWidth={1.8} />
+              </button>
+            </div>
           )}
 
           {!isMemberSession && activeTabId && queuedUserMessages.length > 0 && (

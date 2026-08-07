@@ -4,6 +4,7 @@ import { useSessionRuntimeStore } from './sessionRuntimeStore'
 
 const {
   sendMock,
+  rewindMock,
   getMemberBySessionIdMock,
   sendMessageToMemberMock,
   handleTeamCreatedMock,
@@ -26,6 +27,7 @@ const {
   connectionStateHandlers,
 } = vi.hoisted(() => ({
   sendMock: vi.fn(),
+  rewindMock: vi.fn(async () => ({})),
   getMemberBySessionIdMock: vi.fn<(sessionId: string) => any>(() => null),
   sendMessageToMemberMock: vi.fn(async () => {}),
   handleTeamCreatedMock: vi.fn(),
@@ -85,6 +87,7 @@ vi.mock('../api/sessions', () => ({
   sessionsApi: {
     getMessages: vi.fn(async () => ({ messages: [] })),
     getSlashCommands: vi.fn(async () => ({ commands: [] })),
+    rewind: rewindMock,
   },
 }))
 
@@ -137,6 +140,7 @@ vi.mock('./cliTaskStore', () => ({
 
 import { sessionsApi } from '../api/sessions'
 import { useSettingsStore } from './settingsStore'
+import { useUIStore } from './uiStore'
 import {
   mapHistoryMessagesToUiMessages,
   reconstructAgentNotifications,
@@ -174,6 +178,193 @@ function makeSession(overrides: Partial<PerSessionState> = {}): PerSessionState 
     ...overrides,
   }
 }
+
+describe('enterEditLastMessage', () => {
+  it('targets the last non-pending user message and prefills the composer', () => {
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          messages: [
+            { id: 'u1', type: 'user_text', content: 'first', timestamp: 1 },
+            { id: 'a1', type: 'assistant_text', content: 'answer', timestamp: 2 },
+            { id: 'u2', type: 'user_text', content: 'second', modelContent: 'second model', timestamp: 3 },
+          ],
+        }),
+      },
+    })
+
+    const entered = useChatStore.getState().enterEditLastMessage(TEST_SESSION_ID)
+
+    expect(entered).toBe(true)
+    const session = useChatStore.getState().sessions[TEST_SESSION_ID]!
+    expect(session.editingLastMessage).toMatchObject({
+      uiMessageId: 'u2',
+      expectedContent: 'second model',
+      userMessageIndex: 1,
+    })
+    expect(session.composerPrefill?.text).toBe('second')
+  })
+
+  it('falls back to content when modelContent is absent', () => {
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          messages: [{ id: 'u1', type: 'user_text', content: 'plain', timestamp: 1 }],
+        }),
+      },
+    })
+
+    useChatStore.getState().enterEditLastMessage(TEST_SESSION_ID)
+
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]!.editingLastMessage)
+      .toMatchObject({ expectedContent: 'plain', userMessageIndex: 0 })
+  })
+
+  it('ignores pending user messages and returns false when none are eligible', () => {
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          messages: [{ id: 'u1', type: 'user_text', content: 'queued', timestamp: 1, pending: true }],
+        }),
+      },
+    })
+
+    expect(useChatStore.getState().enterEditLastMessage(TEST_SESSION_ID)).toBe(false)
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]!.editingLastMessage).toBeFalsy()
+  })
+
+  it('carries transcriptMessageId through when the message is hydrated', () => {
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          messages: [{
+            id: 'u1', type: 'user_text', content: 'hydrated',
+            transcriptMessageId: 'uuid-1', timestamp: 1,
+          }],
+        }),
+      },
+    })
+
+    useChatStore.getState().enterEditLastMessage(TEST_SESSION_ID)
+
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]!.editingLastMessage)
+      .toMatchObject({ transcriptMessageId: 'uuid-1' })
+  })
+})
+
+describe('exitEditLastMessage', () => {
+  it('clears edit state', () => {
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          messages: [{ id: 'u1', type: 'user_text', content: 'x', timestamp: 1 }],
+        }),
+      },
+    })
+    useChatStore.getState().enterEditLastMessage(TEST_SESSION_ID)
+
+    useChatStore.getState().exitEditLastMessage(TEST_SESSION_ID)
+
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]!.editingLastMessage).toBeNull()
+  })
+})
+
+describe('resendEditedMessage', () => {
+  // This file has no global mock reset, so call-order assertions below would
+  // otherwise read invocations left behind by earlier tests.
+  beforeEach(() => {
+    sendMock.mockClear()
+    rewindMock.mockClear()
+  })
+
+  function seedEditingSession(overrides: Partial<PerSessionState> = {}) {
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          chatState: 'idle',
+          messages: [
+            {
+              id: 'u1', type: 'user_text', content: 'typo prompt',
+              transcriptMessageId: 'uuid-1', timestamp: 1,
+            },
+            { id: 'a1', type: 'assistant_text', content: 'partial', timestamp: 2 },
+          ],
+          ...overrides,
+        }),
+      },
+    })
+    useChatStore.getState().enterEditLastMessage(TEST_SESSION_ID)
+  }
+
+  it('rewinds the original message before sending the edited text', async () => {
+    seedEditingSession()
+
+    await useChatStore.getState().resendEditedMessage(TEST_SESSION_ID, 'fixed prompt')
+
+    expect(rewindMock).toHaveBeenCalledWith(TEST_SESSION_ID, {
+      targetUserMessageId: 'uuid-1',
+      userMessageIndex: 0,
+      expectedContent: 'typo prompt',
+    })
+    expect(sendMock).toHaveBeenCalledWith(TEST_SESSION_ID, expect.objectContaining({
+      type: 'user_message',
+      content: 'fixed prompt',
+    }))
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]!.editingLastMessage).toBeNull()
+  })
+
+  it('falls back to the user message index when the target is not hydrated', async () => {
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          chatState: 'idle',
+          messages: [{ id: 'u1', type: 'user_text', content: 'optimistic', timestamp: 1 }],
+        }),
+      },
+    })
+    useChatStore.getState().enterEditLastMessage(TEST_SESSION_ID)
+
+    await useChatStore.getState().resendEditedMessage(TEST_SESSION_ID, 'edited')
+
+    expect(rewindMock).toHaveBeenCalledWith(TEST_SESSION_ID, {
+      userMessageIndex: 0,
+      expectedContent: 'optimistic',
+    })
+  })
+
+  it('keeps the original message and still sends when the rewind fails', async () => {
+    seedEditingSession()
+    rewindMock.mockRejectedValueOnce(new Error('unrestorable file changes'))
+    const addToast = vi.spyOn(useUIStore.getState(), 'addToast')
+
+    await useChatStore.getState().resendEditedMessage(TEST_SESSION_ID, 'fixed prompt')
+
+    expect(sendMock).toHaveBeenCalledWith(TEST_SESSION_ID, expect.objectContaining({
+      type: 'user_message',
+      content: 'fixed prompt',
+    }))
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]!.messages.some(
+      (message) => message.type === 'user_text' && message.content === 'typo prompt',
+    )).toBe(true)
+    expect(addToast).toHaveBeenCalledWith(expect.objectContaining({ type: 'error' }))
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]!.editingLastMessage).toBeNull()
+  })
+
+  it('stops an in-flight turn before rewinding', async () => {
+    seedEditingSession({ chatState: 'thinking' })
+
+    await useChatStore.getState().resendEditedMessage(TEST_SESSION_ID, 'fixed prompt')
+
+    const stopCall = sendMock.mock.calls.findIndex(
+      ([, payload]) => payload?.type === 'stop_generation',
+    )
+    expect(stopCall).toBeGreaterThanOrEqual(0)
+    // Ordering is the point: rewinding a turn that is still streaming would
+    // race the runtime against the transcript trim.
+    expect(sendMock.mock.invocationCallOrder[stopCall]!)
+      .toBeLessThan(rewindMock.mock.invocationCallOrder[0]!)
+  })
+})
 
 describe('stripGeneratedImageMetadataLines', () => {
   it('removes simple, detailed, and resize metadata lines but keeps the prompt body', () => {

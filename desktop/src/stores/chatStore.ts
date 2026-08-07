@@ -2008,7 +2008,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     if (targetIndex < 0) return false
 
     const target = session.messages[targetIndex]
-    if (target.type !== 'user_text') return false
+    if (!target || target.type !== 'user_text') return false
 
     set((state) => ({
       sessions: updateSessionIn(state.sessions, sessionId, () => ({

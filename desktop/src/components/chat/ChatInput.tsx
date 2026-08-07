@@ -187,6 +187,8 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
     updateQueuedUserMessage,
     removeQueuedUserMessage,
     sendQueuedUserMessage,
+    enterEditLastMessage,
+    exitEditLastMessage,
   } = useChatStore()
   const activeTabId = useTabStore((s) => s.activeTabId)
   const sessionState = useChatStore((s) => activeTabId ? s.sessions[activeTabId] : undefined)
@@ -197,6 +199,7 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
   const chatState = sessionState?.chatState ?? 'idle'
   const slashCommands = sessionState?.slashCommands ?? []
   const composerPrefill = sessionState?.composerPrefill ?? null
+  const editingLastMessage = sessionState?.editingLastMessage ?? null
   const composerInsertion = sessionState?.composerInsertion ?? null
   const queuedUserMessages = sessionState?.queuedUserMessages ?? []
   const runtimeSelection = useSessionRuntimeStore((state) =>
@@ -913,6 +916,31 @@ export function ChatInput({ variant = 'default', compact = false }: ChatInputPro
         setSlashMenuOpen(false)
         return true
       }
+    }
+
+    // Recall the last prompt for editing. Only from a genuinely empty composer,
+    // so ArrowUp keeps its normal caret movement while a draft is being written.
+    if (
+      event.key === 'ArrowUp' &&
+      !isMemberSession &&
+      input === '' &&
+      composerAttachments.length === 0 &&
+      chatState === 'idle' &&
+      activeTabId
+    ) {
+      if (enterEditLastMessage(activeTabId)) {
+        event.preventDefault()
+        return true
+      }
+    }
+
+    // Returning true keeps the global Escape handler from also stopping generation.
+    if (event.key === 'Escape' && editingLastMessage && activeTabId) {
+      event.preventDefault()
+      exitEditLastMessage(activeTabId)
+      setComposerInput('', [])
+      setComposerAttachments([])
+      return true
     }
 
     if (shouldSubmitOnEnter(event, chatSendBehavior)) {

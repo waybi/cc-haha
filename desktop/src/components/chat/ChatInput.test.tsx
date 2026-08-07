@@ -2182,6 +2182,101 @@ describe('ChatInput file mentions', () => {
     expect(getComposerText()).toBe('/agent debugger ')
   })
 
+  describe('edit last message', () => {
+    function seedLastUserMessage() {
+      useChatStore.setState({
+        sessions: {
+          ...useChatStore.getState().sessions,
+          [sessionId]: {
+            ...useChatStore.getState().sessions[sessionId]!,
+            messages: [{ id: 'u1', type: 'user_text', content: 'origianl typo', timestamp: 1 }],
+          },
+        },
+      })
+    }
+
+    it('recalls the last prompt into an empty composer', async () => {
+      seedLastUserMessage()
+      render(<ChatInput compact />)
+
+      fireEvent.keyDown(getComposerElement(), { key: 'ArrowUp' })
+
+      await waitFor(() => {
+        expect(getComposerText()).toBe('origianl typo')
+      })
+      expect(useChatStore.getState().sessions[sessionId]!.editingLastMessage)
+        .toMatchObject({ uiMessageId: 'u1' })
+    })
+
+    it('does not recall when the composer already has text', async () => {
+      seedLastUserMessage()
+      render(<ChatInput compact />)
+      setComposerText('half-written thought', 20)
+
+      fireEvent.keyDown(getComposerElement(), { key: 'ArrowUp' })
+
+      expect(getComposerText()).toBe('half-written thought')
+      expect(useChatStore.getState().sessions[sessionId]!.editingLastMessage).toBeFalsy()
+    })
+
+    it('does not recall while the session is busy', async () => {
+      seedLastUserMessage()
+      useChatStore.setState({
+        sessions: {
+          ...useChatStore.getState().sessions,
+          [sessionId]: {
+            ...useChatStore.getState().sessions[sessionId]!,
+            chatState: 'thinking',
+          },
+        },
+      })
+      render(<ChatInput compact />)
+
+      fireEvent.keyDown(getComposerElement(), { key: 'ArrowUp' })
+
+      expect(getComposerText()).toBe('')
+      expect(useChatStore.getState().sessions[sessionId]!.editingLastMessage).toBeFalsy()
+    })
+
+    it('leaves ArrowUp to the slash menu when it is open', async () => {
+      seedLastUserMessage()
+      useChatStore.setState({
+        sessions: {
+          ...useChatStore.getState().sessions,
+          [sessionId]: {
+            ...useChatStore.getState().sessions[sessionId]!,
+            slashCommands: [
+              { name: 'compact', description: 'Compact the conversation' },
+              { name: 'clear', description: 'Clear the conversation' },
+            ],
+          },
+        },
+      })
+      render(<ChatInput compact />)
+      setComposerText('/', 1)
+      await screen.findByText('compact')
+
+      fireEvent.keyDown(getComposerElement(), { key: 'ArrowUp' })
+
+      expect(useChatStore.getState().sessions[sessionId]!.editingLastMessage).toBeFalsy()
+      expect(getComposerText()).toBe('/')
+    })
+
+    it('exits edit mode on Escape and clears the composer', async () => {
+      seedLastUserMessage()
+      render(<ChatInput compact />)
+      fireEvent.keyDown(getComposerElement(), { key: 'ArrowUp' })
+      await waitFor(() => expect(getComposerText()).toBe('origianl typo'))
+
+      fireEvent.keyDown(getComposerElement(), { key: 'Escape' })
+
+      await waitFor(() => {
+        expect(useChatStore.getState().sessions[sessionId]!.editingLastMessage).toBeNull()
+        expect(getComposerText()).toBe('')
+      })
+    })
+  })
+
   it('selects a highlighted agent entry from /agent without sending until the configured send shortcut is used', async () => {
     useSettingsStore.setState({
       chatSendBehavior: 'modifierEnter',

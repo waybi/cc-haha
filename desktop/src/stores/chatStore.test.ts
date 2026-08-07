@@ -175,6 +175,96 @@ function makeSession(overrides: Partial<PerSessionState> = {}): PerSessionState 
   }
 }
 
+describe('enterEditLastMessage', () => {
+  it('targets the last non-pending user message and prefills the composer', () => {
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          messages: [
+            { id: 'u1', type: 'user_text', content: 'first', timestamp: 1 },
+            { id: 'a1', type: 'assistant_text', content: 'answer', timestamp: 2 },
+            { id: 'u2', type: 'user_text', content: 'second', modelContent: 'second model', timestamp: 3 },
+          ],
+        }),
+      },
+    })
+
+    const entered = useChatStore.getState().enterEditLastMessage(TEST_SESSION_ID)
+
+    expect(entered).toBe(true)
+    const session = useChatStore.getState().sessions[TEST_SESSION_ID]!
+    expect(session.editingLastMessage).toMatchObject({
+      uiMessageId: 'u2',
+      expectedContent: 'second model',
+      userMessageIndex: 1,
+    })
+    expect(session.composerPrefill?.text).toBe('second')
+  })
+
+  it('falls back to content when modelContent is absent', () => {
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          messages: [{ id: 'u1', type: 'user_text', content: 'plain', timestamp: 1 }],
+        }),
+      },
+    })
+
+    useChatStore.getState().enterEditLastMessage(TEST_SESSION_ID)
+
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]!.editingLastMessage)
+      .toMatchObject({ expectedContent: 'plain', userMessageIndex: 0 })
+  })
+
+  it('ignores pending user messages and returns false when none are eligible', () => {
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          messages: [{ id: 'u1', type: 'user_text', content: 'queued', timestamp: 1, pending: true }],
+        }),
+      },
+    })
+
+    expect(useChatStore.getState().enterEditLastMessage(TEST_SESSION_ID)).toBe(false)
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]!.editingLastMessage).toBeFalsy()
+  })
+
+  it('carries transcriptMessageId through when the message is hydrated', () => {
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          messages: [{
+            id: 'u1', type: 'user_text', content: 'hydrated',
+            transcriptMessageId: 'uuid-1', timestamp: 1,
+          }],
+        }),
+      },
+    })
+
+    useChatStore.getState().enterEditLastMessage(TEST_SESSION_ID)
+
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]!.editingLastMessage)
+      .toMatchObject({ transcriptMessageId: 'uuid-1' })
+  })
+})
+
+describe('exitEditLastMessage', () => {
+  it('clears edit state', () => {
+    useChatStore.setState({
+      sessions: {
+        [TEST_SESSION_ID]: makeSession({
+          messages: [{ id: 'u1', type: 'user_text', content: 'x', timestamp: 1 }],
+        }),
+      },
+    })
+    useChatStore.getState().enterEditLastMessage(TEST_SESSION_ID)
+
+    useChatStore.getState().exitEditLastMessage(TEST_SESSION_ID)
+
+    expect(useChatStore.getState().sessions[TEST_SESSION_ID]!.editingLastMessage).toBeNull()
+  })
+})
+
 describe('stripGeneratedImageMetadataLines', () => {
   it('removes simple, detailed, and resize metadata lines but keeps the prompt body', () => {
     const text = [

@@ -86,6 +86,13 @@ export type ComposerReferenceInsertion = {
 
 export type ComposerPrefillMode = 'replace' | 'append'
 
+export type EditingLastMessageState = {
+  uiMessageId: string
+  expectedContent: string
+  transcriptMessageId?: string
+  userMessageIndex: number
+}
+
 export type PendingPermission = {
   requestId: string
   toolName: string
@@ -164,6 +171,7 @@ export type PerSessionState = {
     mode?: ComposerPrefillMode
     nonce: number
   } | null
+  editingLastMessage?: EditingLastMessageState | null
   composerInsertion?: ComposerReferenceInsertion | null
   composerDraft?: ComposerDraftState | null
   repositoryLaunchDraft?: RepositoryLaunchDraftState | null
@@ -206,6 +214,7 @@ const DEFAULT_SESSION_STATE: PerSessionState = {
   activeGoal: null,
   elapsedTimer: null,
   composerPrefill: null,
+  editingLastMessage: null,
   composerInsertion: null,
   composerDraft: null,
   repositoryLaunchDraft: null,
@@ -340,6 +349,8 @@ type ChatStore = {
     prefill: { text: string; attachments?: UIAttachment[]; mode?: ComposerPrefillMode },
   ) => void
   clearComposerPrefill: (sessionId: string, nonce?: number) => void
+  enterEditLastMessage: (sessionId: string) => boolean
+  exitEditLastMessage: (sessionId: string) => void
   queueComposerInsertion: (
     sessionId: string,
     insertion: Omit<ComposerReferenceInsertion, 'nonce'>,
@@ -1979,6 +1990,49 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         if (nonce !== undefined && session.composerPrefill?.nonce !== nonce) return {}
         return { composerPrefill: null }
       }),
+    }))
+  },
+
+  enterEditLastMessage: (sessionId) => {
+    const session = get().sessions[sessionId]
+    if (!session) return false
+
+    let userMessageIndex = -1
+    let targetIndex = -1
+    session.messages.forEach((message, index) => {
+      if (message.type === 'user_text' && !message.pending) {
+        userMessageIndex += 1
+        targetIndex = index
+      }
+    })
+    if (targetIndex < 0) return false
+
+    const target = session.messages[targetIndex]
+    if (target.type !== 'user_text') return false
+
+    set((state) => ({
+      sessions: updateSessionIn(state.sessions, sessionId, () => ({
+        editingLastMessage: {
+          uiMessageId: target.id,
+          expectedContent: target.modelContent ?? target.content,
+          ...(target.transcriptMessageId ? { transcriptMessageId: target.transcriptMessageId } : {}),
+          userMessageIndex,
+        },
+      })),
+    }))
+
+    get().queueComposerPrefill(sessionId, {
+      text: target.content,
+      attachments: target.attachments,
+    })
+    return true
+  },
+
+  exitEditLastMessage: (sessionId) => {
+    set((state) => ({
+      sessions: updateSessionIn(state.sessions, sessionId, () => ({
+        editingLastMessage: null,
+      })),
     }))
   },
 
